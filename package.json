@@ -1,0 +1,25 @@
+{
+  "name": "spike-into-pi",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "bin": {
+    "spike": "./bin/spike"
+  },
+  "scripts": {
+    "spike": "bun src/cli.ts",
+    "check": "bun build src/cli.ts --target=bun --outfile=/tmp/spike-check.js"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/spike-supervisor.ts"]
+  }
+}

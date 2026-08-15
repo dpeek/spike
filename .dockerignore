@@ -1,0 +1,7 @@
+.git
+.env
+.pi
+.pi-swarm
+node_modules
+**/node_modules
+.DS_Store

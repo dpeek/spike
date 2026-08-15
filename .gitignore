@@ -1,0 +1,4 @@
+.env
+.pi/
+.pi-swarm/
+.DS_Store

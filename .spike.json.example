@@ -1,0 +1,10 @@
+{
+  "runtime": "auto",
+  "image": "pi-agent:0.1",
+  "containerPort": 3000,
+  "portless": true,
+  "cpus": 2,
+  "memory": "4g",
+  "shmSize": "1g",
+  "pids": 512
+}
