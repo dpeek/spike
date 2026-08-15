@@ -6,7 +6,7 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.1";
 const setupRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 type Runtime = "apple" | "docker";
@@ -37,6 +37,11 @@ type AgentState = {
   owner?: string;
   log?: string;
   errorLog?: string;
+  backend?: "headless" | "herdr";
+  herdrName?: string;
+  herdrWorkspaceId?: string;
+  herdrTabId?: string;
+  herdrPaneId?: string;
   startedAt: string;
   finishedAt?: string;
   exitCode?: number;
@@ -50,10 +55,15 @@ Usage:
   spike doctor
   spike up
   spike build
-  spike supervisor [pi arguments...]
+  spike supervisor [--herdr] [pi arguments...]
+  spike herdr setup|status|attach
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
+  spike agent persistent <name> --task <task> [--model <model>]
+  spike agent send <name> --task <follow-up>
+  spike agent read <name>
+  spike agent attach <name>
   spike agent list
   spike agent stop <name>
   spike agent remove <name> [--force]
@@ -111,6 +121,64 @@ async function inherit(command: string[]): Promise<number> {
 
 async function available(command: string): Promise<boolean> {
   return (await capture(["sh", "-c", `command -v "$1" >/dev/null 2>&1`, "sh", command])).code === 0;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function herdrJson(args: string[]): Promise<any> {
+  const result = await capture(["herdr", ...args]);
+  if (result.code !== 0) fail(`Herdr ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  try { return JSON.parse(result.stdout); }
+  catch { fail(`Herdr returned invalid JSON for ${args.join(" ")}`); }
+}
+
+async function requireHerdr() {
+  if (!await available("herdr")) fail("Herdr 0.8 or newer is required; install it with: brew install herdr");
+  const status = await capture(["herdr", "status", "server"]);
+  if (status.code !== 0 || !status.stdout.includes("status: running")) {
+    fail("Herdr server is not running; start it with: brew services start herdr");
+  }
+}
+
+function herdrAgentName(value: string): string {
+  let result = value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+  if (!/^[a-z]/.test(result)) result = `s-${result}`;
+  return result.slice(0, 32).replace(/-+$/g, "") || "spike-agent";
+}
+
+async function createHerdrPane(root: string, project: string, label: string) {
+  await requireHerdr();
+  const workspaceLabel = `spike:${project}`;
+  const listed = await herdrJson(["workspace", "list"]);
+  const workspaces = listed?.result?.workspaces ?? [];
+  let workspace = workspaces.find((candidate: any) => candidate.label === workspaceLabel);
+  if (!workspace) {
+    const created = await herdrJson(["workspace", "create", "--cwd", root, "--label", workspaceLabel, "--no-focus"]);
+    workspace = created.result.workspace;
+    const tabId = created.result.tab.tab_id as string;
+    await herdrJson(["tab", "rename", tabId, label]);
+    return { workspaceId: workspace.workspace_id as string, tabId, paneId: created.result.root_pane.pane_id as string };
+  }
+  const created = await herdrJson(["tab", "create", "--workspace", workspace.workspace_id, "--cwd", root, "--label", label, "--no-focus"]);
+  return {
+    workspaceId: workspace.workspace_id as string,
+    tabId: created.result.tab.tab_id as string,
+    paneId: created.result.root_pane.pane_id as string,
+  };
+}
+
+async function waitForHerdrAgent(paneId: string, timeoutMs = 30_000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const listed = await herdrJson(["agent", "list"]);
+    const agents = listed?.result?.agents ?? [];
+    const found = agents.find((candidate: any) => candidate.pane_id === paneId);
+    if (found) return found;
+    await Bun.sleep(250);
+  }
+  fail(`Herdr did not detect Pi in pane ${paneId} within ${timeoutMs / 1000}s`);
 }
 
 async function gitRoot(): Promise<string> {
@@ -262,7 +330,15 @@ async function doctor() {
   const portless = await capture(["portless", "--version"]);
   console.log(`${portless.code === 0 ? "✓" : "-"} Portless: ${portless.code === 0 ? portless.stdout : "optional; not installed"}`);
   const herdr = await capture(["herdr", "--version"]);
-  console.log(`${herdr.code === 0 ? "✓" : "-"} Herdr: ${herdr.code === 0 ? herdr.stdout : "optional; not installed"}`);
+  if (herdr.code === 0) {
+    const server = await capture(["herdr", "status", "server"]);
+    const integration = await capture(["herdr", "integration", "status"]);
+    const piIntegration = integration.stdout.split("\n").find((line) => line.startsWith("pi:")) ?? "Pi integration unknown";
+    console.log(`✓ Herdr: ${herdr.stdout}; ${server.stdout.includes("status: running") ? "server running" : "server stopped"}`);
+    console.log(`${piIntegration.includes("current") ? "✓" : "-"} Herdr Pi integration: ${piIntegration}`);
+  } else {
+    console.log("- Herdr: optional; not installed");
+  }
   process.exitCode = failed ? 1 : 0;
 }
 
@@ -278,8 +354,41 @@ async function build() {
   if (code !== 0) process.exit(code);
 }
 
+async function herdrCommand(action: string | undefined) {
+  if (action === "setup") {
+    if (!await available("herdr")) fail("install Herdr first with: brew install herdr");
+    const integration = await inherit(["herdr", "integration", "install", "pi"]);
+    if (integration !== 0) fail("could not install the Herdr Pi integration");
+    let status = await capture(["herdr", "status", "server"]);
+    if (!status.stdout.includes("status: running")) {
+      if (process.platform === "darwin" && await available("brew")) {
+        const started = await inherit(["brew", "services", "start", "herdr"]);
+        if (started !== 0) fail("could not start the Herdr service");
+        await Bun.sleep(1_000);
+        status = await capture(["herdr", "status", "server"]);
+      }
+    }
+    if (!status.stdout.includes("status: running")) fail("Herdr is installed but its server is stopped; start it with: herdr server");
+    console.log("✓ Herdr server and Pi integration are ready");
+    return;
+  }
+  if (action === "status") {
+    if (!await available("herdr")) fail("Herdr is not installed");
+    await inherit(["herdr", "status"]);
+    await inherit(["herdr", "integration", "status"]);
+    return;
+  }
+  if (action === "attach") {
+    await requireHerdr();
+    const code = await inherit(["herdr"]);
+    if (code !== 0) process.exit(code);
+    return;
+  }
+  fail("expected herdr setup, status, or attach", 2);
+}
+
 async function supervisor(args: string[]) {
-  await loadContext();
+  const context = await loadContext();
   if (!await available("pi")) fail("Pi is not installed on the host");
   const extension = join(setupRoot, "extensions", "spike-supervisor.ts");
   const systemPrompt = [
@@ -289,7 +398,35 @@ async function supervisor(args: string[]) {
     "Continue coordinating while workers run; their completion reports will arrive asynchronously.",
     "Do not ask workers to access host secrets or modify the host checkout directly.",
   ].join(" ");
-  const code = await inherit(["pi", "-e", extension, "--append-system-prompt", systemPrompt, ...args]);
+  const useHerdr = args.includes("--herdr");
+  const piArgs = args.filter((arg) => arg !== "--herdr");
+  if (!useHerdr || process.env.HERDR_ENV === "1") {
+    const code = await inherit(["pi", "-e", extension, "--append-system-prompt", systemPrompt, ...piArgs]);
+    if (code !== 0) process.exit(code);
+    return;
+  }
+
+  await requireHerdr();
+  const name = herdrAgentName(`${context.project}-supervisor`);
+  const existing = await capture(["herdr", "agent", "get", name]);
+  if (existing.code === 0) {
+    const code = await inherit(["herdr", "agent", "attach", name]);
+    if (code !== 0) process.exit(code);
+    return;
+  }
+
+  const placement = await createHerdrPane(context.root, context.project, "supervisor");
+  const command = [
+    "env", "HERDR_AGENT=pi",
+    shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))),
+    "supervisor",
+    ...piArgs.map(shellQuote),
+  ].join(" ");
+  const launched = await capture(["herdr", "pane", "run", placement.paneId, command]);
+  if (launched.code !== 0) fail(`Herdr could not launch the supervisor: ${launched.stderr || launched.stdout}`);
+  await waitForHerdrAgent(placement.paneId);
+  await herdrJson(["agent", "rename", placement.paneId, name]);
+  const code = await inherit(["herdr", "agent", "attach", name]);
   if (code !== 0) process.exit(code);
 }
 
@@ -312,6 +449,10 @@ async function up() {
     console.log(`✓ Portless URL suffix: .${await portlessTld()}`);
   } else {
     console.log("- Portless disabled or not installed");
+  }
+  if (await available("herdr")) {
+    const status = await capture(["herdr", "status", "server"]);
+    console.log(`${status.stdout.includes("status: running") ? "✓" : "-"} Herdr server: ${status.stdout.includes("status: running") ? "running" : "stopped (start with brew services start herdr)"}`);
   }
 }
 
@@ -352,6 +493,14 @@ async function runAgent(name: string | undefined, args: string[]) {
 
   const command = args[0] === "--" ? args.slice(1) : ["pi", ...args];
   if (command.length === 0) fail("expected a command after --", 2);
+  if (command[0] === "pi" && operatorUrl) {
+    command.splice(1, 0, "--append-system-prompt", [
+      `Service networking: use http://127.0.0.1:${containerPort} from inside this container.`,
+      `The operator-facing route is ${operatorUrl}.`,
+      "When you start or verify a service, report the operator-facing route rather than only the container-local URL.",
+      "Do not claim the operator route is serving unless your internal service check succeeds.",
+    ].join(" "));
+  }
   const cli = runtimeCommand(runtime);
   const run = [cli, "run"];
   if (runtime === "apple") run.push("--user", "root");
@@ -377,6 +526,9 @@ async function runAgent(name: string | undefined, args: string[]) {
       "--mount", `type=bind,source=${hostPiState},target=/host-pi-agent`,
       "--env", "HOST_PI_AUTH_FILE=/host-pi-agent/auth.json",
     );
+    if (existsSync(join(hostPiState, "extensions", "herdr-agent-state.ts"))) {
+      run.push("--env", "HOST_HERDR_PI_EXTENSION=/host-pi-agent/extensions/herdr-agent-state.ts");
+    }
   }
   run.push(
     "--env", `AGENT_NAME=${agent}`,
@@ -403,6 +555,11 @@ async function runAgent(name: string | undefined, args: string[]) {
     ...(process.env.SPIKE_OWNER ? { owner: process.env.SPIKE_OWNER } : {}),
     ...(process.env.SPIKE_LOG_PATH ? { log: process.env.SPIKE_LOG_PATH } : {}),
     ...(process.env.SPIKE_ERROR_LOG_PATH ? { errorLog: process.env.SPIKE_ERROR_LOG_PATH } : {}),
+    ...(process.env.SPIKE_BACKEND === "herdr" ? { backend: "herdr" as const } : { backend: "headless" as const }),
+    ...(process.env.SPIKE_HERDR_NAME ? { herdrName: process.env.SPIKE_HERDR_NAME } : {}),
+    ...(process.env.SPIKE_HERDR_WORKSPACE_ID ? { herdrWorkspaceId: process.env.SPIKE_HERDR_WORKSPACE_ID } : {}),
+    ...(process.env.SPIKE_HERDR_TAB_ID ? { herdrTabId: process.env.SPIKE_HERDR_TAB_ID } : {}),
+    ...(process.env.SPIKE_HERDR_PANE_ID ? { herdrPaneId: process.env.SPIKE_HERDR_PANE_ID } : {}),
     startedAt: new Date().toISOString(), pid: process.pid,
   };
   await writeState(context.stateDir, state);
@@ -466,6 +623,78 @@ async function dispatchAgent(name: string | undefined, args: string[]) {
   console.log(JSON.stringify({ agent, pid: child.pid, task, log, errorLog }));
 }
 
+async function persistentAgent(name: string | undefined, args: string[]) {
+  if (!name) fail("agent persistent requires a name", 2);
+  const task = flagValue(args, "--task");
+  if (!task) fail("agent persistent requires --task <task>", 2);
+  const model = flagValue(args, "--model");
+  const thinking = flagValue(args, "--thinking");
+  const owner = flagValue(args, "--owner");
+  const context = await loadContext();
+  const agent = slug(name);
+  const previous = await readState(context.stateDir, agent);
+  if (previous && !previous.finishedAt) fail(`agent ${agent} is already running`);
+  await rm(statePath(context.stateDir, agent), { force: true });
+
+  const herdrName = herdrAgentName(`${context.project}-${agent}`);
+  const placement = await createHerdrPane(context.root, context.project, agent);
+  const piArgs: string[] = [];
+  if (model) piArgs.push("--model", model);
+  if (thinking) piArgs.push("--thinking", thinking);
+  piArgs.push(task);
+  const environment: Record<string, string> = {
+    HERDR_AGENT: "pi",
+    SPIKE_BACKEND: "herdr",
+    SPIKE_TASK: task,
+    SPIKE_HERDR_NAME: herdrName,
+    SPIKE_HERDR_WORKSPACE_ID: placement.workspaceId,
+    SPIKE_HERDR_TAB_ID: placement.tabId,
+    SPIKE_HERDR_PANE_ID: placement.paneId,
+    ...(owner ? { SPIKE_OWNER: owner } : {}),
+  };
+  const assignments = Object.entries(environment).map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const command = ["env", ...assignments, shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))), "agent", "run", shellQuote(agent), ...piArgs.map(shellQuote)].join(" ");
+  const launched = await capture(["herdr", "pane", "run", placement.paneId, command]);
+  if (launched.code !== 0) fail(`Herdr could not launch ${agent}: ${launched.stderr || launched.stdout}`);
+  await waitForHerdrAgent(placement.paneId);
+  await herdrJson(["agent", "rename", placement.paneId, herdrName]);
+
+  // Let the foreground launcher persist its complete runtime state.
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline && !await readState(context.stateDir, agent)) await Bun.sleep(100);
+  console.log(JSON.stringify({ agent, backend: "herdr", herdrName, ...placement, operatorUrl: (await readState(context.stateDir, agent))?.operatorUrl }));
+}
+
+async function herdrTarget(name: string | undefined): Promise<{ state: AgentState; target: string }> {
+  if (!name) fail("agent name is required", 2);
+  const { stateDir } = await loadContext();
+  const state = await readState(stateDir, name);
+  if (!state) fail(`unknown agent: ${name}`);
+  if (state.backend !== "herdr" || (!state.herdrName && !state.herdrPaneId)) fail(`agent ${name} is not Herdr-backed`);
+  return { state, target: state.herdrName ?? state.herdrPaneId! };
+}
+
+async function sendAgent(name: string | undefined, args: string[]) {
+  const task = flagValue(args, "--task");
+  if (!task) fail("agent send requires --task <follow-up>", 2);
+  const { target } = await herdrTarget(name);
+  const result = await capture(["herdr", "agent", "prompt", target, task]);
+  if (result.code !== 0) fail(result.stderr || result.stdout);
+  console.log(result.stdout);
+}
+
+async function readAgent(name: string | undefined) {
+  const { target } = await herdrTarget(name);
+  const code = await inherit(["herdr", "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"]);
+  if (code !== 0) process.exit(code);
+}
+
+async function attachAgent(name: string | undefined) {
+  const { target } = await herdrTarget(name);
+  const code = await inherit(["herdr", "agent", "attach", target]);
+  if (code !== 0) process.exit(code);
+}
+
 async function listAgents() {
   const { stateDir } = await loadContext();
   const directory = join(stateDir, "agents");
@@ -479,9 +708,18 @@ async function listAgents() {
     try { states.push(JSON.parse(await readFile(join(directory, file), "utf8")) as AgentState); } catch { /* ignore corrupt state */ }
   }
   if (!states.length) return console.log("No agents have been started.");
-  console.log("AGENT\tSTATUS\tRUNTIME\tURL");
+  let herdrAgents: any[] = [];
+  if (states.some((state) => state.backend === "herdr" && !state.finishedAt) && await available("herdr")) {
+    const listed = await capture(["herdr", "agent", "list"]);
+    if (listed.code === 0) {
+      try { herdrAgents = JSON.parse(listed.stdout)?.result?.agents ?? []; } catch { /* server may be restarting */ }
+    }
+  }
+  console.log("AGENT\tSTATUS\tBACKEND\tRUNTIME\tURL");
   for (const state of states.sort((a, b) => a.slug.localeCompare(b.slug))) {
-    console.log(`${state.slug}\t${state.finishedAt ? `exited (${state.exitCode})` : "running"}\t${state.runtime}\t${state.operatorUrl ?? "-"}`);
+    const herdrAgent = herdrAgents.find((candidate) => candidate.name === state.herdrName || candidate.pane_id === state.herdrPaneId);
+    const status = state.finishedAt ? `exited (${state.exitCode})` : herdrAgent?.agent_status ?? "running";
+    console.log(`${state.slug}\t${status}\t${state.backend ?? "headless"}\t${state.runtime}\t${state.operatorUrl ?? "-"}`);
   }
 }
 
@@ -508,6 +746,7 @@ async function removeAgent(name: string | undefined, force: boolean) {
     const result = await capture([runtimeCommand(state.runtime), kind, "rm", resource]);
     if (result.code !== 0 && !result.stderr.toLowerCase().includes("not found")) console.warn(`warning: ${result.stderr}`);
   }
+  if (state.herdrTabId && await available("herdr")) await capture(["herdr", "tab", "close", state.herdrTabId]);
   await rm(statePath(stateDir, state.slug), { force: true });
   console.log(`Removed ${state.slug}`);
 }
@@ -548,16 +787,21 @@ else if (command === "doctor") await doctor();
 else if (command === "up") await up();
 else if (command === "build") await build();
 else if (command === "supervisor" || command === "start") await supervisor(args);
+else if (command === "herdr") await herdrCommand(args.shift());
 else if (command === "down") await down();
 else if (command === "agent") {
   const action = args.shift();
   if (action === "run" || action === "start") await runAgent(args.shift(), args);
   else if (action === "dispatch") await dispatchAgent(args.shift(), args);
+  else if (action === "persistent" || action === "herdr") await persistentAgent(args.shift(), args);
+  else if (action === "send") await sendAgent(args.shift(), args);
+  else if (action === "read") await readAgent(args.shift());
+  else if (action === "attach") await attachAgent(args.shift());
   else if (action === "list" || action === "ls") await listAgents();
   else if (action === "stop") await stopAgent(args.shift());
   else if (action === "remove" || action === "rm") {
     const name = args.find((arg) => !arg.startsWith("-"));
     await removeAgent(name, args.includes("--force"));
   } else if (action === "open") await openAgent(args.shift());
-  else fail("expected agent run, dispatch, list, stop, remove, or open", 2);
+  else fail("expected agent run, dispatch, persistent, send, read, attach, list, stop, remove, or open", 2);
 } else fail(`unknown command: ${command}`, 2);

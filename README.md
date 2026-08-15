@@ -101,16 +101,35 @@ brew install portless
 
 ## Start the supervisor
 
-Run the host-side Pi supervisor from the target repository:
+Run the host-side Pi supervisor from the target repository. The default backend
+uses detached one-shot workers:
 
 ```bash
 spike supervisor
 ```
 
+For persistent interactive workers, install Herdr 0.8 or newer and its Pi
+integration once, then keep its server running:
+
+```bash
+brew install herdr
+spike herdr setup
+spike supervisor --herdr
+```
+
+`spike herdr setup` installs Herdr's official Pi integration and starts the
+Homebrew service when needed. `spike herdr status` shows server and integration
+state, while `spike herdr attach` opens the full workspace UI.
+
+The Herdr supervisor is placed in a project workspace and attached directly to
+your terminal. Detach with `ctrl+b q`; its terminal and workers keep running.
+Running `spike supervisor --herdr` again reattaches to the existing supervisor.
+
 The supervisor loads the repo-local `spike_agents` extension tool. It can
-dispatch focused tasks to detached container workers, list or stop them, and open
-their service URLs. Worker completion reports are watched asynchronously and
-injected back into the supervisor conversation.
+dispatch focused tasks, send persistent workers follow-ups, read their terminals,
+list or stop them, and open their service URLs. Working, blocked, idle, done, and
+exit transitions are watched asynchronously and injected back into the
+supervisor conversation.
 
 Example request:
 
@@ -154,7 +173,7 @@ write to the same clone.
 
 ### Dispatch a detached task
 
-The supervisor uses this lower-level command internally:
+The non-Herdr supervisor uses this lower-level command internally:
 
 ```bash
 spike agent dispatch tests --task "Run the tests and fix failures"
@@ -162,6 +181,24 @@ spike agent dispatch tests --task "Run the tests and fix failures"
 
 It starts Pi in JSON/print mode, returns immediately, and records output under
 `.pi-swarm/logs/`. The persistent workspace remains available for later tasks.
+
+### Persistent Herdr workers
+
+The Herdr supervisor dispatches through `persistent` instead. These commands are
+also available to operators:
+
+```bash
+spike agent persistent frontend --task "Build the UI and keep the preview running"
+spike agent send frontend --task "Now add dark mode"
+spike agent read frontend
+spike agent attach frontend
+```
+
+Detach a direct worker attachment with `ctrl+b q`. Herdr sees Pi through the
+host-visible `HERDR_AGENT=pi` wrapper and derives worker lifecycle from Pi's live
+terminal. The host supervisor itself uses Herdr's official Pi lifecycle
+integration. Portless aliases remain registered for the full persistent worker
+lifetime.
 
 ### Run a command instead of Pi
 
@@ -275,7 +312,8 @@ VM starts. Retrying succeeds.
 
 ## Roadmap
 
-The supervisor currently dispatches durable one-shot Pi tasks. The next slice is
-interactive worker messaging and attachment. Herdr remains the candidate
-persistent terminal and lifecycle backend; container and Portless policy stay
-owned by `spike`.
+Spike now supports both one-shot and Herdr-backed persistent workers. The next
+slice is automated branch review and import (`diff`, `bundle`, and guarded merge)
+plus richer worker-response extraction than terminal snapshots. Container and
+Portless policy remain owned by Spike; Herdr owns durable terminals and lifecycle
+presentation.

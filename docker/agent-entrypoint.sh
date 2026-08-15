@@ -16,6 +16,11 @@ if [[ $(id -u) -eq 0 ]]; then
         rm -f "$agent_dir/auth.json"
         ln -s "$HOST_PI_AUTH_FILE" "$agent_dir/auth.json"
     fi
+    if [[ -n "${HOST_HERDR_PI_EXTENSION:-}" && -f "$HOST_HERDR_PI_EXTENSION" ]]; then
+        mkdir -p "$agent_dir/extensions"
+        rm -f "$agent_dir/extensions/herdr-agent-state.ts"
+        ln -s "$HOST_HERDR_PI_EXTENSION" "$agent_dir/extensions/herdr-agent-state.ts"
+    fi
     chown node:node "$workspace"
     # Apple virtiofs bind mounts map writes to the host owner and reject chown,
     # while named workspace volumes require it. The bind remains writable by

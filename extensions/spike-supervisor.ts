@@ -16,6 +16,9 @@ type WorkerState = {
   log?: string;
   errorLog?: string;
   operatorUrl?: string;
+  backend?: "headless" | "herdr";
+  herdrName?: string;
+  herdrPaneId?: string;
   startedAt: string;
   finishedAt?: string;
   exitCode?: number;
@@ -76,6 +79,7 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
   let scanning = false;
   let owner = "";
   const notified = new Set<string>();
+  const herdrStatuses = new Map<string, string>();
 
   const scan = async (ctx: ExtensionContext) => {
     if (scanning || !owner) return;
@@ -85,8 +89,52 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
       const active = states.filter((state) => !state.finishedAt).length;
       ctx.ui.setStatus("spike", active ? `spike: ${active} worker${active === 1 ? "" : "s"}` : undefined);
 
+      let herdrAgents: any[] = [];
+      if (states.some((state) => state.backend === "herdr" && !state.finishedAt)) {
+        const listed = await pi.exec("herdr", ["agent", "list"], { timeout: 5_000 });
+        if (listed.code === 0) {
+          try { herdrAgents = JSON.parse(listed.stdout)?.result?.agents ?? []; } catch { /* retry next scan */ }
+        }
+      }
+
       for (const state of states) {
         const key = `${state.slug}:${state.startedAt}`;
+        if (state.backend === "herdr" && !state.finishedAt) {
+          const agent = herdrAgents.find((candidate) =>
+            candidate.name === state.herdrName || candidate.pane_id === state.herdrPaneId);
+          if (!agent) continue;
+          const status = String(agent.agent_status ?? "unknown");
+          const previous = herdrStatuses.get(key);
+          herdrStatuses.set(key, status);
+          const settled = status === "idle" || status === "done";
+          const blocked = status === "blocked" && previous !== "blocked";
+          if ((settled && previous === "working") || blocked) {
+            const read = await pi.exec("herdr", ["agent", "read", state.herdrName ?? state.herdrPaneId!, "--source", "recent-unwrapped", "--lines", "160"], { timeout: 5_000 });
+            let reply = (read.stdout || read.stderr || "Worker settled without readable terminal output.").trim();
+            if (Buffer.byteLength(reply, "utf8") > MAX_REPORT_BYTES) reply = `${reply.slice(-MAX_REPORT_BYTES)}\n\n[Earlier terminal output truncated]`;
+            const reportKey = `${key}:${agent.state_change_seq ?? status}`;
+            if (!notified.has(reportKey)) {
+              notified.add(reportKey);
+              pi.appendEntry(NOTIFIED_ENTRY, { key: reportKey });
+              pi.sendMessage({
+                customType: "spike-worker-report",
+                display: true,
+                content: [
+                  `Persistent Spike worker **${state.slug}** is ${status}.`,
+                  state.task ? `Original task: ${state.task}` : "",
+                  state.operatorUrl ? `Operator route: ${state.operatorUrl}` : "",
+                  blocked ? "The worker needs input." : "The worker is ready for follow-up work.",
+                  "",
+                  "Recent terminal output:",
+                  reply,
+                ].filter(Boolean).join("\n"),
+                details: { ...state, herdrStatus: status },
+              }, { deliverAs: "followUp", triggerTurn: true });
+            }
+          }
+          continue;
+        }
+
         if (!state.finishedAt || notified.has(key)) continue;
         notified.add(key);
         pi.appendEntry(NOTIFIED_ENTRY, { key });
@@ -122,7 +170,7 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
     }
     if (timer) clearInterval(timer);
     await scan(ctx);
-    timer = setInterval(() => void scan(ctx), 1_000);
+    timer = setInterval(() => void scan(ctx), 500);
     timer.unref();
     ctx.ui.notify("Spike supervisor ready", "info");
   });
@@ -136,22 +184,24 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spike_agents",
     label: "Spike Agents",
-    description: "Dispatch and manage isolated containerized Pi workers. Dispatch returns immediately; completion reports arrive asynchronously in this conversation.",
-    promptSnippet: "Dispatch, list, stop, or open isolated container workers",
+    description: "Dispatch and manage isolated containerized Pi workers. Inside Herdr, dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Reports arrive asynchronously.",
+    promptSnippet: "Dispatch, message, read, list, stop, or open isolated container workers",
     promptGuidelines: [
       "Use spike_agents to delegate independent coding, investigation, testing, and review tasks that can run concurrently.",
       "Give every spike_agents dispatch a unique stable agent name and a focused, self-contained task.",
       "After dispatching with spike_agents, continue useful coordination rather than polling; completion reports arrive automatically.",
+      "Use spike_agents send for follow-up work when the supervisor is running inside Herdr.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["dispatch", "list", "stop", "open"] as const),
-      name: Type.Optional(Type.String({ description: "Worker name for dispatch, stop, or open" })),
-      task: Type.Optional(Type.String({ description: "Focused task for dispatch" })),
+      action: StringEnum(["dispatch", "send", "read", "list", "stop", "open"] as const),
+      name: Type.Optional(Type.String({ description: "Worker name for dispatch, send, read, stop, or open" })),
+      task: Type.Optional(Type.String({ description: "Focused task for dispatch or follow-up text for send" })),
       model: Type.Optional(Type.String({ description: "Optional provider/model override" })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const args = ["agent", params.action];
+      const commandAction = params.action === "dispatch" && process.env.HERDR_ENV === "1" ? "persistent" : params.action;
+      const args = ["agent", commandAction];
       if (params.action === "dispatch") {
         if (!params.name || !params.task) throw new Error("dispatch requires name and task");
         args.push(params.name, "--task", params.task, "--owner", ctx.sessionManager.getSessionId());
@@ -159,6 +209,9 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
         if (model) args.push("--model", model);
         const thinking = params.thinking ?? ctx.thinkingLevel;
         if (thinking) args.push("--thinking", thinking);
+      } else if (params.action === "send") {
+        if (!params.name || !params.task) throw new Error("send requires name and task");
+        args.push(params.name, "--task", params.task);
       } else if (params.action === "list") {
         // No additional arguments.
       } else {
@@ -166,9 +219,12 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
         args.push(params.name);
       }
 
-      const result = await pi.exec(spikeBin, args, { signal, timeout: 15_000 });
+      const result = await pi.exec(spikeBin, args, { signal, timeout: 45_000 });
       if (result.code !== 0) throw new Error(result.stderr || result.stdout || `spike exited ${result.code}`);
-      if (params.action === "dispatch") setTimeout(() => void scan(ctx), 250).unref();
+      if (params.action === "dispatch" || params.action === "send") {
+        setTimeout(() => void scan(ctx), 100).unref();
+        setTimeout(() => void scan(ctx), 350).unref();
+      }
       return {
         content: [{ type: "text", text: result.stdout.trim() || `${params.action} completed` }],
         details: { action: params.action, name: params.name, stdout: result.stdout, stderr: result.stderr },
