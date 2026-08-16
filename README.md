@@ -124,9 +124,43 @@ Approval is currently supplied **only and explicitly at the CLI boundary** with
 from conversation, chat logs, terminal output, or a goal document. Before
 planning a new goal, supervisors should run `spike goal status --json`; they
 must not draft or activate a replacement while another goal is active, and must
-not treat conversational intent as operator approval. Completion, cancellation,
-multiple active goals, tickets, runs, decisions, and accepted-revision updates
-remain future workflow slices.
+not treat conversational intent as operator approval.
+
+## Issue and recover the ready planner ticket
+
+With an active goal, the current manual planner flow is:
+
+```bash
+spike goal status --json
+# Write an ignored local Markdown ticket, for example .pi-swarm/drafts/ticket.md
+spike ticket issue .pi-swarm/drafts/ticket.md
+spike ticket status --json
+spike ticket show
+```
+
+`ticket issue` accepts one non-empty, bounded Markdown file inside the
+repository, including ignored files under `.pi-swarm/`. It binds the exact bytes
+to the active goal and that goal's `acceptedCodeRevision`; callers cannot supply
+a different base. Reissuing the same bytes is idempotent, while a different
+ready ticket is refused. Issuing a ticket **does not dispatch or start a
+worker**.
+
+The immutable snapshot and schema-versioned record are stored under the active
+generated goal directory. A validated, read-only-by-convention worker copy is
+exported at
+`.pi-swarm/output/workflow/<goal-id>/tickets/<ticket-id>/ticket.md`; workers and
+operators must not edit it. `status` and `show` recover solely from durable
+state, so they continue to work after the
+source is edited or removed. `show` always emits the authoritative snapshot,
+not the source or exported copy. Corrupt pointers, records, paths, schemas,
+snapshots, and worker copies fail closed.
+
+Before drafting another ticket, supervisors must inspect
+`spike ticket status --json` and `spike ticket show`. A ready ticket survives a
+supervisor restart: never redispatch work merely because the supervisor process
+restarted. Runs, dispatch association, completion reports, ticket transitions,
+operator decisions, and accepted-revision updates remain future workflow
+slices.
 
 ## Build and start services
 

@@ -5,9 +5,13 @@ import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export const GOAL_SCHEMA_VERSION = 1;
 export const ACTIVE_GOAL_POINTER_SCHEMA_VERSION = 1;
+export const TICKET_SCHEMA_VERSION = 1;
+export const ACTIVE_TICKET_POINTER_SCHEMA_VERSION = 1;
+export const MAX_TICKET_BYTES = 1024 * 1024;
 
 const objectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
+const ticketIdPattern = /^ticket-[0-9a-f]{32}$/;
 const MAX_RECORD_BYTES = 128 * 1024;
 const MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024;
 
@@ -42,6 +46,34 @@ export type ActiveGoal = {
 
 export type ActivationResult = ActiveGoal & { idempotent: boolean };
 
+export type TicketRecord = {
+  schemaVersion: 1;
+  ticketId: string;
+  goalId: string;
+  status: "ready";
+  baseRevision: string;
+  snapshotPath: string;
+  snapshotSha256: string;
+  snapshotBytes: number;
+  sourcePath: string;
+  workerPath: string;
+  issuedAt: string;
+};
+
+export type ActiveTicketPointer = {
+  schemaVersion: 1;
+  goalId: string;
+  ticketId: string;
+  recordPath: string;
+};
+
+export type ReadyTicket = {
+  record: TicketRecord;
+  snapshot: Buffer;
+};
+
+export type TicketIssueResult = ReadyTicket & { idempotent: boolean };
+
 type GitResult = { code: number; stdout: Buffer; stderr: string };
 
 type GoalContext = {
@@ -68,6 +100,11 @@ function projectIdentity(root: string): string {
 function goalIdentity(projectId: string, revision: string, blob: string, approval: string): string {
   const identity = JSON.stringify({ projectId, revision, blob, approval });
   return `goal-${sha256(`spike-goal-v1\0${identity}`).slice(0, 32)}`;
+}
+
+function ticketIdentity(goalId: string, baseRevision: string, digest: string): string {
+  const identity = JSON.stringify({ goalId, baseRevision, digest });
+  return `ticket-${sha256(`spike-ticket-v1\0${identity}`).slice(0, 32)}`;
 }
 
 async function runGit(root: string, args: string[], input?: Uint8Array): Promise<GitResult> {
@@ -253,6 +290,69 @@ export function validateGoalRecord(value: unknown, expected: { root: string; pro
   const identity = goalIdentity(record.projectId as string, record.repositoryRevision, record.approvedBlob, record.approvalStatement);
   if (identity !== record.goalId) throw new Error("goal record stable identity is invalid");
   return record as GoalRecord;
+}
+
+function requireTicketString(value: unknown, field: string, options: { pattern?: RegExp } = {}): asserts value is string {
+  if (typeof value !== "string" || !value || (options.pattern && !options.pattern.test(value))) {
+    throw new Error(`ticket record has an invalid ${field}`);
+  }
+}
+
+export function validateActiveTicketPointer(
+  value: unknown,
+  expected: { root: string; goalId: string; goalDirectory: string },
+): ActiveTicketPointer {
+  const pointer = requireObject(value, "active ticket pointer");
+  if (pointer.schemaVersion !== ACTIVE_TICKET_POINTER_SCHEMA_VERSION) {
+    throw new Error(`unsupported active ticket pointer schema: ${String(pointer.schemaVersion)}`);
+  }
+  if (pointer.goalId !== expected.goalId) throw new Error("active ticket pointer does not match the active goal");
+  if (typeof pointer.ticketId !== "string" || !ticketIdPattern.test(pointer.ticketId)) {
+    throw new Error("active ticket pointer has an invalid ticketId");
+  }
+  const expectedRecord = `.pi-swarm/goals/${expected.goalId}/tickets/${pointer.ticketId}/record.v1.json`;
+  if (pointer.recordPath !== expectedRecord) throw new Error("active ticket pointer has an invalid recordPath");
+  resolveRecordedPath(expected.root, expectedRecord, "active ticket record path", join(expected.goalDirectory, "tickets", pointer.ticketId));
+  return pointer as ActiveTicketPointer;
+}
+
+export function validateTicketRecord(
+  value: unknown,
+  expected: { root: string; goalId: string; goalDirectory: string; acceptedCodeRevision: string },
+): TicketRecord {
+  const record = requireObject(value, "ticket record");
+  if (record.schemaVersion !== TICKET_SCHEMA_VERSION) throw new Error(`unsupported ticket record schema: ${String(record.schemaVersion)}`);
+  if (record.goalId !== expected.goalId) throw new Error("ticket record does not match the active goal");
+  if (typeof record.ticketId !== "string" || !ticketIdPattern.test(record.ticketId)) throw new Error("ticket record has an invalid ticketId");
+  if (record.status !== "ready") throw new Error("ticket record has an invalid status");
+  if (record.baseRevision !== expected.acceptedCodeRevision || typeof record.baseRevision !== "string" || !objectIdPattern.test(record.baseRevision)) {
+    throw new Error("ticket record base revision does not match the active goal");
+  }
+  requireTicketString(record.snapshotSha256, "snapshotSha256", { pattern: /^[0-9a-f]{64}$/ });
+  if (!Number.isSafeInteger(record.snapshotBytes) || (record.snapshotBytes as number) < 1 || (record.snapshotBytes as number) > MAX_TICKET_BYTES) {
+    throw new Error("ticket record has an invalid snapshotBytes");
+  }
+  requireTicketString(record.sourcePath, "sourcePath");
+  resolveRecordedPath(expected.root, record.sourcePath, "ticket source path");
+  if (record.sourcePath === ".git" || record.sourcePath.startsWith(".git/") || !/\.(?:md|markdown)$/i.test(record.sourcePath)) {
+    throw new Error("ticket record has an invalid sourcePath");
+  }
+  requireTicketString(record.issuedAt, "issuedAt");
+  const issuedAt = new Date(record.issuedAt as string);
+  if (!Number.isFinite(issuedAt.getTime()) || issuedAt.toISOString() !== record.issuedAt) {
+    throw new Error("ticket record has an invalid issuedAt timestamp");
+  }
+
+  const expectedSnapshot = `.pi-swarm/goals/${record.goalId}/tickets/${record.ticketId}/ticket.md`;
+  if (record.snapshotPath !== expectedSnapshot) throw new Error("ticket record has an invalid snapshotPath");
+  resolveRecordedPath(expected.root, expectedSnapshot, "ticket snapshot path", join(expected.goalDirectory, "tickets", record.ticketId as string));
+  const expectedWorker = `.pi-swarm/output/workflow/${record.goalId}/tickets/${record.ticketId}/ticket.md`;
+  if (record.workerPath !== expectedWorker) throw new Error("ticket record has an invalid workerPath");
+  resolveRecordedPath(expected.root, expectedWorker, "worker-visible ticket path", join(expected.root, ".pi-swarm", "output", "workflow", record.goalId as string, "tickets", record.ticketId as string));
+
+  const identity = ticketIdentity(record.goalId as string, record.baseRevision as string, record.snapshotSha256 as string);
+  if (identity !== record.ticketId) throw new Error("ticket record stable identity is invalid");
+  return record as TicketRecord;
 }
 
 async function loadActiveFromContext(context: GoalContext, allowMissing: boolean): Promise<ActiveGoal | undefined> {
@@ -445,6 +545,234 @@ async function installRecord(context: GoalContext, candidate: { record: GoalReco
   }
 }
 
+async function verifyCommitAvailable(context: GoalContext, revision: string): Promise<void> {
+  const result = await runGit(context.root, ["cat-file", "-t", revision]);
+  if (result.code !== 0 || output(result) !== "commit") {
+    throw new Error(`active goal accepted code revision is not an available commit: ${revision}`);
+  }
+}
+
+async function readTicketCopy(path: string, label: string, record: TicketRecord): Promise<Buffer> {
+  let stat;
+  try {
+    stat = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`${label} is missing`);
+    throw new Error(`cannot inspect ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} is not a regular file`);
+  if (stat.size !== record.snapshotBytes) throw new Error(`${label} integrity check failed`);
+  let bytes: Buffer;
+  try { bytes = await readFile(path); }
+  catch (error) { throw new Error(`cannot read ${label}: ${error instanceof Error ? error.message : String(error)}`); }
+  if (bytes.byteLength !== record.snapshotBytes || sha256(bytes) !== record.snapshotSha256) {
+    throw new Error(`${label} integrity check failed`);
+  }
+  return bytes;
+}
+
+async function loadReadyFromContext(
+  context: GoalContext,
+  active: ActiveGoal,
+  allowMissing: boolean,
+): Promise<ReadyTicket | undefined> {
+  const goalDirectory = join(context.goalsDir, active.record.goalId);
+  const pointerPath = join(goalDirectory, "active-ticket.json");
+  await rejectSymlinkComponents(context.root, pointerPath, "active ticket pointer path");
+  try {
+    await access(pointerPath, constants.F_OK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && allowMissing) return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("no ready ticket; issue one with spike ticket issue <ticket-file>");
+    throw error;
+  }
+  const pointer = validateActiveTicketPointer(await readSmallJson(pointerPath, "active ticket pointer", MAX_RECORD_BYTES), {
+    root: context.root,
+    goalId: active.record.goalId,
+    goalDirectory,
+  });
+  const ticketDirectory = join(goalDirectory, "tickets", pointer.ticketId);
+  const recordPath = resolveRecordedPath(context.root, pointer.recordPath, "active ticket record path", ticketDirectory);
+  await rejectSymlinkComponents(context.root, ticketDirectory, "active ticket directory");
+  await rejectSymlinkComponents(context.root, recordPath, "active ticket record path");
+  const record = validateTicketRecord(await readSmallJson(recordPath, "active ticket record", MAX_RECORD_BYTES), {
+    root: context.root,
+    goalId: active.record.goalId,
+    goalDirectory,
+    acceptedCodeRevision: active.record.acceptedCodeRevision,
+  });
+  if (record.ticketId !== pointer.ticketId) throw new Error("ticket record identity does not match the active pointer");
+  await verifyCommitAvailable(context, record.baseRevision);
+
+  const snapshotPath = resolveRecordedPath(context.root, record.snapshotPath, "ticket snapshot path", ticketDirectory);
+  const workerPath = resolveRecordedPath(context.root, record.workerPath, "worker-visible ticket path",
+    join(context.stateDir, "output", "workflow", record.goalId, "tickets", record.ticketId));
+  await rejectSymlinkComponents(context.root, snapshotPath, "ticket snapshot path");
+  await rejectSymlinkComponents(context.root, workerPath, "worker-visible ticket path");
+  const snapshot = await readTicketCopy(snapshotPath, "ticket snapshot", record);
+  const workerCopy = await readTicketCopy(workerPath, "worker-visible ticket copy", record);
+  if (!snapshot.equals(workerCopy)) throw new Error("worker-visible ticket copy integrity check failed");
+  return { record, snapshot };
+}
+
+export async function loadReadyTicket(cwd = process.cwd()): Promise<ReadyTicket> {
+  const context = await discoverContext(cwd);
+  const active = (await loadActiveFromContext(context, false))!;
+  return (await loadReadyFromContext(context, active, false))!;
+}
+
+async function inspectTicketInput(context: GoalContext, ticketFile: string): Promise<{ sourcePath: string; snapshot: Buffer }> {
+  if (!ticketFile) throw new Error("ticket issue requires a Markdown ticket file");
+  const inputPath = resolve(context.invocationDirectory, ticketFile);
+  let initialPathStat;
+  try { initialPathStat = await lstat(inputPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`ticket file does not exist: ${ticketFile}`);
+    throw error;
+  }
+  if (initialPathStat.isSymbolicLink()) throw new Error(`ticket file must not be a symbolic link: ${ticketFile}`);
+  await rejectInputSymlinks(context, inputPath, "ticket file");
+  const absolute = await realpath(inputPath);
+  const sourcePath = toProjectRelative(context.root, absolute, "ticket file");
+  if (sourcePath === ".git" || sourcePath.startsWith(".git/")) throw new Error("ticket file must be in the repository working tree");
+  if (!/\.(?:md|markdown)$/i.test(sourcePath)) throw new Error("ticket file must be Markdown (.md or .markdown)");
+  await rejectSymlinkComponents(context.root, absolute, "ticket file");
+
+  let handle;
+  try {
+    handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    throw new Error(`cannot open ticket file: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let snapshot: Buffer;
+  let openedStat;
+  try {
+    openedStat = await handle.stat();
+    if (!openedStat.isFile()) throw new Error(`ticket file is not a regular file: ${ticketFile}`);
+    if (openedStat.size > MAX_TICKET_BYTES) throw new Error(`ticket file exceeds ${MAX_TICKET_BYTES} bytes`);
+    const bounded = Buffer.alloc(MAX_TICKET_BYTES + 1);
+    let offset = 0;
+    while (offset < bounded.byteLength) {
+      const result = await handle.read(bounded, offset, bounded.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    if (offset > MAX_TICKET_BYTES) throw new Error(`ticket file exceeds ${MAX_TICKET_BYTES} bytes`);
+    snapshot = bounded.subarray(0, offset);
+    const finalOpenedStat = await handle.stat();
+    if (finalOpenedStat.dev !== openedStat.dev || finalOpenedStat.ino !== openedStat.ino || finalOpenedStat.size !== openedStat.size ||
+      finalOpenedStat.mtimeMs !== openedStat.mtimeMs || finalOpenedStat.ctimeMs !== openedStat.ctimeMs) {
+      throw new Error("ticket file changed while it was being read; retry");
+    }
+  } finally {
+    await handle.close();
+  }
+  if (snapshot.byteLength === 0 || !snapshot.toString("utf8").trim()) throw new Error("ticket file must not be empty");
+
+  await rejectInputSymlinks(context, inputPath, "ticket file");
+  await rejectSymlinkComponents(context.root, absolute, "ticket file");
+  const finalPathStat = await lstat(inputPath);
+  if (!finalPathStat.isFile() || finalPathStat.isSymbolicLink() || await realpath(inputPath) !== absolute ||
+    finalPathStat.dev !== openedStat.dev || finalPathStat.ino !== openedStat.ino || finalPathStat.size !== snapshot.byteLength ||
+    finalPathStat.mtimeMs !== openedStat.mtimeMs || finalPathStat.ctimeMs !== openedStat.ctimeMs) {
+    throw new Error("ticket file changed type or target during issuance");
+  }
+  return { sourcePath, snapshot };
+}
+
+async function ensureTicketStateDirectories(context: GoalContext, goalId: string): Promise<{ ticketsDirectory: string; workerTicketsDirectory: string }> {
+  const goalDirectory = join(context.goalsDir, goalId);
+  const ticketsDirectory = join(goalDirectory, "tickets");
+  const workflowDirectory = join(context.stateDir, "output", "workflow", goalId);
+  const workerTicketsDirectory = join(workflowDirectory, "tickets");
+  await rejectSymlinkComponents(context.root, ticketsDirectory, "ticket state path");
+  await mkdir(ticketsDirectory, { recursive: true, mode: 0o700 });
+  await rejectSymlinkComponents(context.root, ticketsDirectory, "ticket state path");
+  await rejectSymlinkComponents(context.root, workerTicketsDirectory, "worker-visible ticket state path");
+  await mkdir(workerTicketsDirectory, { recursive: true, mode: 0o700 });
+  await rejectSymlinkComponents(context.root, workerTicketsDirectory, "worker-visible ticket state path");
+  return { ticketsDirectory, workerTicketsDirectory };
+}
+
+async function installWorkerCopy(context: GoalContext, record: TicketRecord, snapshot: Buffer, workerTicketsDirectory: string): Promise<void> {
+  const finalDirectory = join(workerTicketsDirectory, record.ticketId);
+  const finalPath = join(finalDirectory, "ticket.md");
+  try {
+    await access(finalDirectory, constants.F_OK);
+    await rejectSymlinkComponents(context.root, finalPath, "existing worker-visible ticket path");
+    const existing = await readTicketCopy(finalPath, "existing worker-visible ticket copy", record);
+    if (!existing.equals(snapshot)) throw new Error("existing worker-visible ticket copy conflicts with ticket content");
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const staging = join(workerTicketsDirectory, `.tmp-${record.ticketId}-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    await mkdir(staging, { mode: 0o700 });
+    await durableWrite(join(staging, "ticket.md"), snapshot);
+    try { await rename(staging, finalDirectory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+  await rejectSymlinkComponents(context.root, finalPath, "worker-visible ticket path");
+  const installed = await readTicketCopy(finalPath, "worker-visible ticket copy", record);
+  if (!installed.equals(snapshot)) throw new Error("worker-visible ticket copy conflicts with ticket content");
+}
+
+async function installTicketRecord(
+  context: GoalContext,
+  active: ActiveGoal,
+  candidate: TicketRecord,
+  snapshot: Buffer,
+  ticketsDirectory: string,
+): Promise<TicketRecord> {
+  const goalDirectory = join(context.goalsDir, active.record.goalId);
+  const finalDirectory = join(ticketsDirectory, candidate.ticketId);
+  const recordPath = join(finalDirectory, "record.v1.json");
+  const snapshotPath = join(finalDirectory, "ticket.md");
+  try {
+    await access(finalDirectory, constants.F_OK);
+    await rejectSymlinkComponents(context.root, recordPath, "existing ticket record path");
+    await rejectSymlinkComponents(context.root, snapshotPath, "existing ticket snapshot path");
+    const existing = validateTicketRecord(await readSmallJson(recordPath, "existing ticket record", MAX_RECORD_BYTES), {
+      root: context.root,
+      goalId: active.record.goalId,
+      goalDirectory,
+      acceptedCodeRevision: active.record.acceptedCodeRevision,
+    });
+    const existingSnapshot = await readTicketCopy(snapshotPath, "existing ticket snapshot", existing);
+    if (!existingSnapshot.equals(snapshot)) throw new Error("existing ticket record conflicts with ticket content");
+    return existing;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const staging = join(ticketsDirectory, `.tmp-${candidate.ticketId}-${process.pid}-${crypto.randomUUID()}`);
+  try {
+    await mkdir(staging, { mode: 0o700 });
+    await durableWrite(join(staging, "ticket.md"), snapshot);
+    await durableWrite(join(staging, "record.v1.json"), `${JSON.stringify(candidate, null, 2)}\n`);
+    try { await rename(staging, finalDirectory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+  await rejectSymlinkComponents(context.root, recordPath, "ticket record path");
+  const installed = validateTicketRecord(await readSmallJson(recordPath, "ticket record", MAX_RECORD_BYTES), {
+    root: context.root,
+    goalId: active.record.goalId,
+    goalDirectory,
+    acceptedCodeRevision: active.record.acceptedCodeRevision,
+  });
+  const installedSnapshot = await readTicketCopy(snapshotPath, "ticket snapshot", installed);
+  if (!installedSnapshot.equals(snapshot)) throw new Error("installed ticket record conflicts with ticket content");
+  return installed;
+}
+
 export async function activateGoal(options: { goalFile: string; approvalStatement: string; cwd?: string; now?: Date }): Promise<ActivationResult> {
   const context = await discoverContext(options.cwd ?? process.cwd());
   const candidate = await inspectCandidate(context, options.goalFile, options.approvalStatement);
@@ -486,6 +814,86 @@ export async function activateGoal(options: { goalFile: string; approvalStatemen
     validateActiveGoalPointer(pointer, context);
     await atomicWrite(join(context.goalsDir, "active.json"), `${JSON.stringify(pointer, null, 2)}\n`);
     const loaded = await loadActiveFromContext(context, false);
+    return { ...loaded!, idempotent: false };
+  } finally {
+    await lock.close();
+    await rm(lockPath, { force: true });
+  }
+}
+
+export async function issueTicket(options: { ticketFile: string; cwd?: string; now?: Date }): Promise<TicketIssueResult> {
+  const context = await discoverContext(options.cwd ?? process.cwd());
+  const active = (await loadActiveFromContext(context, false))!;
+  await verifyCommitAvailable(context, active.record.acceptedCodeRevision);
+  const input = await inspectTicketInput(context, options.ticketFile);
+  const trackedState = await runGit(context.root, ["ls-files", "--", ".pi-swarm"]);
+  if (trackedState.code !== 0) throw new Error(`cannot inspect tracked Spike state: ${gitError(trackedState)}`);
+  if (trackedState.stdout.byteLength) throw new Error("refusing to write ticket state because .pi-swarm contains tracked files");
+  const ignored = await runGit(context.root, ["check-ignore", "--quiet", "--", ".pi-swarm/goals/active.json"]);
+  if (ignored.code !== 0) throw new Error(".pi-swarm/ is not ignored; run spike init or add .pi-swarm/ to .gitignore before issuing a ticket");
+  if (options.now && !Number.isFinite(options.now.getTime())) throw new Error("ticket issuance time is invalid");
+
+  const digest = sha256(input.snapshot);
+  const ticketId = ticketIdentity(active.record.goalId, active.record.acceptedCodeRevision, digest);
+  const issuedAt = (options.now ?? new Date()).toISOString();
+  const candidate: TicketRecord = {
+    schemaVersion: TICKET_SCHEMA_VERSION,
+    ticketId,
+    goalId: active.record.goalId,
+    status: "ready",
+    baseRevision: active.record.acceptedCodeRevision,
+    snapshotPath: `.pi-swarm/goals/${active.record.goalId}/tickets/${ticketId}/ticket.md`,
+    snapshotSha256: digest,
+    snapshotBytes: input.snapshot.byteLength,
+    sourcePath: input.sourcePath,
+    workerPath: `.pi-swarm/output/workflow/${active.record.goalId}/tickets/${ticketId}/ticket.md`,
+    issuedAt,
+  };
+  const goalDirectory = join(context.goalsDir, active.record.goalId);
+  validateTicketRecord(candidate, {
+    root: context.root,
+    goalId: active.record.goalId,
+    goalDirectory,
+    acceptedCodeRevision: active.record.acceptedCodeRevision,
+  });
+
+  const lockPath = join(goalDirectory, "ticket-issuance.lock");
+  await rejectSymlinkComponents(context.root, lockPath, "ticket issuance lock path");
+  let lock;
+  try {
+    lock = await open(lockPath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error("another ticket issuance is in progress (remove the ticket-issuance.lock only if no issuance process is running)");
+    }
+    throw error;
+  }
+  try {
+    const currentActive = (await loadActiveFromContext(context, false))!;
+    if (currentActive.record.goalId !== active.record.goalId ||
+      currentActive.record.acceptedCodeRevision !== active.record.acceptedCodeRevision) {
+      throw new Error("active goal changed during ticket issuance; retry");
+    }
+    const existing = await loadReadyFromContext(context, currentActive, true);
+    if (existing) {
+      if (existing.record.baseRevision === candidate.baseRevision && existing.snapshot.equals(input.snapshot)) {
+        return { ...existing, idempotent: true };
+      }
+      throw new Error(`a different ticket is already ready: ${existing.record.ticketId}`);
+    }
+
+    const { ticketsDirectory, workerTicketsDirectory } = await ensureTicketStateDirectories(context, active.record.goalId);
+    await installWorkerCopy(context, candidate, input.snapshot, workerTicketsDirectory);
+    const installedRecord = await installTicketRecord(context, currentActive, candidate, input.snapshot, ticketsDirectory);
+    const pointer: ActiveTicketPointer = {
+      schemaVersion: ACTIVE_TICKET_POINTER_SCHEMA_VERSION,
+      goalId: currentActive.record.goalId,
+      ticketId: installedRecord.ticketId,
+      recordPath: `.pi-swarm/goals/${currentActive.record.goalId}/tickets/${installedRecord.ticketId}/record.v1.json`,
+    };
+    validateActiveTicketPointer(pointer, { root: context.root, goalId: currentActive.record.goalId, goalDirectory });
+    await atomicWrite(join(goalDirectory, "active-ticket.json"), `${JSON.stringify(pointer, null, 2)}\n`);
+    const loaded = await loadReadyFromContext(context, currentActive, false);
     return { ...loaded!, idempotent: false };
   } finally {
     await lock.close();

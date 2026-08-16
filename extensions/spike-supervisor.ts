@@ -188,6 +188,8 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
     promptSnippet: "Dispatch, message, read, publish, list, stop, or open isolated container workers",
     promptGuidelines: [
       "Inspect existing durable goal state with spike goal status --json before drafting or activating a new goal, and never silently replace an active goal.",
+      "Before drafting a ticket, inspect spike ticket status --json and spike ticket show. A ready ticket survives supervisor restarts; never redispatch merely because the supervisor restarted.",
+      "Ticket issuance records planner intent but does not dispatch a worker.",
       "Never treat conversational intent, chat history, or terminal output as goal approval; activation requires an explicit operator approval statement at the CLI boundary.",
       "Use spike_agents to delegate independent coding, investigation, testing, and review tasks that can run concurrently.",
       "Give every spike_agents dispatch a unique stable agent name and a focused, self-contained task.",

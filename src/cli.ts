@@ -5,7 +5,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { activateGoal, loadActiveGoal, type GoalRecord } from "./goals.ts";
+import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
 
 const VERSION = "0.3.1";
@@ -62,6 +62,9 @@ Usage:
   spike goal activate <goal-file> --approval <statement>
   spike goal status [--json]
   spike goal show
+  spike ticket issue <ticket-file>
+  spike ticket status [--json]
+  spike ticket show
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -274,6 +277,46 @@ async function goalCommand(action: string | undefined, args: string[]) {
   }
 }
 
+function printTicketStatus(record: TicketRecord) {
+  console.log(`Ticket ID: ${record.ticketId}`);
+  console.log(`Goal ID: ${record.goalId}`);
+  console.log(`Status: ${record.status}`);
+  console.log(`Base revision: ${record.baseRevision}`);
+  console.log(`Issued at: ${record.issuedAt}`);
+  console.log(`Snapshot SHA-256: ${record.snapshotSha256}`);
+  console.log(`Worker-visible path: ${record.workerPath}`);
+}
+
+async function ticketCommand(action: string | undefined, args: string[]) {
+  try {
+    if (action === "issue") {
+      if (args.length !== 1 || args[0].startsWith("-")) fail("ticket issue requires exactly one Markdown ticket file", 2);
+      const result = await issueTicket({ ticketFile: args[0] });
+      console.log(`${result.idempotent ? "Already ready" : "Issued"} ticket ${result.record.ticketId}`);
+      printTicketStatus(result.record);
+      return;
+    }
+    if (action === "status") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) {
+        fail("ticket status accepts only --json", 2);
+      }
+      const ready = await loadReadyTicket();
+      if (args.includes("--json")) console.log(JSON.stringify(ready.record, null, 2));
+      else printTicketStatus(ready.record);
+      return;
+    }
+    if (action === "show") {
+      if (args.length) fail("ticket show accepts no arguments", 2);
+      const ready = await loadReadyTicket();
+      process.stdout.write(ready.snapshot);
+      return;
+    }
+    fail("expected ticket issue, status, or show", 2);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function runtimeFor(config: Config): Promise<Runtime> {
   const requested = process.env.SPIKE_RUNTIME ?? process.env.PI_CONTAINER_RUNTIME ?? config.runtime ?? "auto";
   if (!['auto', 'apple', 'docker'].includes(requested)) fail("SPIKE_RUNTIME must be auto, apple, or docker", 2);
@@ -462,6 +505,8 @@ async function supervisor(args: string[]) {
   const systemPrompt = [
     "You are the Spike supervisor for this repository.",
     "Before drafting or activating a goal, inspect durable state with spike goal status --json; never replace an existing active goal.",
+    "Before drafting a ticket, inspect spike ticket status --json and spike ticket show; a ready ticket is durable, and a supervisor restart is never a reason to redispatch it.",
+    "Issuing a ticket preserves planner state but does not dispatch a worker.",
     "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",
     "Delegate independent implementation, investigation, testing, and review tasks to isolated workers with spike_agents.",
     "Give each worker a focused task and a unique stable name. Workers have persistent clones and should commit completed work.",
@@ -921,6 +966,7 @@ else if (command === "build") await build();
 else if (command === "supervisor" || command === "start") await supervisor(args);
 else if (command === "herdr") await herdrCommand(args.shift());
 else if (command === "goal") await goalCommand(args.shift(), args);
+else if (command === "ticket") await ticketCommand(args.shift(), args);
 else if (command === "down") await down();
 else if (command === "agent") {
   const action = args.shift();
