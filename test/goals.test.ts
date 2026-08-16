@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -38,8 +38,9 @@ async function must(command: string[], cwd: string): Promise<string> {
 type Fixture = { root: string; goal: string; head: string; blob: string; approved: Buffer };
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "spike-goal-"));
-  temporaryDirectories.push(root);
+  const createdRoot = await mkdtemp(join(tmpdir(), "spike-goal-"));
+  temporaryDirectories.push(createdRoot);
+  const root = await realpath(createdRoot);
   await must(["git", "init", "-b", "main"], root);
   await must(["git", "config", "user.name", "Spike Test"], root);
   await must(["git", "config", "user.email", "spike@example.test"], root);
@@ -115,6 +116,30 @@ describe("durable goal activation", () => {
     expect(pointer.recordPath).toBe(`.pi-swarm/goals/${first.record.goalId}/record.v1.json`);
   });
 
+  test("accepts absolute and relative paths through a canonical repository alias", async () => {
+    const item = await fixture();
+    const aliasParent = await mkdtemp(join(tmpdir(), "spike-goal-alias-"));
+    temporaryDirectories.push(aliasParent);
+    const aliasRoot = join(aliasParent, "repository");
+    await symlink(item.root, aliasRoot);
+
+    const first = await activateGoal({
+      cwd: item.root,
+      goalFile: join(aliasRoot, "docs", "goal.md"),
+      approvalStatement: "approved through canonical alias",
+    });
+    expect(first.record.repositoryRoot).toBe(await realpath(item.root));
+    expect(first.record.goalPath).toBe("docs/goal.md");
+
+    const second = await activateGoal({
+      cwd: aliasRoot,
+      goalFile: "docs/goal.md",
+      approvalStatement: "approved through canonical alias",
+    });
+    expect(second.idempotent).toBe(true);
+    expect(second.record.goalId).toBe(first.record.goalId);
+  });
+
   test("fresh CLI processes recover metadata and show the snapshot after the source changes", async () => {
     const item = await fixture();
     const approval = "Operator explicitly approved goal 002.";
@@ -171,7 +196,19 @@ describe("durable goal activation", () => {
 
     const linked = await fixture();
     await symlink("docs/goal.md", join(linked.root, "linked.md"));
-    await expect(activateGoal({ cwd: linked.root, goalFile: "linked.md", approvalStatement: "approved" })).rejects.toThrow("symbolic links");
+    await expect(activateGoal({ cwd: linked.root, goalFile: "linked.md", approvalStatement: "approved" })).rejects.toThrow("symbolic link");
+    await symlink("docs", join(linked.root, "linked-docs"));
+    await expect(activateGoal({ cwd: linked.root, goalFile: "linked-docs/goal.md", approvalStatement: "approved" })).rejects.toThrow("symbolic links");
+    const escapeTarget = await mkdtemp(join(tmpdir(), "spike-goal-escape-"));
+    temporaryDirectories.push(escapeTarget);
+    await writeFile(join(escapeTarget, "outside.md"), "# outside\n");
+    await symlink(escapeTarget, join(linked.root, "escape"));
+    await expect(activateGoal({ cwd: linked.root, goalFile: "escape/outside.md", approvalStatement: "approved" })).rejects.toThrow("symbolic links");
+    const subdirectoryAliasParent = await mkdtemp(join(tmpdir(), "spike-goal-subdir-alias-"));
+    temporaryDirectories.push(subdirectoryAliasParent);
+    const subdirectoryAlias = join(subdirectoryAliasParent, "docs");
+    await symlink(join(linked.root, "docs"), subdirectoryAlias);
+    await expect(activateGoal({ cwd: linked.root, goalFile: join(subdirectoryAlias, "goal.md"), approvalStatement: "approved" })).rejects.toThrow("symbolic-link alias");
 
     const nonMarkdown = await fixture();
     await expect(activateGoal({ cwd: nonMarkdown.root, goalFile: "tracked.txt", approvalStatement: "approved" })).rejects.toThrow("must be Markdown");
@@ -184,6 +221,20 @@ describe("durable goal activation", () => {
     await writeFile(join(notIgnored.root, ".gitignore"), "");
     await expect(activateGoal({ cwd: notIgnored.root, goalFile: notIgnored.goal, approvalStatement: "approved" })).rejects.toThrow("is not ignored");
     expect(await Bun.file(join(notIgnored.root, ".pi-swarm")).exists()).toBe(false);
+  });
+
+  test("rejects dirty goal bytes even when Git marks the path assume-unchanged", async () => {
+    const item = await fixture();
+    await must(["git", "update-index", "--assume-unchanged", "docs/goal.md"], item.root);
+    await writeFile(item.goal, "# hidden dirty goal\n");
+    expect((await execute(["git", "diff", "--quiet", "HEAD", "--", "docs/goal.md"], item.root)).code).toBe(0);
+
+    await expect(activateGoal({
+      cwd: item.root,
+      goalFile: item.goal,
+      approvalStatement: "must not approve hidden changes",
+    })).rejects.toThrow("uncommitted changes");
+    expect(await Bun.file(join(item.root, ".pi-swarm")).exists()).toBe(false);
   });
 });
 

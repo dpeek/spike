@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export const GOAL_SCHEMA_VERSION = 1;
 export const ACTIVE_GOAL_POINTER_SCHEMA_VERSION = 1;
@@ -46,7 +46,7 @@ type GitResult = { code: number; stdout: Buffer; stderr: string };
 
 type GoalContext = {
   root: string;
-  workingDirectory: string;
+  invocationDirectory: string;
   stateDir: string;
   goalsDir: string;
   projectId: string;
@@ -108,9 +108,8 @@ async function discoverContext(cwd: string): Promise<GoalContext> {
   const root = await realpath(output(discovered));
   const head = await runGit(root, ["rev-parse", "--verify", "HEAD^{commit}"]);
   if (head.code !== 0) throw new Error("the repository must have at least one commit");
-  const workingDirectory = await realpath(requested);
   const stateDir = join(root, ".pi-swarm");
-  return { root, workingDirectory, stateDir, goalsDir: join(stateDir, "goals"), projectId: projectIdentity(root) };
+  return { root, invocationDirectory: requested, stateDir, goalsDir: join(stateDir, "goals"), projectId: projectIdentity(root) };
 }
 
 function toProjectRelative(root: string, path: string, label: string): string {
@@ -155,6 +154,29 @@ async function rejectSymlinkComponents(root: string, path: string, label: string
       throw error;
     }
   }
+}
+
+async function rejectInputSymlinks(context: GoalContext, inputPath: string, label: string): Promise<void> {
+  const parsed = parse(inputPath);
+  let current = parsed.root;
+  let repositoryAlias: string | undefined;
+  for (const part of inputPath.slice(parsed.root.length).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      const canonicalPrefix = await realpath(current);
+      if (canonicalPrefix === context.root) {
+        repositoryAlias = current;
+        break;
+      }
+      if (canonicalPrefix.startsWith(`${context.root}${sep}`)) {
+        throw new Error(`${label} must not enter the repository through a symbolic-link alias: ${current}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
+  if (repositoryAlias) await rejectSymlinkComponents(repositoryAlias, inputPath, label);
 }
 
 async function readSmallJson(path: string, label: string, limit: number): Promise<unknown> {
@@ -305,18 +327,21 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 async function inspectCandidate(context: GoalContext, goalFile: string, approvalStatement: string): Promise<{ record: GoalRecord; snapshot: Buffer }> {
   if (!approvalStatement || !approvalStatement.trim()) throw new Error("approval statement must be non-empty");
   if (!goalFile) throw new Error("goal activate requires a Markdown goal file");
-  const absolute = resolve(context.workingDirectory, goalFile);
-  const goalPath = toProjectRelative(context.root, absolute, "goal file");
-  if (!/\.(?:md|markdown)$/i.test(goalPath)) throw new Error("goal file must be Markdown (.md or .markdown)");
-  await rejectSymlinkComponents(context.root, absolute, "goal file");
-  let stat;
-  try { stat = await lstat(absolute); }
+  const inputPath = resolve(context.invocationDirectory, goalFile);
+  let inputStat;
+  try { inputStat = await lstat(inputPath); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`goal file does not exist: ${goalFile}`);
     throw error;
   }
-  if (stat.isSymbolicLink()) throw new Error(`goal file must not be a symbolic link: ${goalFile}`);
-  if (!stat.isFile()) throw new Error(`goal file is not a regular file: ${goalFile}`);
+  if (inputStat.isSymbolicLink()) throw new Error(`goal file must not be a symbolic link: ${goalFile}`);
+  await rejectInputSymlinks(context, inputPath, "goal file");
+  const absolute = await realpath(inputPath);
+  const goalPath = toProjectRelative(context.root, absolute, "goal file");
+  if (!/\.(?:md|markdown)$/i.test(goalPath)) throw new Error("goal file must be Markdown (.md or .markdown)");
+  await rejectSymlinkComponents(context.root, absolute, "goal file");
+  const stat = await lstat(absolute);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`goal file is not a regular file: ${goalFile}`);
 
   const literalPathspec = `:(literal)${goalPath}`;
   const tracked = await runGit(context.root, ["ls-files", "--error-unmatch", "--", literalPathspec]);
@@ -332,18 +357,28 @@ async function inspectCandidate(context: GoalContext, goalFile: string, approval
   if (blobResult.code !== 0 || !objectIdPattern.test(approvedBlob)) throw new Error(`goal file is not represented by a Git object at HEAD: ${goalPath}`);
   const typeResult = await runGit(context.root, ["cat-file", "-t", approvedBlob]);
   if (typeResult.code !== 0 || output(typeResult) !== "blob") throw new Error(`goal file is not represented by a Git blob at HEAD: ${goalPath}`);
+  const worktreeBlob = await runGit(context.root, ["hash-object", `--path=${goalPath}`, "--", goalPath]);
+  if (worktreeBlob.code !== 0) throw new Error(`cannot hash goal file through Git filters: ${gitError(worktreeBlob)}`);
+  if (output(worktreeBlob) !== approvedBlob) throw new Error(`goal file has uncommitted changes: ${goalPath}`);
   const contentResult = await runGit(context.root, ["cat-file", "blob", approvedBlob]);
   if (contentResult.code !== 0) throw new Error(`cannot read approved Git blob: ${gitError(contentResult)}`);
   if (contentResult.stdout.byteLength > MAX_SNAPSHOT_BYTES) throw new Error(`approved goal exceeds ${MAX_SNAPSHOT_BYTES} bytes`);
 
-  // Recheck the input after reading the object so a normal concurrent edit is
-  // rejected rather than silently approving a now-dirty source path.
+  // Recheck the input and its filtered worktree bytes after reading the object
+  // so concurrent edits and assume-unchanged index flags cannot bypass approval.
+  await rejectInputSymlinks(context, inputPath, "goal file");
   await rejectSymlinkComponents(context.root, absolute, "goal file");
+  const finalInputStat = await lstat(inputPath);
   const finalStat = await lstat(absolute);
-  if (!finalStat.isFile() || finalStat.isSymbolicLink()) throw new Error("goal file changed type during activation");
+  if (finalInputStat.isSymbolicLink() || !finalStat.isFile() || finalStat.isSymbolicLink() || await realpath(inputPath) !== absolute) {
+    throw new Error("goal file changed type or target during activation");
+  }
   const finalClean = await runGit(context.root, ["diff", "--quiet", "--no-ext-diff", "HEAD", "--", literalPathspec]);
   if (finalClean.code === 1) throw new Error(`goal file has uncommitted changes: ${goalPath}`);
   if (finalClean.code !== 0) throw new Error(`cannot compare goal file with HEAD: ${gitError(finalClean)}`);
+  const finalWorktreeBlob = await runGit(context.root, ["hash-object", `--path=${goalPath}`, "--", goalPath]);
+  if (finalWorktreeBlob.code !== 0) throw new Error(`cannot hash goal file through Git filters: ${gitError(finalWorktreeBlob)}`);
+  if (output(finalWorktreeBlob) !== approvedBlob) throw new Error(`goal file has uncommitted changes: ${goalPath}`);
   const finalRevision = await runGit(context.root, ["rev-parse", "--verify", "HEAD^{commit}"]);
   if (finalRevision.code !== 0 || output(finalRevision) !== repositoryRevision) throw new Error("repository HEAD changed during goal activation; retry");
 
