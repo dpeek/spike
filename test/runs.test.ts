@@ -115,7 +115,16 @@ async function writeLegacyAgent(item: Fixture, name: string, options: { backend?
   await writeFile(join(directory, `${name.toLowerCase()}.json`), `${JSON.stringify(legacyAgent(item, name, options), null, 2)}\n`);
 }
 
-type ToolBehavior = "ok" | "absent" | "fail" | "fail-once" | "portless-absent" | "portless-absent-lowercase";
+type ToolBehavior =
+  | "ok"
+  | "absent"
+  | "fail"
+  | "fail-once"
+  | "portless-absent"
+  | "portless-absent-lowercase"
+  | "ambiguous-absent"
+  | "ambiguous-present"
+  | "ambiguous-probe-fail";
 
 async function installAgentTooling(root: string, state: AgentState, options: {
   runtime?: "apple" | "docker";
@@ -130,23 +139,46 @@ async function installAgentTooling(root: string, state: AgentState, options: {
   await mkdir(fakeBin, { recursive: true });
   await mkdir(onceDir, { recursive: true });
   const behavior = options.behavior ?? {};
+  const oncePath = (name: string) => join(onceDir, name);
+  const genericDeleteFailure = (kind: "workspace" | "network", identifier: string) =>
+    kind === "workspace"
+      ? `Error: failed to delete one or more volumes: [\"${identifier}\"]`
+      : `Error: failed to delete one or more networks: [\"${identifier}\"]`;
   const outcome = (name: string, mode: ToolBehavior | undefined, missing: string, failed: string) => {
     if (mode === "absent" || mode === "portless-absent" || mode === "portless-absent-lowercase") return `echo ${JSON.stringify(missing)} >&2\nexit 1`;
     if (mode === "fail") return `echo ${JSON.stringify(failed)} >&2\nexit 1`;
-    if (mode === "fail-once") return `if [ ! -f ${JSON.stringify(join(onceDir, name))} ]; then touch ${JSON.stringify(join(onceDir, name))}; echo ${JSON.stringify(failed)} >&2; exit 1; fi\nexit 0`;
+    if (mode === "fail-once") return `if [ ! -f ${JSON.stringify(oncePath(name))} ]; then touch ${JSON.stringify(oncePath(name))}; echo ${JSON.stringify(failed)} >&2; exit 1; fi\nexit 0`;
+    return "exit 0";
+  };
+  const runtimeRemoveOutcome = (name: string, kind: "container" | "workspace" | "network", mode: ToolBehavior | undefined, identifier: string, missing: string, failed: string) => {
+    if ((mode === "ambiguous-absent" || mode === "ambiguous-present" || mode === "ambiguous-probe-fail") && (kind === "workspace" || kind === "network")) {
+      return `echo ${JSON.stringify(genericDeleteFailure(kind, identifier))} >&2\nexit 1`;
+    }
+    return outcome(name, mode, missing, failed);
+  };
+  const runtimeInspectOutcome = (kind: "workspace" | "network", mode: ToolBehavior | undefined, identifier: string, missing: string) => {
+    if (mode === "ambiguous-absent" || mode === "absent") return `echo ${JSON.stringify(missing)} >&2\nexit 1`;
+    if (mode === "ambiguous-present") return `printf '%s\n' ${JSON.stringify(`[{\"name\":\"${identifier}\"}]`)}\nexit 0`;
+    if (mode === "ambiguous-probe-fail") return `echo ${JSON.stringify(`${kind} inspect unavailable`)} >&2\nexit 1`;
     return "exit 0";
   };
   await writeFile(join(fakeBin, command), `#!/bin/sh
 printf '${command}\t%s\n' "$*" >> ${JSON.stringify(logPath)}
 case "$*" in
   ${JSON.stringify(runtime === "apple" ? `rm ${state.container}` : `rm --force ${state.container}`)})
-    ${outcome("container", behavior.container, `No such container: ${state.container}`, "container removal failed")}
+    ${runtimeRemoveOutcome("container", "container", behavior.container, state.container, `No such container: ${state.container}`, "container removal failed")}
     ;;
   ${JSON.stringify(`volume rm ${state.workspaceVolume}`)})
-    ${outcome("workspace", behavior.workspace, `${state.workspaceVolume} not found`, "volume removal failed")}
+    ${runtimeRemoveOutcome("workspace", "workspace", behavior.workspace, state.workspaceVolume, `${state.workspaceVolume} not found`, "volume removal failed")}
+    ;;
+  ${JSON.stringify(`volume inspect ${state.workspaceVolume}`)})
+    ${runtimeInspectOutcome("workspace", behavior.workspace, state.workspaceVolume, `${state.workspaceVolume} not found`)}
     ;;
   ${JSON.stringify(`network rm ${state.network}`)})
-    ${outcome("network", behavior.network, `${state.network} not found`, "network removal failed")}
+    ${runtimeRemoveOutcome("network", "network", behavior.network, state.network, `${state.network} not found`, "network removal failed")}
+    ;;
+  ${JSON.stringify(`network inspect ${state.network}`)})
+    ${runtimeInspectOutcome("network", behavior.network, state.network, `${state.network} not found`)}
     ;;
   *) exit 0 ;;
 esac
@@ -328,7 +360,7 @@ describe("agent listing and finalization", () => {
     }
   });
 
-  test("retries partial cleanup, accepts absent resources, and uses Docker removal commands", async () => {
+  test("retries only pending/failed cleanup, preserves completed statuses, and uses Docker removal commands", async () => {
     const item = await fixture();
     const state: AgentState = {
       schemaVersion: 1,
@@ -376,10 +408,126 @@ describe("agent listing and finalization", () => {
     expect(await readAgentState(item.stateDir, state.slug)).toBeUndefined();
     const [finalized] = await listAgentFinalizations(item.stateDir, state.slug);
     expect(finalized.finalizedAt).toBeDefined();
+    expect(finalized.cleanup.container.status).toBe("absent");
+    expect(finalized.cleanup.workspaceVolume.status).toBe("absent");
     expect(finalized.cleanup.network.status).toBe("removed");
-    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\trm --force ${state.container}`);
-    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\tvolume rm ${state.workspaceVolume}`);
-    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\tnetwork rm ${state.network}`);
+    expect(finalized.cleanup.alias.status).toBe("removed");
+    expect(finalized.cleanup.herdrTab.status).toBe("removed");
+    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toEqual([
+      `docker\trm --force ${state.container}`,
+      `docker\tvolume rm ${state.workspaceVolume}`,
+      `docker\tnetwork rm ${state.network}`,
+      `docker\tnetwork inspect ${state.network}`,
+      `portless\talias --remove ${state.alias}`,
+      `herdr\ttab close ${state.herdrTabId}`,
+      `docker\tnetwork rm ${state.network}`,
+    ]);
+  });
+
+  test("accepts ambiguous Apple volume/network delete failures only after exact negative inspect", async () => {
+    const item = await fixture();
+    const state: AgentState = {
+      schemaVersion: 1,
+      name: "apple-worker",
+      slug: "apple-worker",
+      project: "test",
+      runtime: "apple",
+      container: "container-apple-worker",
+      workspaceVolume: "volume-apple-worker",
+      network: "network-apple-worker",
+      alias: "apple-worker.test",
+      containerPort: 3000,
+      backend: "herdr",
+      herdrTabId: "tab-apple-worker",
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      lifecycle: "stopped",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      finishedAt: "2026-08-17T10:12:12.000Z",
+      stopRequestedAt: "2026-08-17T10:12:00.000Z",
+      stopReason: "operator-requested",
+      stopRequester: "cli",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      outcome: "stopped",
+      pid: 1234,
+    };
+    await writeAgentState(item.stateDir, state);
+    const tooling = await installAgentTooling(item.root, state, { behavior: { workspace: "ambiguous-absent", network: "ambiguous-absent", alias: "ok", herdr: "ok" } });
+    const removed = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+    expect(removed.code).toBe(0);
+    expect(await readAgentState(item.stateDir, state.slug)).toBeUndefined();
+    const [finalized] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(finalized.cleanup.workspaceVolume.status).toBe("absent");
+    expect(finalized.cleanup.workspaceVolume.detail).toContain("verified absent via exact volume inspect");
+    expect(finalized.cleanup.network.status).toBe("absent");
+    expect(finalized.cleanup.network.detail).toContain("verified absent via exact network inspect");
+    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toEqual([
+      `container\trm ${state.container}`,
+      `container\tvolume rm ${state.workspaceVolume}`,
+      `container\tvolume inspect ${state.workspaceVolume}`,
+      `container\tnetwork rm ${state.network}`,
+      `container\tnetwork inspect ${state.network}`,
+      `portless\talias --remove ${state.alias}`,
+      `herdr\ttab close ${state.herdrTabId}`,
+    ]);
+  });
+
+  test("keeps resources failed when exact inspect still finds them or is inconclusive and uses Docker inspect commands", async () => {
+    const item = await fixture();
+    const state: AgentState = {
+      schemaVersion: 1,
+      name: "docker-probe",
+      slug: "docker-probe",
+      project: "test",
+      runtime: "docker",
+      container: "container-docker-probe",
+      workspaceVolume: "volume-docker-probe",
+      network: "network-docker-probe",
+      alias: "docker-probe.test",
+      containerPort: 3000,
+      backend: "herdr",
+      herdrTabId: "tab-docker-probe",
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      lifecycle: "stopped",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      finishedAt: "2026-08-17T10:12:12.000Z",
+      stopRequestedAt: "2026-08-17T10:12:00.000Z",
+      stopReason: "operator-requested",
+      stopRequester: "cli",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      outcome: "stopped",
+      pid: 1234,
+    };
+    await writeAgentState(item.stateDir, state);
+    const tooling = await installAgentTooling(item.root, state, { runtime: "docker", behavior: { workspace: "ambiguous-absent", network: "ambiguous-probe-fail", alias: "ok", herdr: "ok" } });
+    let first = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+    expect(first.code).toBe(1);
+    let [pending] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(pending.cleanup.workspaceVolume.status).toBe("absent");
+    expect(pending.cleanup.network.status).toBe("failed");
+    expect(pending.cleanup.network.detail).toContain("inconclusive");
+
+    const existing = await installAgentTooling(item.root, state, { runtime: "docker", behavior: { network: "ambiguous-present" } });
+    await writeFile(existing.logPath, "");
+    first = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, existing.env);
+    expect(first.code).toBe(1);
+    [pending] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(pending.cleanup.workspaceVolume.status).toBe("absent");
+    expect(pending.cleanup.network.status).toBe("failed");
+    expect(pending.cleanup.network.detail).toContain(`exact network inspect still found ${state.network}`);
+    expect((await readFile(existing.logPath, "utf8")).trim().split("\n")).toContain(`docker\tnetwork inspect ${state.network}`);
+    expect((await readFile(existing.logPath, "utf8")).trim().split("\n")).not.toContain(`docker\tvolume rm ${state.workspaceVolume}`);
+    expect((await readFile(existing.logPath, "utf8")).trim().split("\n")).not.toContain(`portless\talias --remove ${state.alias}`);
+    expect((await readAgentState(item.stateDir, state.slug))?.slug).toBe(state.slug);
   });
 
   test("classifies the real Portless absent alias response as absent", async () => {

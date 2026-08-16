@@ -578,9 +578,14 @@ async function removeAlias(alias?: string) {
 }
 
 type CleanupStatus = AgentFinalizationResourceRecord["status"];
+type CleanupKey = keyof AgentFinalizationRecord["cleanup"];
 
 function cleanupOutcome(status: CleanupStatus, identifier?: string, detail?: string): AgentFinalizationResourceRecord {
   return { status, ...(identifier ? { identifier } : {}), ...(detail ? { detail } : {}) };
+}
+
+function cleanupCompleted(status: CleanupStatus): boolean {
+  return status === "removed" || status === "absent" || status === "not_configured";
 }
 
 function cleanupMissing(result: { stdout: string; stderr: string }): boolean {
@@ -601,8 +606,17 @@ function trimDetail(result: { stdout: string; stderr: string }): string | undefi
   return text ? text.slice(0, 300) : undefined;
 }
 
+function cleanupDetail(...parts: Array<string | undefined>): string | undefined {
+  const text = parts.filter(Boolean).join("; ").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 300) : undefined;
+}
+
 function removeContainerCommand(runtime: Runtime, container: string): string[] {
   return runtime === "apple" ? [runtimeCommand(runtime), "rm", container] : [runtimeCommand(runtime), "rm", "--force", container];
+}
+
+function inspectRuntimeResourceCommand(runtime: Runtime, kind: "volume" | "network", identifier: string): string[] {
+  return [runtimeCommand(runtime), kind, "inspect", identifier];
 }
 
 async function finalizeAlias(alias?: string): Promise<AgentFinalizationResourceRecord> {
@@ -623,10 +637,21 @@ async function finalizeHerdrTab(tabId?: string): Promise<AgentFinalizationResour
   return cleanupOutcome("failed", tabId, trimDetail(result));
 }
 
-async function finalizeRuntimeResource(command: string[], identifier: string): Promise<AgentFinalizationResourceRecord> {
+async function finalizeRuntimeResource(runtime: Runtime, kind: "container" | "volume" | "network", identifier: string): Promise<AgentFinalizationResourceRecord> {
+  const command = kind === "container" ? removeContainerCommand(runtime, identifier) : [runtimeCommand(runtime), kind, "rm", identifier];
   const result = await capture(command);
   if (result.code === 0) return cleanupOutcome("removed", identifier);
   if (cleanupMissing(result)) return cleanupOutcome("absent", identifier);
+  if (kind === "volume" || kind === "network") {
+    const probe = await capture(inspectRuntimeResourceCommand(runtime, kind, identifier));
+    if (probe.code !== 0 && cleanupMissing(probe)) {
+      return cleanupOutcome("absent", identifier, cleanupDetail(trimDetail(result), `verified absent via exact ${kind} inspect`));
+    }
+    if (probe.code === 0) {
+      return cleanupOutcome("failed", identifier, cleanupDetail(trimDetail(result), `exact ${kind} inspect still found ${identifier}`));
+    }
+    return cleanupOutcome("failed", identifier, cleanupDetail(trimDetail(result), `exact ${kind} inspect was inconclusive`, trimDetail(probe)));
+  }
   return cleanupOutcome("failed", identifier, trimDetail(result));
 }
 
@@ -641,6 +666,17 @@ async function persistFinalizationCleanup(stateDir: string, record: AgentFinaliz
   else delete next.finalizedAt;
   await writeAgentFinalization(stateDir, next);
   return next;
+}
+
+async function persistRetriedFinalizationCleanup<K extends CleanupKey>(
+  stateDir: string,
+  record: AgentFinalizationRecord,
+  key: K,
+  cleanup: () => Promise<AgentFinalizationRecord["cleanup"][K]>,
+): Promise<AgentFinalizationRecord> {
+  if (cleanupCompleted(record.cleanup[key].status)) return record;
+  const next = { [key]: await cleanup() } as Pick<AgentFinalizationRecord["cleanup"], K>;
+  return persistFinalizationCleanup(stateDir, record, next);
 }
 
 function cleanupSummary(record: AgentFinalizationRecord): string {
@@ -1156,21 +1192,16 @@ async function removeAgent(name: string | undefined, force: boolean) {
     return;
   }
 
-  finalization = await persistFinalizationCleanup(stateDir, finalization, {
-    container: await finalizeRuntimeResource(removeContainerCommand(state.runtime, state.container), state.container),
-  });
-  finalization = await persistFinalizationCleanup(stateDir, finalization, {
-    workspaceVolume: await finalizeRuntimeResource([runtimeCommand(state.runtime), "volume", "rm", state.workspaceVolume], state.workspaceVolume),
-  });
-  finalization = await persistFinalizationCleanup(stateDir, finalization, {
-    network: await finalizeRuntimeResource([runtimeCommand(state.runtime), "network", "rm", state.network], state.network),
-  });
-  finalization = await persistFinalizationCleanup(stateDir, finalization, {
-    alias: await finalizeAlias(state.alias),
-  });
-  finalization = await persistFinalizationCleanup(stateDir, finalization, {
-    herdrTab: await finalizeHerdrTab(state.herdrTabId),
-  });
+  finalization = await persistRetriedFinalizationCleanup(stateDir, finalization, "container", async () =>
+    await finalizeRuntimeResource(state.runtime, "container", state.container));
+  finalization = await persistRetriedFinalizationCleanup(stateDir, finalization, "workspaceVolume", async () =>
+    await finalizeRuntimeResource(state.runtime, "volume", state.workspaceVolume));
+  finalization = await persistRetriedFinalizationCleanup(stateDir, finalization, "network", async () =>
+    await finalizeRuntimeResource(state.runtime, "network", state.network));
+  finalization = await persistRetriedFinalizationCleanup(stateDir, finalization, "alias", async () =>
+    await finalizeAlias(state.alias));
+  finalization = await persistRetriedFinalizationCleanup(stateDir, finalization, "herdrTab", async () =>
+    await finalizeHerdrTab(state.herdrTabId));
 
   if (!finalizedAgentComplete(finalization)) {
     fail(`agent ${state.slug} finalization is incomplete; retry after resolving failed cleanup: ${cleanupSummary(finalization)}`);
