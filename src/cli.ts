@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor, type TicketHistoryEntry } from "./workflow.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
+import { finalizeAgentRemoval } from "./finalization.ts";
 import {
   agentStatePath,
   dispatchTicket as dispatchReadyTicket,
@@ -1053,14 +1054,11 @@ async function removeAgent(name: string | undefined, force: boolean) {
   const { stateDir } = await loadContext();
   const state = await readState(stateDir, name);
   if (!state) fail(`unknown agent: ${name}`);
-  await capture([runtimeCommand(state.runtime), "stop", state.container]);
-  await removeAlias(state.alias);
-  for (const [kind, resource] of [["volume", state.workspaceVolume], ["network", state.network]] as const) {
-    const result = await capture([runtimeCommand(state.runtime), kind, "rm", resource]);
-    if (result.code !== 0 && !result.stderr.toLowerCase().includes("not found")) console.warn(`warning: ${result.stderr}`);
+  const result = await finalizeAgentRemoval({ stateDir, state, runCommand: capture, available });
+  if (!result.completed) {
+    const failed = result.failedResources.length ? `; failed: ${result.failedResources.join(", ")}` : "";
+    fail(`agent ${state.slug} cleanup is incomplete; retry spike agent remove ${state.slug} --force${failed}`);
   }
-  if (state.herdrTabId && await available("herdr")) await capture(["herdr", "tab", "close", state.herdrTabId]);
-  await rm(statePath(stateDir, state.slug), { force: true });
   console.log(`Removed ${state.slug}`);
 }
 

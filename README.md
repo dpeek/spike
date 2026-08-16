@@ -446,8 +446,10 @@ to the worker's start identity and optional run. This lets the stop caller repai
 a legacy launcher's terminal overwrite; the record is removed after terminal
 reconciliation and cannot apply to a replacement process or run.
 
-`remove --force` deletes that agent's persistent clone and network. It does not
-delete `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,
+`remove --force` persists cleanup progress under `.pi-swarm/agents/finalization/`
+and retries only resources still `pending` or `failed`; completed cleanup is
+never retried or downgraded. It removes that agent's runtime resources without
+deleting `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,
 snapshots, publications, bundles, and artifacts. `spike down` stops this
 project's active agents and removes their aliases, but deliberately leaves the
 global Portless proxy running for other projects.
