@@ -1,7 +1,16 @@
 import { open, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
 import { loadActiveGoal, loadReadyTicket, loadWorkflowState, validateTicketRecord, type TicketRecord } from "./goals.ts";
-import { loadActiveRun, normalizeAgentState, validateAgentStopIntent, validateRunRecord, type AgentState, type RunRecord } from "./runs.ts";
+import {
+  loadActiveRun,
+  normalizeAgentState,
+  validateAgentFinalizationRecord,
+  validateAgentStopIntent,
+  validateRunRecord,
+  type AgentFinalizationRecord,
+  type AgentState,
+  type RunRecord,
+} from "./runs.ts";
 import { loadLatestPublication, type CommandRunner, type PublicationResult } from "./publication.ts";
 import {
   TICKET_RESULT_SCHEMA_VERSION,
@@ -252,6 +261,36 @@ async function readAgentReadonly(stateDir: string, slug: string): Promise<AgentS
   return value === undefined ? undefined : normalizeAgentState(value, slug).state;
 }
 
+async function readFinalizedAgents(root: string): Promise<{ records: Map<string, AgentFinalizationRecord>; errors: string[] }> {
+  const directory = join(root, ".pi-swarm", "finalized-agents");
+  const records = new Map<string, AgentFinalizationRecord>();
+  const errors: string[] = [];
+  if (!await exists(directory)) return { records, errors };
+  try { await rejectSymlinks(root, directory, "agent finalization directory"); }
+  catch (error) { return { records, errors: [error instanceof Error ? error.message : String(error)] }; }
+  for (const file of (await readdir(directory)).filter((name) => name.endsWith(".v1.json")).sort()) {
+    const finalizationId = file.slice(0, -8);
+    const path = join(directory, file);
+    try {
+      await rejectSymlinks(root, path, "agent finalization path");
+      records.set(finalizationId, validateAgentFinalizationRecord(await readJson(path, "agent finalization record"), { finalizationId }));
+    } catch (error) {
+      errors.push(`agent finalization ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { records, errors };
+}
+
+function finalizedRunMatches(record: AgentFinalizationRecord, run: RunRecord): boolean {
+  return record.correlation?.runId === run.runId && record.correlation.goalId === run.goalId && record.correlation.ticketId === run.ticketId &&
+    record.correlation.baseRevision === run.baseRevision && record.agent.slug === run.worker.slug && record.terminal.lifecycle === run.status;
+}
+
+function finalizedHistoricalMatch(record: AgentFinalizationRecord, expected: { goalId: string; ticketId: string; baseRevision: string; slug: string }): boolean {
+  return record.correlation?.runId === undefined && record.correlation?.goalId === expected.goalId && record.correlation.ticketId === expected.ticketId &&
+    record.correlation.baseRevision === expected.baseRevision && record.agent.slug === expected.slug;
+}
+
 export type DoctorReport = {
   schemaVersion: 1;
   ok: boolean;
@@ -285,6 +324,8 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
     report.summary.acceptedCodeRevision = state.acceptedCodeRevision;
     report.summary.activeTicketId = state.activeTicketId;
     const history = await ticketHistory(root, { readOnly: true });
+    const finalized = await readFinalizedAgents(root);
+    report.errors.push(...finalized.errors);
     report.summary.tickets = history.length;
     report.summary.results = history.filter((entry) => entry.result).length;
     for (const entry of history) {
@@ -296,15 +337,23 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
             const runRecord = validateRunRecord(await readJson(runPath, "result run record"), { goalId: state.goalId, ticketId: entry.ticket.ticketId, baseRevision: entry.ticket.baseRevision, runId: entry.result.runId });
             if (!terminalRuns.has(runRecord.status) || runRecord.worker.slug !== entry.result.worker?.slug) throw new Error(`run provenance for ${entry.ticket.ticketId} is inconsistent`);
             const agent = await readAgentReadonly(join(root, ".pi-swarm"), runRecord.worker.slug);
-            if (!agent || agent.runId !== runRecord.runId || agent.goalId !== runRecord.goalId || agent.ticketId !== runRecord.ticketId || agent.baseRevision !== runRecord.baseRevision || !agent.finishedAt) {
-              throw new Error(`agent/run correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
-            }
+            const activeMatches = Boolean(agent && agent.runId === runRecord.runId && agent.goalId === runRecord.goalId && agent.ticketId === runRecord.ticketId &&
+              agent.baseRevision === runRecord.baseRevision && agent.finishedAt);
+            const finalizedAgent = finalized.records.get(runRecord.runId);
+            if (finalizedAgent && !finalizedRunMatches(finalizedAgent, runRecord)) throw new Error(`finalized agent/run correlation for ${entry.ticket.ticketId} is inconsistent`);
+            if (!activeMatches && !finalizedAgent) throw new Error(`agent/run correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
           } catch (error) { report.errors.push(error instanceof Error ? error.message : String(error)); }
         } else if (entry.result.provenanceMigrated && entry.result.worker) {
           const agent = await readAgentReadonly(join(root, ".pi-swarm"), entry.result.worker.slug);
-          if (!agent || agent.runId !== undefined || agent.goalId !== state.goalId || agent.ticketId !== entry.ticket.ticketId || agent.baseRevision !== entry.ticket.baseRevision) {
-            report.errors.push(`migrated historical agent correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
-          }
+          const activeMatches = Boolean(agent && agent.runId === undefined && agent.goalId === state.goalId && agent.ticketId === entry.ticket.ticketId && agent.baseRevision === entry.ticket.baseRevision);
+          const finalizedMatches = [...finalized.records.values()].filter((record) => finalizedHistoricalMatch(record, {
+            goalId: state.goalId,
+            ticketId: entry.ticket.ticketId,
+            baseRevision: entry.ticket.baseRevision,
+            slug: entry.result.worker.slug,
+          }));
+          if (!activeMatches && finalizedMatches.length === 0) report.errors.push(`migrated historical agent correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
+          if (finalizedMatches.length > 1) report.errors.push(`migrated historical agent correlation for ${entry.ticket.ticketId} is ambiguous`);
         } else if (entry.result.worker && !entry.result.publication) report.errors.push(`ticket ${entry.ticket.ticketId} has worker provenance without a run or publication`);
       }
     }

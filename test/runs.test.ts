@@ -8,6 +8,7 @@ import { publishBranch } from "../src/publication.ts";
 import {
   agentStopIntentPath,
   dispatchTicket,
+  listAgentFinalizations,
   loadActiveRun,
   normalizeAgentState,
   readAgentState,
@@ -114,6 +115,69 @@ async function writeLegacyAgent(item: Fixture, name: string, options: { backend?
   await writeFile(join(directory, `${name.toLowerCase()}.json`), `${JSON.stringify(legacyAgent(item, name, options), null, 2)}\n`);
 }
 
+type ToolBehavior = "ok" | "absent" | "fail" | "fail-once" | "portless-absent" | "portless-absent-lowercase";
+
+async function installAgentTooling(root: string, state: AgentState, options: {
+  runtime?: "apple" | "docker";
+  herdrListJson?: string;
+  behavior?: Partial<Record<"container" | "workspace" | "network" | "alias" | "herdr", ToolBehavior>>;
+} = {}) {
+  const runtime = options.runtime ?? state.runtime;
+  const command = runtime === "apple" ? "container" : "docker";
+  const fakeBin = join(root, `fake-bin-${command}`);
+  const logPath = join(root, `${command}.log`);
+  const onceDir = join(root, `${command}-once`);
+  await mkdir(fakeBin, { recursive: true });
+  await mkdir(onceDir, { recursive: true });
+  const behavior = options.behavior ?? {};
+  const outcome = (name: string, mode: ToolBehavior | undefined, missing: string, failed: string) => {
+    if (mode === "absent" || mode === "portless-absent" || mode === "portless-absent-lowercase") return `echo ${JSON.stringify(missing)} >&2\nexit 1`;
+    if (mode === "fail") return `echo ${JSON.stringify(failed)} >&2\nexit 1`;
+    if (mode === "fail-once") return `if [ ! -f ${JSON.stringify(join(onceDir, name))} ]; then touch ${JSON.stringify(join(onceDir, name))}; echo ${JSON.stringify(failed)} >&2; exit 1; fi\nexit 0`;
+    return "exit 0";
+  };
+  await writeFile(join(fakeBin, command), `#!/bin/sh
+printf '${command}\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  ${JSON.stringify(runtime === "apple" ? `rm ${state.container}` : `rm --force ${state.container}`)})
+    ${outcome("container", behavior.container, `No such container: ${state.container}`, "container removal failed")}
+    ;;
+  ${JSON.stringify(`volume rm ${state.workspaceVolume}`)})
+    ${outcome("workspace", behavior.workspace, `${state.workspaceVolume} not found`, "volume removal failed")}
+    ;;
+  ${JSON.stringify(`network rm ${state.network}`)})
+    ${outcome("network", behavior.network, `${state.network} not found`, "network removal failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  const portlessMissing = behavior.alias === "portless-absent-lowercase"
+    ? `error: no alias found for "${state.alias}.spike.local".`
+    : `Error: No alias found for "${state.alias}.spike.local".`;
+  await writeFile(join(fakeBin, "portless"), `#!/bin/sh
+printf 'portless\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  ${JSON.stringify(`alias --remove ${state.alias}`)})
+    ${outcome("alias", behavior.alias, behavior.alias === "portless-absent" || behavior.alias === "portless-absent-lowercase" ? portlessMissing : `${state.alias} not found`, "alias removal failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  await writeFile(join(fakeBin, "herdr"), `#!/bin/sh
+printf 'herdr\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  "agent list")
+    printf '%s\n' ${JSON.stringify(options.herdrListJson ?? '{"result":{"agents":[]}}')}
+    ;;
+  ${JSON.stringify(`tab close ${state.herdrTabId}`)})
+    ${outcome("herdr", behavior.herdr, `${state.herdrTabId} not found`, "Herdr close failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  return { logPath, env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, REPO_SEED: root, SPIKE_RUNTIME: runtime } };
+}
+
 async function successfulDispatch(item: Fixture, name = "worker-a") {
   return dispatchTicket({
     cwd: item.root,
@@ -214,6 +278,198 @@ describe("legacy agent state compatibility", () => {
     expect(() => validateAgentStopIntent({ ...valid, startedAt: "yesterday" }, "legacy")).toThrow("invalid timestamp");
     expect(() => validateAgentStopIntent({ ...valid, pid: 0 }, "legacy")).toThrow("invalid pid");
     expect(() => validateAgentStopIntent({ ...valid, runId: "other-run" }, "legacy")).toThrow("invalid runId");
+  });
+});
+
+describe("agent listing and finalization", () => {
+  test("never applies Herdr status to a headless agent", async () => {
+    const item = await fixture();
+    await writeLegacyAgent(item, "legacy-headless");
+    await writeLegacyAgent(item, "legacy-herdr", { backend: "herdr" });
+    const herdrState = (await readAgentState(item.stateDir, "legacy-herdr"))!;
+    const tooling = await installAgentTooling(item.root, herdrState, {
+      herdrListJson: JSON.stringify({ result: { agents: [{ agent_status: "done" }, { name: herdrState.herdrName, pane_id: herdrState.herdrPaneId, agent_status: "done" }] } }),
+    });
+    const listed = await execute([process.execPath, cli, "agent", "list"], item.root, tooling.env);
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toContain("legacy-headless\trunning\theadless");
+    expect(listed.stdout).toContain("legacy-herdr\tdone\therdr");
+  });
+
+  test("refuses finalization for running or stopping agents without touching resources", async () => {
+    for (const lifecycle of ["running", "stopping"] as const) {
+      const item = await fixture();
+      const state: AgentState = {
+        schemaVersion: 1,
+        name: lifecycle,
+        slug: lifecycle,
+        project: "test",
+        runtime: "apple",
+        container: `container-${lifecycle}`,
+        workspaceVolume: `volume-${lifecycle}`,
+        network: `network-${lifecycle}`,
+        alias: `${lifecycle}.test`,
+        containerPort: 3000,
+        backend: "herdr",
+        herdrTabId: `tab-${lifecycle}`,
+        lifecycle,
+        startedAt: "2026-08-17T10:11:12.000Z",
+        ...(lifecycle === "stopping" ? { stopRequestedAt: "2026-08-17T10:12:00.000Z", stopReason: "operator-requested" } : {}),
+        pid: 1234,
+      };
+      await writeAgentState(item.stateDir, state);
+      const tooling = await installAgentTooling(item.root, state);
+      const removed = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+      expect(removed.code).toBe(1);
+      expect(removed.stderr).toContain("wait for terminal reconciliation");
+      expect(await Bun.file(tooling.logPath).exists()).toBe(false);
+      expect((await readAgentState(item.stateDir, state.slug))?.lifecycle).toBe(lifecycle);
+      expect((await listAgentFinalizations(item.stateDir, state.slug))).toHaveLength(0);
+    }
+  });
+
+  test("retries partial cleanup, accepts absent resources, and uses Docker removal commands", async () => {
+    const item = await fixture();
+    const state: AgentState = {
+      schemaVersion: 1,
+      name: "docker-worker",
+      slug: "docker-worker",
+      project: "test",
+      runtime: "docker",
+      container: "container-docker-worker",
+      workspaceVolume: "volume-docker-worker",
+      network: "network-docker-worker",
+      alias: "docker-worker.test",
+      containerPort: 3000,
+      backend: "herdr",
+      herdrTabId: "tab-docker-worker",
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      lifecycle: "stopped",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      finishedAt: "2026-08-17T10:12:12.000Z",
+      stopRequestedAt: "2026-08-17T10:12:00.000Z",
+      stopReason: "operator-requested",
+      stopRequester: "cli",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      outcome: "stopped",
+      pid: 1234,
+    };
+    await writeAgentState(item.stateDir, state);
+    const tooling = await installAgentTooling(item.root, state, { runtime: "docker", behavior: { container: "absent", workspace: "absent", network: "fail-once", alias: "ok", herdr: "ok" } });
+    const first = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+    expect(first.code).toBe(1);
+    expect(first.stderr).toContain("finalization is incomplete");
+    expect((await readAgentState(item.stateDir, state.slug))?.slug).toBe(state.slug);
+    const [pending] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(pending.cleanup.container.status).toBe("absent");
+    expect(pending.cleanup.workspaceVolume.status).toBe("absent");
+    expect(pending.cleanup.network.status).toBe("failed");
+
+    const second = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+    expect(second.code).toBe(0);
+    expect(second.stdout).toContain("Finalized docker-worker");
+    expect(await readAgentState(item.stateDir, state.slug)).toBeUndefined();
+    const [finalized] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(finalized.finalizedAt).toBeDefined();
+    expect(finalized.cleanup.network.status).toBe("removed");
+    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\trm --force ${state.container}`);
+    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\tvolume rm ${state.workspaceVolume}`);
+    expect((await readFile(tooling.logPath, "utf8")).trim().split("\n")).toContain(`docker\tnetwork rm ${state.network}`);
+  });
+
+  test("classifies the real Portless absent alias response as absent", async () => {
+    const item = await fixture();
+    const state: AgentState = {
+      schemaVersion: 1,
+      name: "portless-absent",
+      slug: "portless-absent",
+      project: "test",
+      runtime: "apple",
+      container: "container-portless-absent",
+      workspaceVolume: "volume-portless-absent",
+      network: "network-portless-absent",
+      alias: "portless-absent.test",
+      containerPort: 3000,
+      backend: "herdr",
+      herdrTabId: "tab-portless-absent",
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      lifecycle: "stopped",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      finishedAt: "2026-08-17T10:12:12.000Z",
+      stopRequestedAt: "2026-08-17T10:12:00.000Z",
+      stopReason: "operator-requested",
+      stopRequester: "cli",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      outcome: "stopped",
+      pid: 1234,
+    };
+    await writeAgentState(item.stateDir, state);
+    const tooling = await installAgentTooling(item.root, state, { behavior: { alias: "portless-absent", herdr: "ok" } });
+    const removed = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, tooling.env);
+    expect(removed.code).toBe(0);
+    expect(await readAgentState(item.stateDir, state.slug)).toBeUndefined();
+    const [finalized] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(finalized.cleanup.alias.status).toBe("absent");
+    expect(finalized.finalizedAt).toBeDefined();
+  });
+
+  test("keeps unexpected Portless errors failed and lets partial finalization converge on retry", async () => {
+    const item = await fixture();
+    const state: AgentState = {
+      schemaVersion: 1,
+      name: "portless-retry",
+      slug: "portless-retry",
+      project: "test",
+      runtime: "apple",
+      container: "container-portless-retry",
+      workspaceVolume: "volume-portless-retry",
+      network: "network-portless-retry",
+      alias: "portless-retry.test",
+      containerPort: 3000,
+      backend: "herdr",
+      herdrTabId: "tab-portless-retry",
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      lifecycle: "stopped",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      finishedAt: "2026-08-17T10:12:12.000Z",
+      stopRequestedAt: "2026-08-17T10:12:00.000Z",
+      stopReason: "operator-requested",
+      stopRequester: "cli",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      outcome: "stopped",
+      pid: 1234,
+    };
+    await writeAgentState(item.stateDir, state);
+    const failing = await installAgentTooling(item.root, state, { behavior: { alias: "fail", herdr: "ok" } });
+    const first = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, failing.env);
+    expect(first.code).toBe(1);
+    expect(first.stderr).toContain("finalization is incomplete");
+    expect((await readAgentState(item.stateDir, state.slug))?.slug).toBe(state.slug);
+    let [pending] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(pending.cleanup.alias.status).toBe("failed");
+
+    const retried = await installAgentTooling(item.root, state, { behavior: { alias: "portless-absent-lowercase", herdr: "ok" } });
+    const second = await execute([process.execPath, cli, "agent", "remove", state.slug, "--force"], item.root, retried.env);
+    expect(second.code).toBe(0);
+    expect(await readAgentState(item.stateDir, state.slug)).toBeUndefined();
+    [pending] = await listAgentFinalizations(item.stateDir, state.slug);
+    expect(pending.cleanup.alias.status).toBe("absent");
+    expect(pending.finalizedAt).toBeDefined();
   });
 });
 

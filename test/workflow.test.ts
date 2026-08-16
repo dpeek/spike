@@ -1,17 +1,26 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { activateGoal, issueTicket, loadActiveGoal, loadWorkflowState } from "../src/goals.ts";
-import { dispatchTicket, writeAgentState, type AgentState, type DispatchLaunchRequest } from "../src/runs.ts";
+import {
+  dispatchTicket,
+  readAgentState,
+  recordAgentExit,
+  requestAgentStop,
+  writeAgentState,
+  type AgentState,
+  type DispatchLaunchRequest,
+} from "../src/runs.ts";
 import { acceptTicket, ticketHistory, workflowDoctor } from "../src/workflow.ts";
 import { ticketResultPath } from "../src/workflow-state.ts";
 
 const temporaryDirectories: string[] = [];
+const cli = join(import.meta.dir, "..", "src", "cli.ts");
 afterEach(async () => Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
-async function execute(command: string[], cwd: string) {
-  const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+async function execute(command: string[], cwd: string, env?: Record<string, string | undefined>) {
+  const child = Bun.spawn(command, { cwd, env, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   return { code, stdout: stdout.trim(), stderr: stderr.trim() };
 }
@@ -69,6 +78,77 @@ function agent(item: Fixture, request: DispatchLaunchRequest): AgentState {
   };
 }
 
+async function acceptedWorker(item: Fixture, name = "worker") {
+  const head = await commit(item, `accepted-${name}`);
+  const run = await dispatchTicket({ cwd: item.root, workerName: name, launcher: async (request) => {
+    await writeAgentState(item.stateDir, {
+      ...agent(item, request),
+      container: `container-${request.workerSlug}`,
+      workspaceVolume: `volume-${request.workerSlug}`,
+      network: `network-${request.workerSlug}`,
+      alias: `${request.workerSlug}.workflow-test`,
+      herdrName: `herdr-${request.workerSlug}`,
+      herdrTabId: `tab-${request.workerSlug}`,
+      herdrPaneId: `pane-${request.workerSlug}`,
+    });
+    return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrTabId: `tab-${request.workerSlug}`, herdrPaneId: `pane-${request.workerSlug}` };
+  } });
+  const running = (await readAgentState(item.stateDir, run.worker.slug))!;
+  await requestAgentStop({ cwd: item.root, name: run.worker.slug, requester: "cli", reason: "operator-requested", now: new Date("2026-01-03T01:00:00.000Z"), stopRuntime: async () => {} });
+  await recordAgentExit({ cwd: item.root, state: running, exitCode: 143, now: new Date("2026-01-03T01:00:01.000Z") });
+  await publishExplicit(item, head, run.worker.slug);
+  const accepted = await acceptTicket({ cwd: item.root, revision: head, review: "planner", statement: `accepted ${name}`, now: new Date("2026-01-04T00:00:00.000Z") });
+  return { run, head, result: accepted.result, slug: run.worker.slug };
+}
+
+async function installFinalizationFakes(root: string, state: AgentState, behavior: Partial<Record<"container" | "workspace" | "network" | "alias" | "herdr", "ok" | "absent" | "fail" | "fail-once">> = {}) {
+  const fakeBin = join(root, "fake-bin");
+  const logPath = join(root, "cleanup.log");
+  const onceDir = join(root, "cleanup-once");
+  await mkdir(fakeBin, { recursive: true });
+  await mkdir(onceDir, { recursive: true });
+  const outcome = (name: string, mode: string | undefined, missing: string, failed: string) => {
+    if (mode === "absent") return `echo ${JSON.stringify(missing)} >&2\nexit 1`;
+    if (mode === "fail") return `echo ${JSON.stringify(failed)} >&2\nexit 1`;
+    if (mode === "fail-once") return `if [ ! -f ${JSON.stringify(join(onceDir, name))} ]; then touch ${JSON.stringify(join(onceDir, name))}; echo ${JSON.stringify(failed)} >&2; exit 1; fi\nexit 0`;
+    return "exit 0";
+  };
+  await writeFile(join(fakeBin, "container"), `#!/bin/sh
+printf 'container\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  ${JSON.stringify(`rm ${state.container}`)})
+    ${outcome("container", behavior.container, `No such container: ${state.container}`, "container removal failed")}
+    ;;
+  ${JSON.stringify(`volume rm ${state.workspaceVolume}`)})
+    ${outcome("workspace", behavior.workspace, `${state.workspaceVolume} not found`, "volume removal failed")}
+    ;;
+  ${JSON.stringify(`network rm ${state.network}`)})
+    ${outcome("network", behavior.network, `${state.network} not found`, "network removal failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  await writeFile(join(fakeBin, "portless"), `#!/bin/sh
+printf 'portless\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  ${JSON.stringify(`alias --remove ${state.alias}`)})
+    ${outcome("alias", behavior.alias, `${state.alias} not found`, "alias removal failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  await writeFile(join(fakeBin, "herdr"), `#!/bin/sh
+printf 'herdr\t%s\n' "$*" >> ${JSON.stringify(logPath)}
+case "$*" in
+  ${JSON.stringify(`tab close ${state.herdrTabId}`)})
+    ${outcome("herdr", behavior.herdr, `${state.herdrTabId} not found`, "Herdr close failed")}
+    ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  return { logPath, env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, REPO_SEED: root } };
+}
+
 describe("durable ticket acceptance", () => {
   test("advances workflow state, is idempotent, records ordered history, and permits the next ticket", async () => {
     const item = await fixture();
@@ -124,6 +204,57 @@ describe("durable ticket acceptance", () => {
     expect(recovered.record.acceptedCodeRevision).toBe(head);
     expect((await loadWorkflowState(item.root)).activeTicketId).toBeNull();
     expect((await acceptTicket({ cwd: item.root, revision: head, review: "hunk" })).idempotent).toBe(true);
+  });
+});
+
+describe("agent finalization and provenance", () => {
+  test("finalizes an accepted worker, preserves doctor provenance, and allows slug reuse", async () => {
+    const item = await fixture();
+    const accepted = await acceptedWorker(item, "Worker One");
+    const state = (await readAgentState(item.stateDir, accepted.slug))!;
+    const fake = await installFinalizationFakes(item.root, state);
+    const removed = await execute([process.execPath, cli, "agent", "remove", accepted.slug, "--force"], item.root, fake.env);
+    expect(removed.code).toBe(0);
+    expect(removed.stdout).toContain(`Finalized ${accepted.slug}`);
+    expect((await readAgentState(item.stateDir, accepted.slug))).toBeUndefined();
+    expect((await readFile(fake.logPath, "utf8")).trim().split("\n")).toEqual([
+      `container\trm ${state.container}`,
+      `container\tvolume rm ${state.workspaceVolume}`,
+      `container\tnetwork rm ${state.network}`,
+      `portless\talias --remove ${state.alias}`,
+      `herdr\ttab close ${state.herdrTabId}`,
+    ]);
+    expect((await workflowDoctor(item.root)).ok).toBe(true);
+
+    const repeated = await execute([process.execPath, cli, "agent", "remove", accepted.slug, "--force"], item.root, fake.env);
+    expect(repeated.code).toBe(0);
+    expect(repeated.stdout).toContain(`Already finalized ${accepted.slug}`);
+
+    const nextPath = join(item.root, ".pi-swarm", "drafts", "next.md");
+    await writeFile(nextPath, "# Next\n");
+    await issueTicket({ cwd: item.root, ticketFile: nextPath, now: new Date("2026-01-05T00:00:00.000Z") });
+    const redispatched = await dispatchTicket({ cwd: item.root, workerName: "Worker One", launcher: async (request) => {
+      await writeAgentState(item.stateDir, agent(item, request));
+      return { runtime: "apple", container: "container-reused", herdrName: "herdr-reused", herdrPaneId: "pane-reused" };
+    } });
+    expect(redispatched.worker.slug).toBe(accepted.slug);
+    expect(redispatched.runId).not.toBe(accepted.run.runId);
+    expect((await workflowDoctor(item.root)).ok).toBe(true);
+  });
+
+  test("doctor fails closed on tampered finalization evidence", async () => {
+    const item = await fixture();
+    const accepted = await acceptedWorker(item, "tampered");
+    const state = (await readAgentState(item.stateDir, accepted.slug))!;
+    const fake = await installFinalizationFakes(item.root, state);
+    expect((await execute([process.execPath, cli, "agent", "remove", accepted.slug, "--force"], item.root, fake.env)).code).toBe(0);
+    const finalizationPath = join(item.stateDir, "finalized-agents", `${accepted.run.runId}.v1.json`);
+    const tampered = JSON.parse(await readFile(finalizationPath, "utf8"));
+    tampered.correlation.runId = `run-${"f".repeat(32)}`;
+    await writeFile(finalizationPath, `${JSON.stringify(tampered, null, 2)}\n`);
+    const report = await workflowDoctor(item.root);
+    expect(report.ok).toBe(false);
+    expect(report.errors.join(" ")).toContain("finalization");
   });
 });
 

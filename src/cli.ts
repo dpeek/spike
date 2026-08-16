@@ -8,15 +8,21 @@ import { fileURLToPath } from "node:url";
 import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor, type TicketHistoryEntry } from "./workflow.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
-import { finalizeAgentRemoval } from "./finalization.ts";
 import {
   agentStatePath,
   dispatchTicket as dispatchReadyTicket,
+  ensureAgentFinalization,
+  finalizedAgentComplete,
+  finalizedAgentMatchesState,
+  listAgentFinalizations,
   loadActiveRun,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
+  writeAgentFinalization,
   writeAgentState,
+  type AgentFinalizationRecord,
+  type AgentFinalizationResourceRecord,
   type AgentState,
   type DispatchLaunchRequest,
   type RunRecord,
@@ -571,6 +577,83 @@ async function removeAlias(alias?: string) {
   if (alias && await available("portless")) await capture(["portless", "alias", "--remove", alias]);
 }
 
+type CleanupStatus = AgentFinalizationResourceRecord["status"];
+
+function cleanupOutcome(status: CleanupStatus, identifier?: string, detail?: string): AgentFinalizationResourceRecord {
+  return { status, ...(identifier ? { identifier } : {}), ...(detail ? { detail } : {}) };
+}
+
+function cleanupMissing(result: { stdout: string; stderr: string }): boolean {
+  const message = `${result.stderr}\n${result.stdout}`.toLowerCase();
+  return ["not found", "no such", "does not exist", "not exist", "cannot find"].some((fragment) => message.includes(fragment));
+}
+
+function portlessAliasMissing(result: { stdout: string; stderr: string }): boolean {
+  return `${result.stderr}\n${result.stdout}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => /^(?:error:\s*)?no alias found for\s+"[^"]+"\.?$/i.test(line));
+}
+
+function trimDetail(result: { stdout: string; stderr: string }): string | undefined {
+  const text = (result.stderr || result.stdout).replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 300) : undefined;
+}
+
+function removeContainerCommand(runtime: Runtime, container: string): string[] {
+  return runtime === "apple" ? [runtimeCommand(runtime), "rm", container] : [runtimeCommand(runtime), "rm", "--force", container];
+}
+
+async function finalizeAlias(alias?: string): Promise<AgentFinalizationResourceRecord> {
+  if (!alias) return cleanupOutcome("not_configured");
+  if (!await available("portless")) return cleanupOutcome("failed", alias, "Portless is unavailable");
+  const result = await capture(["portless", "alias", "--remove", alias]);
+  if (result.code === 0) return cleanupOutcome("removed", alias);
+  if (portlessAliasMissing(result) || cleanupMissing(result)) return cleanupOutcome("absent", alias);
+  return cleanupOutcome("failed", alias, trimDetail(result));
+}
+
+async function finalizeHerdrTab(tabId?: string): Promise<AgentFinalizationResourceRecord> {
+  if (!tabId) return cleanupOutcome("not_configured");
+  if (!await available("herdr")) return cleanupOutcome("failed", tabId, "Herdr is unavailable");
+  const result = await capture(["herdr", "tab", "close", tabId]);
+  if (result.code === 0) return cleanupOutcome("removed", tabId);
+  if (cleanupMissing(result)) return cleanupOutcome("absent", tabId);
+  return cleanupOutcome("failed", tabId, trimDetail(result));
+}
+
+async function finalizeRuntimeResource(command: string[], identifier: string): Promise<AgentFinalizationResourceRecord> {
+  const result = await capture(command);
+  if (result.code === 0) return cleanupOutcome("removed", identifier);
+  if (cleanupMissing(result)) return cleanupOutcome("absent", identifier);
+  return cleanupOutcome("failed", identifier, trimDetail(result));
+}
+
+async function persistFinalizationCleanup(stateDir: string, record: AgentFinalizationRecord, cleanup: Partial<AgentFinalizationRecord["cleanup"]>): Promise<AgentFinalizationRecord> {
+  const updatedAt = new Date().toISOString();
+  const next: AgentFinalizationRecord = {
+    ...record,
+    updatedAt,
+    cleanup: { ...record.cleanup, ...cleanup },
+  };
+  if (finalizedAgentComplete(next)) next.finalizedAt = next.finalizedAt ?? updatedAt;
+  else delete next.finalizedAt;
+  await writeAgentFinalization(stateDir, next);
+  return next;
+}
+
+function cleanupSummary(record: AgentFinalizationRecord): string {
+  const label = (name: string, resource: AgentFinalizationResourceRecord) => `${name} ${resource.status}`;
+  return [
+    label("container", record.cleanup.container),
+    label("workspace", record.cleanup.workspaceVolume),
+    label("network", record.cleanup.network),
+    label("alias", record.cleanup.alias),
+    label("Herdr tab", record.cleanup.herdrTab),
+  ].join(", ");
+}
+
 async function initProject() {
   const { root } = await loadContext();
   const configPath = join(root, ".spike.json");
@@ -1020,8 +1103,10 @@ async function listAgents() {
   }
   console.log("AGENT\tSTATUS\tBACKEND\tRUNTIME\tURL");
   for (const state of states.sort((a, b) => a.slug.localeCompare(b.slug))) {
-    const herdrAgent = herdrAgents.find((candidate) => candidate.name === state.herdrName || candidate.pane_id === state.herdrPaneId);
-    const status = state.finishedAt ? state.lifecycle : state.lifecycle === "stopping" ? "stopping" : herdrAgent?.agent_status ?? "running";
+    const herdrAgent = state.backend === "herdr"
+      ? herdrAgents.find((candidate) => candidate.name === state.herdrName || candidate.pane_id === state.herdrPaneId)
+      : undefined;
+    const status = state.finishedAt ? state.lifecycle : state.lifecycle === "stopping" ? "stopping" : state.backend === "herdr" ? herdrAgent?.agent_status ?? "running" : state.lifecycle;
     console.log(`${state.slug}\t${status}\t${state.backend ?? "headless"}\t${state.runtime}\t${state.operatorUrl ?? "-"}`);
   }
 }
@@ -1053,13 +1138,46 @@ async function removeAgent(name: string | undefined, force: boolean) {
   if (!force) fail("agent remove deletes its persistent clone; repeat with --force", 2);
   const { stateDir } = await loadContext();
   const state = await readState(stateDir, name);
-  if (!state) fail(`unknown agent: ${name}`);
-  const result = await finalizeAgentRemoval({ stateDir, state, runCommand: capture, available });
-  if (!result.completed) {
-    const failed = result.failedResources.length ? `; failed: ${result.failedResources.join(", ")}` : "";
-    fail(`agent ${state.slug} cleanup is incomplete; retry spike agent remove ${state.slug} --force${failed}`);
+  if (!state) {
+    const finalized = await listAgentFinalizations(stateDir, slug(name));
+    if (finalized.length === 1 && finalizedAgentComplete(finalized[0])) {
+      console.log(`Already finalized ${finalized[0].agent.slug}: ${cleanupSummary(finalized[0])}; evidence retained at .pi-swarm/finalized-agents/${finalized[0].finalizationId}.v1.json`);
+      return;
+    }
+    fail(`unknown agent: ${name}`);
   }
-  console.log(`Removed ${state.slug}`);
+  if (!state.finishedAt) fail(`agent ${state.slug} is still ${state.lifecycle}; stop it and wait for terminal reconciliation before remove --force`);
+  if (state.lifecycle === "stopping") fail(`agent ${state.slug} is still stopping; wait for terminal reconciliation before remove --force`);
+
+  let finalization = await ensureAgentFinalization(stateDir, state);
+  if (finalizedAgentComplete(finalization) && finalizedAgentMatchesState(finalization, state)) {
+    await rm(statePath(stateDir, state.slug), { force: true });
+    console.log(`Finalized ${state.slug}: ${cleanupSummary(finalization)}; evidence retained at .pi-swarm/finalized-agents/${finalization.finalizationId}.v1.json`);
+    return;
+  }
+
+  finalization = await persistFinalizationCleanup(stateDir, finalization, {
+    container: await finalizeRuntimeResource(removeContainerCommand(state.runtime, state.container), state.container),
+  });
+  finalization = await persistFinalizationCleanup(stateDir, finalization, {
+    workspaceVolume: await finalizeRuntimeResource([runtimeCommand(state.runtime), "volume", "rm", state.workspaceVolume], state.workspaceVolume),
+  });
+  finalization = await persistFinalizationCleanup(stateDir, finalization, {
+    network: await finalizeRuntimeResource([runtimeCommand(state.runtime), "network", "rm", state.network], state.network),
+  });
+  finalization = await persistFinalizationCleanup(stateDir, finalization, {
+    alias: await finalizeAlias(state.alias),
+  });
+  finalization = await persistFinalizationCleanup(stateDir, finalization, {
+    herdrTab: await finalizeHerdrTab(state.herdrTabId),
+  });
+
+  if (!finalizedAgentComplete(finalization)) {
+    fail(`agent ${state.slug} finalization is incomplete; retry after resolving failed cleanup: ${cleanupSummary(finalization)}`);
+  }
+
+  await rm(statePath(stateDir, state.slug), { force: true });
+  console.log(`Finalized ${state.slug}: ${cleanupSummary(finalization)}; evidence retained at .pi-swarm/finalized-agents/${finalization.finalizationId}.v1.json`);
 }
 
 const commandRunner: CommandRunner = (command, cwd) => capture(command, cwd);
