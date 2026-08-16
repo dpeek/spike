@@ -50,6 +50,7 @@ type Fixture = {
   context: PublicationContext;
   state: PublicationAgentState;
   run: CommandRunner;
+  runtimeCommands: string[][];
   base: string;
 };
 
@@ -79,10 +80,14 @@ async function fixture(): Promise<Fixture> {
 
   const stateDir = join(root, ".pi-swarm");
   await mkdir(join(stateDir, "output"), { recursive: true });
+  const runtimeCommands: string[][] = [];
   const run: CommandRunner = async (command, cwd) => {
     if ((command[0] === "docker" || command[0] === "container") && command[1] === "exec") {
-      if (command[2] !== "recorded-container") return { code: 1, stdout: "", stderr: "No such container" };
-      const translated = command.slice(3).map((argument) => {
+      runtimeCommands.push(command);
+      if (command[2] !== "--user" || command[3] !== "node" || command[4] !== "recorded-container") {
+        return { code: 2, stdout: "", stderr: "invalid runtime exec command shape" };
+      }
+      const translated = command.slice(5).map((argument) => {
         if (argument === "/workspace/project") return worker;
         if (argument.startsWith("/output/")) return join(stateDir, "output", argument.slice("/output/".length));
         return argument;
@@ -103,6 +108,7 @@ async function fixture(): Promise<Fixture> {
       backend: "herdr",
     },
     run,
+    runtimeCommands,
     base,
   };
 }
@@ -150,6 +156,8 @@ describe("worker branch publication", () => {
 
     const first = await publishBranch(item.context, item.state, item.run, () => new Date("2026-08-16T01:00:00.000Z"));
     expect(first.idempotent).toBe(false);
+    expect(item.runtimeCommands.length > 0).toBe(true);
+    expect(item.runtimeCommands.every((command) => command.slice(0, 5).join("\0") === ["docker", "exec", "--user", "node", "recorded-container"].join("\0"))).toBe(true);
     expect(first.base).toBe(item.base);
     expect(first.head).toBe(await must(["git", "rev-parse", "HEAD"], item.worker));
     expect(await must(["git", "rev-parse", first.importedRef], item.root)).toBe(first.head);
@@ -196,6 +204,8 @@ describe("worker branch publication", () => {
     const item = await fixture();
     item.state.runtime = "apple";
     const first = await publishBranch(item.context, item.state, item.run);
+    expect(item.runtimeCommands.length > 0).toBe(true);
+    expect(item.runtimeCommands.every((command) => command.slice(0, 5).join("\0") === ["container", "exec", "--user", "node", "recorded-container"].join("\0"))).toBe(true);
     await writeFile(join(item.worker, "second.txt"), "second\n");
     await must(["git", "add", "second.txt"], item.worker);
     await must(["git", "commit", "-m", "second worker change"], item.worker);

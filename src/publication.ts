@@ -149,7 +149,7 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 function execCommand(state: PublicationAgentState, args: string[]): string[] {
   if (state.runtime !== "apple" && state.runtime !== "docker") throw new Error(`agent ${state.slug} has an invalid recorded runtime`);
   if (!state.container) throw new Error(`agent ${state.slug} has no recorded container`);
-  return [state.runtime === "apple" ? "container" : "docker", "exec", state.container, ...args];
+  return [state.runtime === "apple" ? "container" : "docker", "exec", "--user", "node", state.container, ...args];
 }
 
 async function workerGit(run: CommandRunner, state: PublicationAgentState, args: string[], label: string): Promise<string> {

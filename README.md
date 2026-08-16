@@ -317,9 +317,9 @@ case $(jq -r .runtime "$state") in
   docker) runtime_cli=docker ;;
   *) echo "invalid recorded runtime" >&2; exit 1 ;;
 esac
-worker_branch=$($runtime_cli exec "$container_name" \
+worker_branch=$($runtime_cli exec --user node "$container_name" \
   git -C /workspace/project symbolic-ref --short HEAD)
-$runtime_cli exec "$container_name" git -C /workspace/project bundle create \
+$runtime_cli exec --user node "$container_name" git -C /workspace/project bundle create \
   /output/frontend-recovery.bundle "refs/heads/$worker_branch"
 git bundle verify .pi-swarm/output/frontend-recovery.bundle
 git fetch --no-write-fetch-head .pi-swarm/output/frontend-recovery.bundle \
