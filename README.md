@@ -398,6 +398,10 @@ with stale intent from another run) is `failed`. Exit code 143 is never treated
 as success by itself. `spike agent list`, run status, and asynchronous supervisor
 notifications use that semantic outcome; a live persistent Pi session may still
 show Herdr's `done` after completing a turn because it remains available.
+Schema-less agent records created by earlier Spike versions are validated and
+normalized on read (terminal records are migrated eagerly), so existing
+one-shot and Herdr workers remain manageable; unknown schemas and malformed
+legacy records still fail closed.
 
 `remove --force` deletes that agent's persistent clone and network. It does not
 delete `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,

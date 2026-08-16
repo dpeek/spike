@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { activateGoal, issueTicket } from "../src/goals.ts";
 import { agentOutcomeDescription } from "../src/lifecycle.ts";
+import { publishBranch } from "../src/publication.ts";
 import {
   dispatchTicket,
   loadActiveRun,
+  normalizeAgentState,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
@@ -24,8 +26,8 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function execute(command: string[], cwd: string) {
-  const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+async function execute(command: string[], cwd: string, env?: Record<string, string | undefined>) {
+  const child = Bun.spawn(command, { cwd, env, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   return { code, stdout, stderr };
 }
@@ -85,6 +87,31 @@ function agent(item: Fixture, request: DispatchLaunchRequest): AgentState {
   };
 }
 
+function legacyAgent(item: Fixture, name: string, options: { backend?: "headless" | "herdr"; finished?: boolean } = {}) {
+  const slug = name.toLowerCase();
+  return {
+    name,
+    slug,
+    project: item.root.split("/").at(-1)!,
+    runtime: "apple",
+    container: `container-${slug}`,
+    workspaceVolume: `volume-${slug}`,
+    network: `network-${slug}`,
+    containerPort: 3000,
+    ...(options.backend ? { backend: options.backend } : {}),
+    ...(options.backend === "herdr" ? { herdrName: `herdr-${slug}`, herdrPaneId: `pane-${slug}` } : {}),
+    startedAt: "2026-08-17T10:11:12.000Z",
+    ...(options.finished ? { finishedAt: "2026-08-17T10:12:12.000Z", exitCode: 0 } : {}),
+    pid: 1234,
+  };
+}
+
+async function writeLegacyAgent(item: Fixture, name: string, options: { backend?: "headless" | "herdr"; finished?: boolean } = {}) {
+  const directory = join(item.stateDir, "agents");
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, `${name.toLowerCase()}.json`), `${JSON.stringify(legacyAgent(item, name, options), null, 2)}\n`);
+}
+
 async function successfulDispatch(item: Fixture, name = "worker-a") {
   return dispatchTicket({
     cwd: item.root,
@@ -100,6 +127,75 @@ async function successfulDispatch(item: Fixture, name = "worker-a") {
     },
   });
 }
+
+describe("legacy agent state compatibility", () => {
+  test("normalizes existing one-shot and Herdr records for list, stop, publication, and reuse", async () => {
+    const item = await fixture();
+    await writeLegacyAgent(item, "legacy-headless");
+    await writeLegacyAgent(item, "legacy-herdr", { backend: "herdr" });
+    await writeLegacyAgent(item, "legacy-finished", { finished: true });
+
+    const listed = await execute([process.execPath, cli, "agent", "list"], join(import.meta.dir, ".."), { ...process.env, REPO_SEED: item.root });
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toContain("legacy-headless\trunning\theadless");
+    expect(listed.stdout).toContain("legacy-herdr\trunning\therdr");
+    expect(listed.stdout).toContain("legacy-finished\tcompleted\theadless");
+
+    const herdr = (await readAgentState(item.stateDir, "legacy-herdr"))!;
+    expect(herdr.schemaVersion).toBe(1);
+    expect(herdr.backend).toBe("herdr");
+    expect(herdr.herdrName).toBe("herdr-legacy-herdr");
+    expect(herdr.finishedAt).toBeUndefined();
+    // These are the fields publication consumes; normalization must preserve
+    // them exactly for an applicable live persistent worker.
+    expect({ slug: herdr.slug, project: herdr.project, runtime: herdr.runtime, container: herdr.container, backend: herdr.backend, finishedAt: herdr.finishedAt }).toEqual({
+      slug: "legacy-herdr", project: item.root.split("/").at(-1)!, runtime: "apple", container: "container-legacy-herdr", backend: "herdr", finishedAt: undefined,
+    });
+    const publicationCommands: string[][] = [];
+    await expect(publishBranch(
+      { root: item.root, stateDir: item.stateDir, project: herdr.project },
+      herdr,
+      async (command) => { publicationCommands.push(command); return { code: 1, stdout: "", stderr: "worker is detached" }; },
+    )).rejects.toThrow("detached");
+    expect(publicationCommands[0]).toEqual(["container", "exec", "--user", "node", "container-legacy-herdr", "git", "-C", "/workspace/project", "symbolic-ref", "--quiet", "--short", "HEAD"]);
+
+    let stopCalled = false;
+    await requestAgentStop({
+      cwd: item.root,
+      name: "legacy-headless",
+      stopRuntime: async (state) => {
+        stopCalled = true;
+        expect(state.schemaVersion).toBe(1);
+        expect(state.lifecycle).toBe("stopping");
+        const persisted = JSON.parse(await readFile(join(item.stateDir, "agents", "legacy-headless.json"), "utf8"));
+        expect(persisted.schemaVersion).toBe(1);
+        expect(persisted.lifecycle).toBe("stopping");
+      },
+    });
+    expect(stopCalled).toBe(true);
+
+    const finished = (await readAgentState(item.stateDir, "legacy-finished"))!;
+    expect(finished.lifecycle).toBe("completed");
+    expect(finished.finishedAt).toBeDefined();
+    expect(JSON.parse(await readFile(join(item.stateDir, "agents", "legacy-finished.json"), "utf8")).schemaVersion).toBe(1);
+    // Existing dispatch/persistent reuse gates on finishedAt, retained by the
+    // migration, and can safely replace this terminal record.
+    expect(finished.finishedAt).toBe("2026-08-17T10:12:12.000Z");
+  });
+
+  test("fails closed for malformed legacy records and unknown current schemas", async () => {
+    const item = await fixture();
+    const valid = legacyAgent(item, "legacy");
+    expect(normalizeAgentState(valid, "legacy").state.lifecycle).toBe("running");
+    expect(() => normalizeAgentState({ ...valid, runtime: "podman" }, "legacy")).toThrow("invalid runtime");
+    expect(() => normalizeAgentState({ ...valid, pid: 0 }, "legacy")).toThrow("invalid pid");
+    expect(() => normalizeAgentState({ ...valid, container: "" }, "legacy")).toThrow("invalid container");
+    expect(() => normalizeAgentState({ ...valid, herdrPaneId: 42 }, "legacy")).toThrow("invalid herdrPaneId");
+    expect(() => normalizeAgentState({ ...valid, lifecycle: "running" }, "legacy")).toThrow("unexpected lifecycle");
+    expect(() => normalizeAgentState({ ...valid, schemaVersion: 2 }, "legacy")).toThrow("unsupported agent state schema: 2");
+    expect(() => normalizeAgentState({ ...valid, finishedAt: "2026-08-17T10:12:12.000Z" }, "legacy")).toThrow("no exitCode");
+  });
+});
 
 describe("durable ticket dispatch and recovery", () => {
   test("records dispatch before launch, correlates identities, and recovers in a fresh CLI", async () => {
@@ -200,6 +296,42 @@ describe("intentional shutdown classification", () => {
     expect(finalRun.exitCode).toBe(143);
     expect(finalRun.terminationKind).toBe("requested");
     expect(agentOutcomeDescription(final)).toBe("stopped by request");
+  });
+
+  test("releases the lifecycle lock before runtime stop waits for foreground exit", async () => {
+    const item = await fixture();
+    await successfulDispatch(item);
+    const initial = (await readAgentState(item.stateDir, "worker-a"))!;
+    let enteredRuntime!: () => void;
+    let releaseRuntime!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredRuntime = resolve; });
+    const release = new Promise<void>((resolve) => { releaseRuntime = resolve; });
+
+    const stopPromise = requestAgentStop({
+      cwd: item.root,
+      name: "worker-a",
+      stopRuntime: async () => {
+        enteredRuntime();
+        // A real runtime stop may wait here for runAgent's process to exit.
+        await release;
+      },
+    });
+    await entered;
+    await expect(requestAgentStop({ cwd: item.root, name: "worker-a", stopRuntime: async () => {} })).rejects.toThrow("already stopping");
+
+    let exit: AgentState;
+    try {
+      exit = await Promise.race([
+        recordAgentExit({ cwd: item.root, state: initial, exitCode: 143 }),
+        Bun.sleep(1_000).then(() => { throw new Error("recordAgentExit deadlocked behind stopRuntime"); }),
+      ]);
+    } finally {
+      releaseRuntime();
+    }
+    expect(exit.lifecycle).toBe("stopped");
+    expect((await loadActiveRun(item.root)).status).toBe("stopped");
+    await stopPromise;
+    expect((await readAgentState(item.stateDir, "worker-a"))?.lifecycle).toBe("stopped");
   });
 
   test("classifies unexpected 143 and stale intent from another run as failed", async () => {

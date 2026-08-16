@@ -224,6 +224,10 @@ export function validateAgentState(value: unknown, expectedSlug?: string): Agent
   if (typeof state.name !== "string" || !state.name || typeof state.project !== "string" || !state.project) throw new Error("agent state has invalid identity");
   if (state.runtime !== "apple" && state.runtime !== "docker") throw new Error("agent state has an invalid runtime");
   for (const field of ["container", "workspaceVolume", "network"] as const) if (typeof state[field] !== "string" || !state[field]) throw new Error(`agent state has an invalid ${field}`);
+  for (const field of ["alias", "operatorUrl", "task", "owner", "log", "errorLog", "herdrName", "herdrWorkspaceId", "herdrTabId", "herdrPaneId", "stopRequester", "stopReason", "signal", "expectedSignal"] as const) {
+    if (!validOptionalString(state[field])) throw new Error(`agent state has an invalid ${field}`);
+  }
+  if (state.hostPort !== undefined && (!Number.isSafeInteger(state.hostPort) || (state.hostPort as number) < 1 || (state.hostPort as number) > 65535)) throw new Error("agent state has an invalid hostPort");
   if (!Number.isSafeInteger(state.containerPort) || (state.containerPort as number) < 1 || (state.containerPort as number) > 65535) throw new Error("agent state has an invalid containerPort");
   if (state.backend !== "headless" && state.backend !== "herdr") throw new Error("agent state has an invalid backend");
   if (!["running", "stopping", "stopped", "failed", "completed"].includes(String(state.lifecycle))) throw new Error("agent state has an invalid lifecycle");
@@ -232,12 +236,46 @@ export function validateAgentState(value: unknown, expectedSlug?: string): Agent
   if (state.stopRequestedAt !== undefined) requireTimestamp(state.stopRequestedAt, "agent state stopRequestedAt");
   if (!Number.isSafeInteger(state.pid) || (state.pid as number) < 1) throw new Error("agent state has an invalid pid");
   if (state.exitCode !== undefined && !Number.isSafeInteger(state.exitCode)) throw new Error("agent state has an invalid exitCode");
+  if (state.terminationKind !== undefined && state.terminationKind !== "requested" && state.terminationKind !== "unexpected") throw new Error("agent state has an invalid terminationKind");
+  if (state.outcome !== undefined && !["stopped", "failed", "completed"].includes(String(state.outcome))) throw new Error("agent state has an invalid outcome");
   validateCorrelation(state, "agent state");
   if (state.runId && state.backend !== "herdr") throw new Error("correlated ticket agent must be Herdr-backed");
-  if (state.lifecycle === "running" && state.finishedAt !== undefined) throw new Error("running agent state must not be finished");
-  if (state.lifecycle === "stopping" && (!state.stopRequestedAt || (state.runId && state.stopRunId !== state.runId))) throw new Error("stopping agent state has invalid stop intent");
-  if (["stopped", "failed", "completed"].includes(String(state.lifecycle)) && (!state.finishedAt || state.exitCode === undefined || state.outcome !== state.lifecycle)) throw new Error("terminal agent state has incomplete termination data");
+  if (state.lifecycle === "running" && (state.finishedAt !== undefined || state.exitCode !== undefined || state.outcome !== undefined || state.terminationKind !== undefined)) throw new Error("running agent state must not have termination data");
+  if (state.stopRunId !== undefined && (typeof state.stopRunId !== "string" || !runIdPattern.test(state.stopRunId))) throw new Error("agent state has an invalid stopRunId");
+  if (state.lifecycle === "stopping" && (!state.stopRequestedAt || (state.runId ? state.stopRunId !== state.runId : state.stopRunId !== undefined))) throw new Error("stopping agent state has invalid stop intent");
+  if (["stopped", "failed", "completed"].includes(String(state.lifecycle)) && (!state.finishedAt || state.exitCode === undefined || state.outcome !== state.lifecycle || !state.terminationKind)) throw new Error("terminal agent state has incomplete termination data");
+  if (state.lifecycle === "stopped" && (state.terminationKind !== "requested" || !state.stopRequestedAt)) throw new Error("stopped agent state has no matching requested termination");
   return state as AgentState;
+}
+
+export function normalizeAgentState(value: unknown, expectedSlug?: string): { state: AgentState; migrated: boolean } {
+  const source = requireObject(value, "agent state");
+  if (source.schemaVersion !== undefined) return { state: validateAgentState(source, expectedSlug), migrated: false };
+
+  // Schema-less records are the one supported legacy shape. Reject new
+  // lifecycle/correlation fields without a schema so removing schemaVersion
+  // cannot downgrade a current record past validation.
+  for (const field of [
+    "goalId", "ticketId", "runId", "baseRevision", "lifecycle", "stopRequestedAt", "stopRequester",
+    "stopReason", "stopRunId", "signal", "expectedSignal", "terminationKind", "outcome",
+  ]) {
+    if (source[field] !== undefined) throw new Error(`legacy agent state has an unexpected ${field}`);
+  }
+  const backend = source.backend === undefined
+    ? (source.herdrName !== undefined || source.herdrWorkspaceId !== undefined || source.herdrTabId !== undefined || source.herdrPaneId !== undefined ? "herdr" : "headless")
+    : source.backend;
+  const terminal = source.finishedAt !== undefined;
+  if (terminal && source.exitCode === undefined) throw new Error("legacy terminal agent state has no exitCode");
+  const outcome = terminal ? source.exitCode === 0 ? "completed" : "failed" : undefined;
+  const migrated = {
+    ...source,
+    schemaVersion: AGENT_SCHEMA_VERSION,
+    backend,
+    lifecycle: outcome ?? "running",
+    ...(outcome ? { outcome, terminationKind: "unexpected" as const } : {}),
+    ...(source.exitCode === 143 ? { signal: "SIGTERM" } : {}),
+  };
+  return { state: validateAgentState(migrated, expectedSlug), migrated: true };
 }
 
 export function validateActiveRunPointer(value: unknown, expected: { goalId: string; ticketId: string }): ActiveRunPointer {
@@ -390,8 +428,15 @@ export function agentStatePath(stateDir: string, name: string): string {
 
 export async function readAgentState(stateDir: string, name: string): Promise<AgentState | undefined> {
   const slug = workerSlug(name);
-  try { return validateAgentState(await smallJson(agentStatePath(stateDir, slug), "agent state"), slug); }
-  catch (error) {
+  try {
+    const path = agentStatePath(stateDir, slug);
+    const normalized = normalizeAgentState(await smallJson(path, "agent state"), slug);
+    // Active legacy launchers may still write their final schema-less state.
+    // Normalize them in memory and migrate only terminal records eagerly;
+    // lifecycle mutations (stop/open) persist the normalized v1 shape.
+    if (normalized.migrated && normalized.state.finishedAt) await atomicWrite(path, `${JSON.stringify(normalized.state, null, 2)}\n`);
+    return normalized.state;
+  } catch (error) {
     if (error instanceof Error && error.message === "agent state is missing") return undefined;
     throw error;
   }
@@ -429,7 +474,7 @@ export async function requestAgentStop(options: {
   const root = active ? active.record.repositoryRoot : await gitRoot(options.cwd ?? process.cwd());
   const stateDir = join(root, ".pi-swarm");
   const slug = workerSlug(options.name);
-  return withAgentLock(stateDir, slug, async () => {
+  const stopping = await withAgentLock(stateDir, slug, async () => {
     const state = await readAgentState(stateDir, slug);
     if (!state) throw new Error(`unknown agent: ${options.name}`);
     if (state.finishedAt) throw new Error(`agent ${slug} is already ${state.lifecycle}`);
@@ -445,15 +490,18 @@ export async function requestAgentStop(options: {
       run = { ...run, status: "stopping", stopRequestedAt: requestedAt, ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason, stopRunId: run.runId };
       await writeRun(await context(options.cwd ?? process.cwd()), run);
     }
-    const stopping: AgentState = {
+    const durableIntent: AgentState = {
       ...state, lifecycle: "stopping", stopRequestedAt: requestedAt,
       ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason,
       ...(state.runId ? { stopRunId: state.runId } : {}),
     };
-    await writeAgentState(stateDir, stopping);
-    await options.stopRuntime(stopping);
-    return stopping;
+    await writeAgentState(stateDir, durableIntent);
+    return durableIntent;
   });
+  // Runtime stop may wait for the foreground launcher to finish. Release the
+  // lifecycle lock first so its finally block can record that exit.
+  await options.stopRuntime(stopping);
+  return stopping;
 }
 
 async function gitRoot(cwd: string): Promise<string> {

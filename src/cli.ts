@@ -946,8 +946,10 @@ async function listAgents() {
 async function stopAgent(name: string | undefined) {
   if (!name) fail("agent stop requires a name", 2);
   try {
+    const context = await loadContext();
     let stopped: AgentState | undefined;
     stopped = await requestAgentStop({
+      cwd: context.root,
       name,
       requester: process.env.SPIKE_STOP_REQUESTER ?? "cli",
       reason: "operator-requested",
@@ -1057,7 +1059,7 @@ async function openAgent(name: string | undefined) {
 }
 
 async function down() {
-  const { stateDir } = await loadContext();
+  const { root, stateDir } = await loadContext();
   const directory = join(stateDir, "agents");
   if (!existsSync(directory)) return;
   const glob = new Bun.Glob("*.json");
@@ -1067,6 +1069,7 @@ async function down() {
     if (!state) continue;
     if (!state.finishedAt && state.lifecycle !== "stopping") {
       await requestAgentStop({
+        cwd: root,
         name: state.slug,
         requester: "cli:down",
         reason: "operator-requested",
