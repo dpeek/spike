@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 
@@ -8,8 +8,10 @@ export const RUN_SCHEMA_VERSION = 1;
 export const ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1;
 export const AGENT_SCHEMA_VERSION = 1;
 export const AGENT_STOP_INTENT_SCHEMA_VERSION = 1;
+export const AGENT_FINALIZATION_SCHEMA_VERSION = 1;
 const MAX_RECORD_BYTES = 128 * 1024;
 const runIdPattern = /^run-[0-9a-f]{32}$/;
+const finalizationIdPattern = /^(?:run|start)-[0-9a-f]{32}$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const ticketIdPattern = /^ticket-[0-9a-f]{32}$/;
 const objectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -123,6 +125,43 @@ export type DispatchLaunchRequest = {
   thinking?: string;
 };
 
+export type AgentCorrelation = {
+  goalId: string;
+  ticketId: string;
+  baseRevision: string;
+  runId?: string;
+};
+
+export type AgentFinalizationResourceStatus = "pending" | "removed" | "absent" | "failed" | "not_configured";
+export type AgentFinalizationResourceRecord = {
+  status: AgentFinalizationResourceStatus;
+  identifier?: string;
+  detail?: string;
+};
+
+export type AgentFinalizationRecord = {
+  schemaVersion: 1;
+  finalizationId: string;
+  createdAt: string;
+  updatedAt: string;
+  finalizedAt?: string;
+  agent: Pick<AgentState,
+    "name" | "slug" | "project" | "runtime" | "container" | "workspaceVolume" | "network" | "alias" |
+    "hostPort" | "containerPort" | "operatorUrl" | "backend" | "herdrName" | "herdrWorkspaceId" | "herdrTabId" |
+    "herdrPaneId" | "startedAt" | "pid">;
+  correlation?: AgentCorrelation;
+  terminal: Pick<AgentState,
+    "lifecycle" | "finishedAt" | "stopRequestedAt" | "stopRequester" | "stopReason" | "stopRunId" |
+    "exitCode" | "signal" | "expectedSignal" | "terminationKind" | "outcome">;
+  cleanup: {
+    container: AgentFinalizationResourceRecord;
+    workspaceVolume: AgentFinalizationResourceRecord;
+    network: AgentFinalizationResourceRecord;
+    alias: AgentFinalizationResourceRecord;
+    herdrTab: AgentFinalizationResourceRecord;
+  };
+};
+
 export type LaunchMetadata = Pick<AgentState,
   "runtime" | "container" | "herdrName" | "herdrWorkspaceId" | "herdrTabId" | "herdrPaneId">;
 
@@ -231,6 +270,45 @@ function validateCorrelation(record: Record<string, unknown>, label: string): vo
   if (record.runId !== undefined && (typeof record.runId !== "string" || !runIdPattern.test(record.runId))) throw new Error(`${label} has an invalid runId`);
 }
 
+function finalizationIdentity(state: Pick<AgentState, "project" | "slug" | "container" | "startedAt" | "pid" | "runId">): string {
+  if (state.runId) return state.runId;
+  return `start-${new Bun.CryptoHasher("sha256").update(`spike-agent-finalization-v1\0${JSON.stringify({
+    project: state.project,
+    slug: state.slug,
+    container: state.container,
+    startedAt: state.startedAt,
+    pid: state.pid,
+  })}`).digest("hex").slice(0, 32)}`;
+}
+
+function correlationFromState(state: AgentState): AgentCorrelation | undefined {
+  if (!state.goalId || !state.ticketId || !state.baseRevision) return undefined;
+  return {
+    goalId: state.goalId,
+    ticketId: state.ticketId,
+    baseRevision: state.baseRevision,
+    ...(state.runId ? { runId: state.runId } : {}),
+  };
+}
+
+function finalizationResource(status: AgentFinalizationResourceStatus, identifier?: string, detail?: string): AgentFinalizationResourceRecord {
+  return { status, ...(identifier ? { identifier } : {}), ...(detail ? { detail } : {}) };
+}
+
+function defaultFinalizationCleanup(state: AgentState): AgentFinalizationRecord["cleanup"] {
+  return {
+    container: finalizationResource("pending", state.container),
+    workspaceVolume: finalizationResource("pending", state.workspaceVolume),
+    network: finalizationResource("pending", state.network),
+    alias: state.alias ? finalizationResource("pending", state.alias) : finalizationResource("not_configured"),
+    herdrTab: state.herdrTabId ? finalizationResource("pending", state.herdrTabId) : finalizationResource("not_configured"),
+  };
+}
+
+function finalizationComplete(cleanup: AgentFinalizationRecord["cleanup"]): boolean {
+  return Object.values(cleanup).every((resource) => ["removed", "absent", "not_configured"].includes(resource.status));
+}
+
 export function validateAgentState(value: unknown, expectedSlug?: string): AgentState {
   const state = requireObject(value, "agent state");
   if (state.schemaVersion !== AGENT_SCHEMA_VERSION) throw new Error(`unsupported agent state schema: ${String(state.schemaVersion)}`);
@@ -304,6 +382,216 @@ export function validateAgentStopIntent(value: unknown, expectedSlug?: string): 
   if (!validOptionalString(intent.stopRequester)) throw new Error("agent stop intent has an invalid stopRequester");
   if (typeof intent.stopReason !== "string" || !intent.stopReason) throw new Error("agent stop intent has an invalid stopReason");
   return intent as AgentStopIntent;
+}
+
+export function agentFinalizationPath(stateDir: string, finalizationId: string): string {
+  return join(stateDir, "finalized-agents", `${finalizationId}.v1.json`);
+}
+
+function validateFinalizationResource(value: unknown, label: string): AgentFinalizationResourceRecord {
+  const resource = requireObject(value, label);
+  if (!["pending", "removed", "absent", "failed", "not_configured"].includes(String(resource.status))) throw new Error(`${label} has an invalid status`);
+  if (!validOptionalString(resource.identifier)) throw new Error(`${label} has an invalid identifier`);
+  if (!validOptionalString(resource.detail)) throw new Error(`${label} has an invalid detail`);
+  return resource as AgentFinalizationResourceRecord;
+}
+
+export function validateAgentFinalizationRecord(value: unknown, expected: { finalizationId?: string; slug?: string } = {}): AgentFinalizationRecord {
+  const record = requireObject(value, "agent finalization record");
+  if (record.schemaVersion !== AGENT_FINALIZATION_SCHEMA_VERSION) throw new Error(`unsupported agent finalization schema: ${String(record.schemaVersion)}`);
+  if (typeof record.finalizationId !== "string" || !finalizationIdPattern.test(record.finalizationId) || (expected.finalizationId && record.finalizationId !== expected.finalizationId)) {
+    throw new Error("agent finalization record has an invalid finalizationId");
+  }
+  requireTimestamp(record.createdAt, "agent finalization record createdAt");
+  requireTimestamp(record.updatedAt, "agent finalization record updatedAt");
+  if (record.finalizedAt !== undefined) requireTimestamp(record.finalizedAt, "agent finalization record finalizedAt");
+  const agent = requireObject(record.agent, "agent finalization record agent");
+  const validatedAgent = validateAgentState({
+    schemaVersion: AGENT_SCHEMA_VERSION,
+    name: agent.name,
+    slug: agent.slug,
+    project: agent.project,
+    runtime: agent.runtime,
+    container: agent.container,
+    workspaceVolume: agent.workspaceVolume,
+    network: agent.network,
+    ...(agent.alias !== undefined ? { alias: agent.alias } : {}),
+    ...(agent.hostPort !== undefined ? { hostPort: agent.hostPort } : {}),
+    containerPort: agent.containerPort,
+    ...(agent.operatorUrl !== undefined ? { operatorUrl: agent.operatorUrl } : {}),
+    backend: agent.backend,
+    ...(agent.herdrName !== undefined ? { herdrName: agent.herdrName } : {}),
+    ...(agent.herdrWorkspaceId !== undefined ? { herdrWorkspaceId: agent.herdrWorkspaceId } : {}),
+    ...(agent.herdrTabId !== undefined ? { herdrTabId: agent.herdrTabId } : {}),
+    ...(agent.herdrPaneId !== undefined ? { herdrPaneId: agent.herdrPaneId } : {}),
+    lifecycle: "completed",
+    startedAt: agent.startedAt,
+    finishedAt: record.updatedAt,
+    exitCode: 0,
+    terminationKind: "unexpected",
+    outcome: "completed",
+    pid: agent.pid,
+  }, expected.slug);
+  const correlation = record.correlation === undefined ? undefined : (() => {
+    const value = requireObject(record.correlation, "agent finalization record correlation");
+    validateCorrelation(value, "agent finalization record correlation");
+    return value as AgentCorrelation;
+  })();
+  const terminal = requireObject(record.terminal, "agent finalization record terminal");
+  if (!["stopped", "failed", "completed"].includes(String(terminal.lifecycle))) throw new Error("agent finalization record terminal has an invalid lifecycle");
+  if (terminal.outcome !== terminal.lifecycle) throw new Error("agent finalization record terminal outcome does not match lifecycle");
+  requireTimestamp(terminal.finishedAt, "agent finalization record terminal finishedAt");
+  for (const field of ["stopRequestedAt"] as const) if (terminal[field] !== undefined) requireTimestamp(terminal[field], `agent finalization record terminal ${field}`);
+  for (const field of ["stopRequester", "stopReason", "stopRunId", "signal", "expectedSignal"] as const) if (!validOptionalString(terminal[field])) throw new Error(`agent finalization record terminal has an invalid ${field}`);
+  if (terminal.stopRunId !== undefined && (typeof terminal.stopRunId !== "string" || !runIdPattern.test(terminal.stopRunId))) throw new Error("agent finalization record terminal has an invalid stopRunId");
+  if (!Number.isSafeInteger(terminal.exitCode)) throw new Error("agent finalization record terminal has an invalid exitCode");
+  if (terminal.terminationKind !== "requested" && terminal.terminationKind !== "unexpected") throw new Error("agent finalization record terminal has an invalid terminationKind");
+  const cleanup = requireObject(record.cleanup, "agent finalization record cleanup");
+  const validatedCleanup = {
+    container: validateFinalizationResource(cleanup.container, "agent finalization record cleanup container"),
+    workspaceVolume: validateFinalizationResource(cleanup.workspaceVolume, "agent finalization record cleanup workspaceVolume"),
+    network: validateFinalizationResource(cleanup.network, "agent finalization record cleanup network"),
+    alias: validateFinalizationResource(cleanup.alias, "agent finalization record cleanup alias"),
+    herdrTab: validateFinalizationResource(cleanup.herdrTab, "agent finalization record cleanup herdrTab"),
+  };
+  if (validatedCleanup.container.identifier !== validatedAgent.container) throw new Error("agent finalization cleanup container does not match agent state");
+  if (validatedCleanup.workspaceVolume.identifier !== validatedAgent.workspaceVolume) throw new Error("agent finalization cleanup workspace volume does not match agent state");
+  if (validatedCleanup.network.identifier !== validatedAgent.network) throw new Error("agent finalization cleanup network does not match agent state");
+  if (validatedAgent.alias) {
+    if (validatedCleanup.alias.identifier !== validatedAgent.alias || validatedCleanup.alias.status === "not_configured") throw new Error("agent finalization cleanup alias does not match agent state");
+  } else if (validatedCleanup.alias.status !== "not_configured") throw new Error("agent finalization cleanup alias is inconsistent with agent state");
+  if (validatedAgent.herdrTabId) {
+    if (validatedCleanup.herdrTab.identifier !== validatedAgent.herdrTabId || validatedCleanup.herdrTab.status === "not_configured") throw new Error("agent finalization cleanup Herdr tab does not match agent state");
+  } else if (validatedCleanup.herdrTab.status !== "not_configured") throw new Error("agent finalization cleanup Herdr tab is inconsistent with agent state");
+  if (correlation) {
+    if (validatedAgent.runId !== undefined) throw new Error("agent finalization record agent unexpectedly retained a runId");
+    if (correlation.runId && record.finalizationId !== correlation.runId) throw new Error("agent finalization run correlation does not match its key");
+  }
+  if (record.finalizationId.startsWith("run-") && correlation?.runId !== record.finalizationId) throw new Error("agent finalization run key does not match its correlation");
+  if (record.finalizationId.startsWith("start-") && correlation?.runId) throw new Error("agent finalization start key conflicts with run correlation");
+  if (record.finalizationId !== finalizationIdentity({
+    project: validatedAgent.project,
+    slug: validatedAgent.slug,
+    container: validatedAgent.container,
+    startedAt: validatedAgent.startedAt,
+    pid: validatedAgent.pid,
+    ...(correlation?.runId ? { runId: correlation.runId } : {}),
+  })) throw new Error("agent finalization key does not match the retired start identity");
+  if (record.finalizedAt !== undefined && !finalizationComplete(validatedCleanup)) throw new Error("agent finalization finalizedAt conflicts with pending cleanup");
+  return record as AgentFinalizationRecord;
+}
+
+function finalizationFromState(state: AgentState, now: string, existing?: AgentFinalizationRecord): AgentFinalizationRecord {
+  if (!state.finishedAt || !state.outcome || !state.terminationKind) throw new Error(`agent ${state.slug} is not terminal`);
+  const finalizationId = finalizationIdentity(state);
+  const cleanup = existing?.cleanup ?? defaultFinalizationCleanup(state);
+  return validateAgentFinalizationRecord({
+    schemaVersion: AGENT_FINALIZATION_SCHEMA_VERSION,
+    finalizationId,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    ...(existing?.finalizedAt ? { finalizedAt: existing.finalizedAt } : {}),
+    agent: {
+      name: state.name,
+      slug: state.slug,
+      project: state.project,
+      runtime: state.runtime,
+      container: state.container,
+      workspaceVolume: state.workspaceVolume,
+      network: state.network,
+      ...(state.alias ? { alias: state.alias } : {}),
+      ...(state.hostPort ? { hostPort: state.hostPort } : {}),
+      containerPort: state.containerPort,
+      ...(state.operatorUrl ? { operatorUrl: state.operatorUrl } : {}),
+      backend: state.backend,
+      ...(state.herdrName ? { herdrName: state.herdrName } : {}),
+      ...(state.herdrWorkspaceId ? { herdrWorkspaceId: state.herdrWorkspaceId } : {}),
+      ...(state.herdrTabId ? { herdrTabId: state.herdrTabId } : {}),
+      ...(state.herdrPaneId ? { herdrPaneId: state.herdrPaneId } : {}),
+      startedAt: state.startedAt,
+      pid: state.pid,
+    },
+    ...(correlationFromState(state) ? { correlation: correlationFromState(state) } : {}),
+    terminal: {
+      lifecycle: state.lifecycle,
+      finishedAt: state.finishedAt,
+      ...(state.stopRequestedAt ? { stopRequestedAt: state.stopRequestedAt } : {}),
+      ...(state.stopRequester ? { stopRequester: state.stopRequester } : {}),
+      ...(state.stopReason ? { stopReason: state.stopReason } : {}),
+      ...(state.stopRunId ? { stopRunId: state.stopRunId } : {}),
+      exitCode: state.exitCode!,
+      ...(state.signal ? { signal: state.signal } : {}),
+      ...(state.expectedSignal ? { expectedSignal: state.expectedSignal } : {}),
+      terminationKind: state.terminationKind,
+      outcome: state.outcome,
+    },
+    cleanup,
+  }, { finalizationId, slug: state.slug });
+}
+
+export async function readAgentFinalization(stateDir: string, finalizationId: string): Promise<AgentFinalizationRecord | undefined> {
+  if (!finalizationIdPattern.test(finalizationId)) throw new Error("agent finalization lookup has an invalid finalizationId");
+  const path = agentFinalizationPath(stateDir, finalizationId);
+  try {
+    await rejectSymlinks(stateDir, path, "agent finalization path");
+    return validateAgentFinalizationRecord(await smallJson(path, "agent finalization record"), { finalizationId });
+  } catch (error) {
+    if (error instanceof Error && error.message === "agent finalization record is missing") return undefined;
+    throw error;
+  }
+}
+
+export async function writeAgentFinalization(stateDir: string, record: AgentFinalizationRecord): Promise<void> {
+  validateAgentFinalizationRecord(record, { finalizationId: record.finalizationId, slug: record.agent.slug });
+  const path = agentFinalizationPath(stateDir, record.finalizationId);
+  await mkdir(join(stateDir, "finalized-agents"), { recursive: true, mode: 0o700 });
+  await rejectSymlinks(stateDir, path, "agent finalization path");
+  await atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
+}
+
+export async function listAgentFinalizations(stateDir: string, slug?: string): Promise<AgentFinalizationRecord[]> {
+  const directory = join(stateDir, "finalized-agents");
+  try { await rejectSymlinks(stateDir, directory, "agent finalization directory"); }
+  catch (error) {
+    if (error instanceof Error && error.message.startsWith("agent finalization directory must not contain symbolic links")) throw error;
+  }
+  try {
+    const files = (await readdir(directory)).filter((name) => name.endsWith(".v1.json")).sort();
+    const finalizations: AgentFinalizationRecord[] = [];
+    for (const file of files) {
+      const finalizationId = file.slice(0, -8);
+      const record = await readAgentFinalization(stateDir, finalizationId);
+      if (record && (!slug || record.agent.slug === slug)) finalizations.push(record);
+    }
+    return finalizations;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+export async function ensureAgentFinalization(stateDir: string, state: AgentState, now = iso()): Promise<AgentFinalizationRecord> {
+  const finalizationId = finalizationIdentity(state);
+  const existing = await readAgentFinalization(stateDir, finalizationId);
+  const record = finalizationFromState(state, now, existing);
+  await writeAgentFinalization(stateDir, record);
+  return record;
+}
+
+export function finalizedAgentIdentity(state: Pick<AgentState, "project" | "slug" | "container" | "startedAt" | "pid" | "runId">): string {
+  return finalizationIdentity(state);
+}
+
+export function finalizedAgentComplete(record: AgentFinalizationRecord): boolean {
+  return finalizationComplete(record.cleanup);
+}
+
+export function finalizedAgentMatchesState(record: AgentFinalizationRecord, state: AgentState): boolean {
+  return record.finalizationId === finalizationIdentity(state) && record.agent.slug === state.slug && record.agent.project === state.project &&
+    record.agent.container === state.container && record.agent.startedAt === state.startedAt && record.agent.pid === state.pid &&
+    record.agent.workspaceVolume === state.workspaceVolume && record.agent.network === state.network &&
+    record.correlation?.goalId === state.goalId && record.correlation?.ticketId === state.ticketId && record.correlation?.baseRevision === state.baseRevision &&
+    record.correlation?.runId === state.runId;
 }
 
 export function validateActiveRunPointer(value: unknown, expected: { goalId: string; ticketId: string }): ActiveRunPointer {
