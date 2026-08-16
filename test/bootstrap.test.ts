@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { activateGoal, issueTicket, loadWorkflowState, type TicketRecord } from "../src/goals.ts";
@@ -73,6 +73,15 @@ async function actualLayoutFixture() {
 describe("actual bootstrap layout migration", () => {
   test("plans directly, preserves active Ticket 006, migrates correlations and cleans only validated evidence", async () => {
     const item = await actualLayoutFixture(); const workflowPath = join(item.root, `.pi-swarm/goals/${item.goalId}/workflow.v1.json`);
+    const sharedState = join(item.root, ".pi-swarm", "shared-pi-state");
+    await mkdir(sharedState, { recursive: true });
+    await symlink("/tmp/unrelated-spike-auth.json", join(sharedState, "auth.json"));
+    const inspection = join(item.root, ".pi-swarm", "output", "bootstrap-inspection");
+    await mkdir(inspection, { recursive: true });
+    await writeFile(join(inspection, "acceptance.bootstrap.json"), "unrelated inspection output\n");
+    const logs = join(item.root, ".pi-swarm", "logs");
+    await mkdir(logs, { recursive: true });
+    await writeFile(join(logs, "acceptance.bootstrap.json"), "unrelated log output\n");
     const first = await migrateBootstrap({ cwd: item.root }); const second = await migrateBootstrap({ cwd: item.root });
     expect(first).toEqual(second); expect(first.applicable).toBe(true); expect(first.errors).toEqual([]); expect(first.actions.some((action) => action.action === "retain" && action.source?.includes(item.activeId))).toBe(true); expect(await Bun.file(workflowPath).exists()).toBe(false);
     const applied = await migrateBootstrap({ cwd: item.root, apply: true, now: new Date("2026-08-16T05:00:00.000Z") }); expect(applied.applied).toBe(true);

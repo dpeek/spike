@@ -109,21 +109,6 @@ async function readGeneratedTicket(root: string, state: WorkflowState, ticketId:
   if (!snapshot.equals(worker)) throw new Error(`generated ticket ${ticketId} worker copy differs`);
   return { ticket, snapshot };
 }
-async function findFiles(directory: string, fileName: string): Promise<string[]> {
-  const found: string[] = [];
-  if (!await exists(directory)) return found;
-  async function walk(path: string) {
-    for (const entry of (await readdir(path, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-      const child = join(path, entry.name);
-      if (entry.isSymbolicLink()) throw new Error(`bootstrap state contains symbolic link: ${child}`);
-      if (entry.isDirectory()) await walk(child);
-      else if (entry.isFile() && entry.name === fileName) found.push(child);
-    }
-  }
-  await walk(directory);
-  return found;
-}
-
 async function prepare(cwd: string): Promise<Prepared> {
   const active = await loadActiveGoal(cwd, { readOnly: true });
   const root = active.record.repositoryRoot;
@@ -240,10 +225,15 @@ async function prepare(cwd: string): Promise<Prepared> {
     const unknown = state.ticketOrder.filter((id) => !known.has(id));
     if (unknown.length) throw new Error(`workflow contains unknown tickets: ${unknown.join(", ")}`);
 
-    const bootstrapRecords = await findFiles(join(root, ".pi-swarm"), "acceptance.bootstrap.json");
-    if (bootstrapRecords.length !== 1) throw new Error("expected exactly one generated acceptance.bootstrap.json for Ticket 005");
-    archivePaths.push({ source: bootstrapRecords[0], destination: join(root, ".pi-swarm", "archive", "bootstrap-001", "ticket-005-acceptance.bootstrap.json") });
-    const bootstrap = await readJson(bootstrapRecords[0], "Ticket 005 bootstrap acceptance") as Record<string, unknown>;
+    // Bootstrap acceptance belongs to the known generated Ticket 005. Never
+    // discover it by traversing all of .pi-swarm: shared Pi auth/session state,
+    // logs, and inspection output are unrelated and may legitimately contain
+    // symlinks or similarly named files.
+    const bootstrapRecord = join(root, ".pi-swarm", "goals", state.goalId, "tickets", tickets[4].ticket.ticketId, "acceptance.bootstrap.json");
+    await rejectSymlinks(root, bootstrapRecord, "Ticket 005 bootstrap acceptance");
+    if (!await exists(bootstrapRecord)) throw new Error("generated Ticket 005 acceptance.bootstrap.json is missing from its ticket directory");
+    archivePaths.push({ source: bootstrapRecord, destination: join(root, ".pi-swarm", "archive", "bootstrap-001", "ticket-005-acceptance.bootstrap.json") });
+    const bootstrap = await readJson(bootstrapRecord, "Ticket 005 bootstrap acceptance") as Record<string, unknown>;
     const fifth = tickets[4];
     for (const [field, expected] of [["ticketId", fifth.ticket.ticketId], ["goalId", state.goalId], ["runId", fifth.result.runId], ["baseRevision", fifth.ticket.baseRevision], ["acceptedRevision", fifth.result.acceptedRevision], ["acceptedAt", fifth.result.acceptedAt], ["worker", fifth.agent.slug]] as const) {
       if (bootstrap[field] !== expected) throw new Error(`Ticket 005 bootstrap acceptance has conflicting ${field}`);
