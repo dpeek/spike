@@ -184,17 +184,19 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spike_agents",
     label: "Spike Agents",
-    description: "Dispatch and manage isolated containerized Pi workers. Inside Herdr, dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Reports arrive asynchronously.",
-    promptSnippet: "Dispatch, message, read, list, stop, or open isolated container workers",
+    description: "Dispatch and manage isolated containerized Pi workers. Inside Herdr, dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Publish imports a verified committed worker branch into a host review ref without merging it. Reports arrive asynchronously.",
+    promptSnippet: "Dispatch, message, read, publish, list, stop, or open isolated container workers",
     promptGuidelines: [
       "Use spike_agents to delegate independent coding, investigation, testing, and review tasks that can run concurrently.",
       "Give every spike_agents dispatch a unique stable agent name and a focused, self-contained task.",
       "After dispatching with spike_agents, continue useful coordination rather than polling; completion reports arrive automatically.",
       "Use spike_agents send for follow-up work when the supervisor is running inside Herdr.",
+      "Publish only after a persistent worker reports that it committed its intended changes and completed verification.",
+      "Publication creates a stable review target. Inspect or summarize it, but do not merge it.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["dispatch", "send", "read", "list", "stop", "open"] as const),
-      name: Type.Optional(Type.String({ description: "Worker name for dispatch, send, read, stop, or open" })),
+      action: StringEnum(["dispatch", "send", "read", "publish", "list", "stop", "open"] as const),
+      name: Type.Optional(Type.String({ description: "Worker name for dispatch, send, read, publish, stop, or open" })),
       task: Type.Optional(Type.String({ description: "Focused task for dispatch or follow-up text for send" })),
       model: Type.Optional(Type.String({ description: "Optional provider/model override" })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)),
@@ -214,20 +216,28 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
         args.push(params.name, "--task", params.task);
       } else if (params.action === "list") {
         // No additional arguments.
+      } else if (params.action === "publish") {
+        if (!params.name) throw new Error("publish requires a name");
+        args.push(params.name, "--json");
       } else {
         if (!params.name) throw new Error(`${params.action} requires a name`);
         args.push(params.name);
       }
 
-      const result = await pi.exec(spikeBin, args, { signal, timeout: 45_000 });
+      const result = await pi.exec(spikeBin, args, { signal, timeout: params.action === "publish" ? 120_000 : 45_000 });
       if (result.code !== 0) throw new Error(result.stderr || result.stdout || `spike exited ${result.code}`);
       if (params.action === "dispatch" || params.action === "send") {
         setTimeout(() => void scan(ctx), 100).unref();
         setTimeout(() => void scan(ctx), 350).unref();
       }
+      let publication: unknown;
+      if (params.action === "publish") {
+        try { publication = JSON.parse(result.stdout); }
+        catch { throw new Error("spike publish returned invalid structured metadata"); }
+      }
       return {
         content: [{ type: "text", text: result.stdout.trim() || `${params.action} completed` }],
-        details: { action: params.action, name: params.name, stdout: result.stdout, stderr: result.stderr },
+        details: { action: params.action, name: params.name, ...(publication ? { publication } : {}), stdout: result.stdout, stderr: result.stderr },
       };
     },
   });

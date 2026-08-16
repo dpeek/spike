@@ -5,6 +5,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
 
 const VERSION = "0.3.1";
 const setupRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -64,6 +65,9 @@ Usage:
   spike agent send <name> --task <follow-up>
   spike agent read <name>
   spike agent attach <name>
+  spike agent publish <name> [--json]
+  spike agent diff <name> [-- <git diff arguments...>]
+  spike agent review <name>
   spike agent list
   spike agent stop <name>
   spike agent remove <name> [--force]
@@ -86,6 +90,9 @@ Examples:
   spike supervisor
   spike agent run frontend
   spike agent dispatch tests --task "Run the test suite and fix failures"
+  spike agent publish frontend
+  spike agent diff frontend -- --stat
+  spike agent review frontend
   spike agent open frontend
 `;
 
@@ -100,9 +107,9 @@ function slug(value: string): string {
   return result;
 }
 
-async function capture(command: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+async function capture(command: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const child = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
@@ -114,8 +121,8 @@ async function capture(command: string[]): Promise<{ code: number; stdout: strin
   }
 }
 
-async function inherit(command: string[]): Promise<number> {
-  const child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+async function inherit(command: string[], cwd?: string): Promise<number> {
+  const child = Bun.spawn(command, { cwd, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   return child.exited;
 }
 
@@ -751,6 +758,68 @@ async function removeAgent(name: string | undefined, force: boolean) {
   console.log(`Removed ${state.slug}`);
 }
 
+const commandRunner: CommandRunner = (command, cwd) => capture(command, cwd);
+
+async function publicationContext() {
+  const context = await loadContext();
+  return { context, publication: { root: context.root, stateDir: context.stateDir, project: context.project } };
+}
+
+async function publishAgent(name: string | undefined, json: boolean) {
+  if (!name) fail("agent publish requires a name", 2);
+  const { context, publication } = await publicationContext();
+  const agent = slug(name);
+  const state = await readState(context.stateDir, agent);
+  if (!state) fail(`unknown agent: ${agent}; start it with spike agent persistent ${agent}`);
+  try {
+    const result = await publishBranch(publication, state, commandRunner);
+    if (json) {
+      console.log(JSON.stringify(result));
+      return;
+    }
+    console.log(`${result.idempotent ? "Already published" : "Published"} ${result.agent}: ${result.base}...${result.head}`);
+    console.log(`Worker branch: ${result.workerBranch}`);
+    console.log(`Imported ref: ${result.importedRef}`);
+    console.log(`Bundle: ${result.bundlePath}`);
+    console.log(`Manifest: ${result.manifestPath}`);
+    console.log(`Review with: spike agent review ${result.agent}`);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function diffAgent(name: string | undefined, args: string[]) {
+  if (!name) fail("agent diff requires a name", 2);
+  const { publication } = await publicationContext();
+  const agent = slug(name);
+  try {
+    const result = await loadLatestPublication(publication, agent, commandRunner);
+    console.log(`Published change: ${result.base}...${result.head}`);
+    console.log(`Imported ref: ${result.importedRef}`);
+    const forwarded = args[0] === "--" ? args.slice(1) : args;
+    const code = await inherit(["git", "-C", publication.root, "diff", `${result.base}...${result.importedRef}`, ...forwarded]);
+    if (code !== 0) process.exit(code);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function reviewAgent(name: string | undefined) {
+  if (!name) fail("agent review requires a name", 2);
+  const { publication } = await publicationContext();
+  const agent = slug(name);
+  try {
+    const result = await loadLatestPublication(publication, agent, commandRunner);
+    if (!await available("hunk")) fail("Hunk is not installed; install it with: brew install hunk (or npm install -g hunkdiff)");
+    console.log(`Reviewing: ${result.base}...${result.head}`);
+    console.log(`Imported ref: ${result.importedRef}`);
+    const code = await inherit(["hunk", "diff", `${result.base}...${result.importedRef}`], publication.root);
+    if (code !== 0) process.exit(code);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function openAgent(name: string | undefined) {
   if (!name) fail("agent open requires a name", 2);
   const { stateDir } = await loadContext();
@@ -797,11 +866,16 @@ else if (command === "agent") {
   else if (action === "send") await sendAgent(args.shift(), args);
   else if (action === "read") await readAgent(args.shift());
   else if (action === "attach") await attachAgent(args.shift());
+  else if (action === "publish") {
+    const name = args.find((arg) => !arg.startsWith("-"));
+    await publishAgent(name, args.includes("--json"));
+  } else if (action === "diff") await diffAgent(args.shift(), args);
+  else if (action === "review") await reviewAgent(args.shift());
   else if (action === "list" || action === "ls") await listAgents();
   else if (action === "stop") await stopAgent(args.shift());
   else if (action === "remove" || action === "rm") {
     const name = args.find((arg) => !arg.startsWith("-"));
     await removeAgent(name, args.includes("--force"));
   } else if (action === "open") await openAgent(args.shift());
-  else fail("expected agent run, dispatch, persistent, send, read, attach, list, stop, remove, or open", 2);
+  else fail("expected agent run, dispatch, persistent, send, read, attach, publish, diff, review, list, stop, remove, or open", 2);
 } else fail(`unknown command: ${command}`, 2);

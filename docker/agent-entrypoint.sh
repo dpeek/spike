@@ -68,9 +68,24 @@ if [[ -n "$agent_branch" ]]; then
     if git show-ref --verify --quiet "refs/heads/$agent_branch"; then
         git switch "$agent_branch" >/dev/null
     elif git show-ref --verify --quiet "refs/remotes/origin/$agent_branch"; then
+        base_commit=$(git rev-parse "refs/remotes/origin/$agent_branch^{commit}")
         git switch --track "origin/$agent_branch" >/dev/null
+        git config --local spike.agentBase "$base_commit"
     else
-        git switch -c "$agent_branch" "${AGENT_BASE_REF:-HEAD}" >/dev/null
+        base_commit=$(git rev-parse "${AGENT_BASE_REF:-HEAD}^{commit}")
+        git switch -c "$agent_branch" "$base_commit" >/dev/null
+        git config --local spike.agentBase "$base_commit"
+    fi
+
+    # Workspaces created before branch publication was added do not have the
+    # explicit base. Their clone's immutable origin default is the safest
+    # derivation of the original seed divergence point.
+    if ! git config --local --get spike.agentBase >/dev/null 2>&1; then
+        origin_head=$(git rev-parse --verify 'refs/remotes/origin/HEAD^{commit}' 2>/dev/null || true)
+        if [[ -n "$origin_head" ]]; then
+            base_commit=$(git merge-base HEAD "$origin_head")
+            git config --local spike.agentBase "$base_commit"
+        fi
     fi
 fi
 

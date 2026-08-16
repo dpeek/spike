@@ -273,21 +273,111 @@ for other projects.
 
 State and exported work live under `.pi-swarm/`.
 
-## Return work to the host
+## Publish and review worker changes
 
-Agents should commit their changes. Export a branch through the mounted output
-directory:
+After a persistent worker has committed its intended changes and completed its
+verification, publish its current branch into a namespaced host ref:
 
 ```bash
-spike agent run frontend -- \
-  git bundle create /output/frontend.bundle agent/frontend
-
-git fetch .pi-swarm/output/frontend.bundle agent/frontend:agent/frontend
-git log agent/frontend
-git merge agent/frontend
+spike agent publish frontend
+spike agent diff frontend -- --stat
+spike agent diff frontend -- src/
+spike agent review frontend
 ```
 
-Review the branch before merging.
+Publication inspects the live worker through its recorded runtime and container,
+rejects detached, dirty, empty, stopped, or non-Herdr workers, creates and
+host-verifies an immutable bundle, and imports it as
+`refs/spike/agents/frontend`. It does not check out, merge, reset, rebase, stage,
+or otherwise change the host branch, index, or working tree. A dirty host
+checkout is supported.
+
+The manifest and bundle are retained under
+`.pi-swarm/output/branches/frontend/`; `latest.json` is the durable pointer used
+by `diff` and `review`. Re-publishing the same head is idempotent, while a
+non-fast-forward move of the imported ref is refused. `diff` continues to work
+after the worker stops. Hunk is an optional operator tool; install it with
+`brew install hunk` or `npm install -g hunkdiff`.
+
+Publication deliberately does **not** merge work. Inspect the reported ref and
+leave integration to the planner or operator at a later, explicit step.
+
+### Emergency bundle recovery
+
+The automated command is the primary return path. If publication itself is
+broken, the old manual bundle flow remains only as a troubleshooting/bootstrap
+escape hatch. Resolve the container from recorded state, then use an entirely
+new recovery ref:
+
+```bash
+state=.pi-swarm/agents/frontend.json
+container_name=$(jq -r .container "$state")
+case $(jq -r .runtime "$state") in
+  apple) runtime_cli=container ;;
+  docker) runtime_cli=docker ;;
+  *) echo "invalid recorded runtime" >&2; exit 1 ;;
+esac
+worker_branch=$($runtime_cli exec "$container_name" \
+  git -C /workspace/project symbolic-ref --short HEAD)
+$runtime_cli exec "$container_name" git -C /workspace/project bundle create \
+  /output/frontend-recovery.bundle "refs/heads/$worker_branch"
+git bundle verify .pi-swarm/output/frontend-recovery.bundle
+git fetch --no-write-fetch-head .pi-swarm/output/frontend-recovery.bundle \
+  "refs/heads/$worker_branch:refs/spike/recovery/frontend"
+```
+
+Never force an existing ref, and do not merge as part of recovery. Preserve the
+failed bundle and agent state when reporting the defect.
+
+### Real-runtime publication smoke test
+
+Use a disposable repository and a real Herdr-backed worker. Set `SPIKE_BIN` to
+this checkout's `bin/spike`, choose a running Apple Container or Docker runtime,
+and keep Herdr running:
+
+```bash
+export SPIKE_BIN=/path/to/spike/bin/spike
+export SPIKE_RUNTIME=apple                 # or docker
+smoke_repo=$(mktemp -d)/publish-smoke
+mkdir -p "$smoke_repo" && cd "$smoke_repo"
+git init -b main
+git config user.name "Spike Smoke"
+git config user.email "spike-smoke@example.test"
+printf 'seed\n' > seed.txt
+git add seed.txt && git commit -m seed
+"$SPIKE_BIN" init
+
+"$SPIKE_BIN" agent persistent publish-smoke --task \
+  'Create worker.txt containing "published", commit it, run git status --short, and report when clean.'
+"$SPIKE_BIN" agent read publish-smoke       # repeat until Pi reports completion
+
+# Deliberately leave both staged and unstaged host changes, then snapshot them.
+printf 'staged\n' > host-only.txt
+git add host-only.txt
+printf 'unstaged\n' >> host-only.txt
+git status --porcelain=v2 -z > /tmp/spike-smoke-status.before
+cp .git/index /tmp/spike-smoke-index.before
+host_head=$(git rev-parse HEAD)
+host_branch=$(git symbolic-ref HEAD)
+
+"$SPIKE_BIN" agent publish publish-smoke
+"$SPIKE_BIN" agent publish publish-smoke    # idempotency check
+cmp /tmp/spike-smoke-status.before <(git status --porcelain=v2 -z)
+cmp /tmp/spike-smoke-index.before .git/index
+test "$host_head" = "$(git rev-parse HEAD)"
+test "$host_branch" = "$(git symbolic-ref HEAD)"
+manifest=.pi-swarm/output/branches/publish-smoke/latest.json
+git bundle verify "$(jq -r .bundlePath "$manifest")"
+test "$(git rev-parse refs/spike/agents/publish-smoke)" = "$(jq -r .head "$manifest")"
+"$SPIKE_BIN" agent diff publish-smoke -- --stat
+"$SPIKE_BIN" agent review publish-smoke    # inspect the range, then quit Hunk
+"$SPIKE_BIN" agent stop publish-smoke
+"$SPIKE_BIN" agent diff publish-smoke -- --stat
+```
+
+Remove the disposable directory and temporary snapshot files afterward. This
+smoke test requires real Herdr, Hunk, and a running container runtime; automated
+unit tests use temporary Git repositories and a fake runtime boundary instead.
 
 ## Authentication and browser testing
 
@@ -312,8 +402,9 @@ VM starts. Retrying succeeds.
 
 ## Roadmap
 
-Spike now supports both one-shot and Herdr-backed persistent workers. The next
-slice is automated branch review and import (`diff`, `bundle`, and guarded merge)
-plus richer worker-response extraction than terminal snapshots. Container and
-Portless policy remain owned by Spike; Herdr owns durable terminals and lifecycle
-presentation.
+Spike now supports one-shot and Herdr-backed persistent workers plus verified,
+ref-only publication and exact-range review of persistent worker branches. Merge
+and rebase automation remain intentionally out of scope. The next slices add
+durable workflow state and richer worker-response extraction than terminal
+snapshots. Container and Portless policy remain owned by Spike; Herdr owns
+durable terminals and lifecycle presentation.
