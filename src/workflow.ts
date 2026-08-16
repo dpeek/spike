@@ -1,10 +1,9 @@
-import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
+import { open, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { basename, join, relative, sep } from "node:path";
 import { loadActiveGoal, loadReadyTicket, loadWorkflowState, validateTicketRecord, type TicketRecord } from "./goals.ts";
 import { loadActiveRun, normalizeAgentState, validateAgentStopIntent, validateRunRecord, type AgentState, type RunRecord } from "./runs.ts";
 import { loadLatestPublication, type CommandRunner, type PublicationResult } from "./publication.ts";
 import {
-  MIGRATION_RECEIPT_SCHEMA_VERSION,
   TICKET_RESULT_SCHEMA_VERSION,
   WORKFLOW_DOCTOR_SCHEMA_VERSION,
   atomicWrite,
@@ -154,7 +153,10 @@ export async function acceptTicket(options: {
       const project = basename(root).toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
       publication = await loadLatestPublication({ root, stateDir: join(root, ".pi-swarm"), project, }, durableRun.worker.slug, commandRunner);
       await verifyPublication(root, publication, options.revision, ready.record.baseRevision);
-    } else publication = await findExplicitPublication(root, options.revision, ready.record.baseRevision);
+    } else {
+      publication = await findExplicitPublication(root, options.revision, ready.record.baseRevision);
+      if (!publication) throw new Error("ticket acceptance without a durable run requires an explicit validated publication identity");
+    }
 
     const acceptedAt = (options.now ?? new Date()).toISOString();
     const candidate = validateTicketResult({
@@ -167,7 +169,7 @@ export async function acceptTicket(options: {
       review: options.review,
       ...(options.statement !== undefined ? { statement: options.statement } : {}),
       acceptedAt,
-      ...(durableRun ? { worker: durableRun.worker, runId: durableRun.runId } : {}),
+      ...(durableRun ? { worker: durableRun.worker, runId: durableRun.runId } : publication ? { worker: { name: publication.agent, slug: publication.agent } } : {}),
       ...(publication ? { publication: publicationProvenance(publication) } : {}),
       provenanceMigrated: false,
     }, { goalId: ready.record.goalId, ticketId: ready.record.ticketId, baseRevision: ready.record.baseRevision });
@@ -298,7 +300,12 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
               throw new Error(`agent/run correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
             }
           } catch (error) { report.errors.push(error instanceof Error ? error.message : String(error)); }
-        } else if (!entry.result.provenanceMigrated && entry.result.worker) report.errors.push(`ticket ${entry.ticket.ticketId} has worker provenance without a run`);
+        } else if (entry.result.provenanceMigrated && entry.result.worker) {
+          const agent = await readAgentReadonly(join(root, ".pi-swarm"), entry.result.worker.slug);
+          if (!agent || agent.runId !== undefined || agent.goalId !== state.goalId || agent.ticketId !== entry.ticket.ticketId || agent.baseRevision !== entry.ticket.baseRevision) {
+            report.errors.push(`migrated historical agent correlation for ${entry.ticket.ticketId} is missing or inconsistent`);
+          }
+        } else if (entry.result.worker && !entry.result.publication) report.errors.push(`ticket ${entry.ticket.ticketId} has worker provenance without a run or publication`);
       }
     }
     if (state.activeTicketId) {
@@ -350,209 +357,10 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
   return report;
 }
 
-export type MigrationAction = { action: "import" | "archive" | "remove" | "retain" | "receipt"; source?: string; destination?: string; sha256?: string; reason?: string };
-
-function migratedTicketId(goalId: string, baseRevision: string, digest: string): string {
-  return `ticket-${new Bun.CryptoHasher("sha256").update(`spike-ticket-v1\0${JSON.stringify({ goalId, baseRevision, digest })}`).digest("hex").slice(0, 32)}`;
-}
+export type MigrationAction = { action: "import" | "correlate" | "archive" | "remove" | "retain" | "receipt"; source?: string; destination?: string; sha256?: string; reason?: string };
 export type MigrationPlan = { schemaVersion: 1; migration: "bootstrap-001"; applicable: boolean; applied: boolean; actions: MigrationAction[]; errors: string[] };
 
-/*
- * Bootstrap layouts predate a single machine schema.  The importer deliberately
- * accepts only an explicit, independently-checkable bootstrap manifest.  Old
- * installations can create it from their Markdown evidence without modifying
- * that evidence; unsupported prose is reported and retained rather than guessed.
- */
-type BootstrapManifest = {
-  schemaVersion: 1;
-  goalId: string;
-  tickets: Array<{
-    snapshotPath: string; baseRevision: string; acceptedRevision: string; issuedAt: string; acceptedAt: string;
-    review: "planner" | "hunk"; statement?: string; worker?: { name: string; slug: string }; runId?: string;
-    publicationManifestPath?: string; sourcePaths?: string[];
-  }>;
-  archivePaths?: string[];
-  removeMirrors?: Array<{ path: string; equivalentTo: string }>;
-  removeStopIntents?: string[];
-};
-
-async function evidenceDigest(root: string, path: string): Promise<string> {
-  await rejectSymlinks(root, path, "bootstrap evidence path");
-  const info = await lstat(path);
-  if (info.isFile()) return sha256(await readFile(path));
-  if (!info.isDirectory()) throw new Error(`bootstrap evidence is not a regular file or directory: ${relative(root, path)}`);
-  const parts: string[] = [];
-  async function walk(directory: string, prefix: string): Promise<void> {
-    for (const name of (await readdir(directory)).sort()) {
-      const child = join(directory, name);
-      const childStat = await lstat(child);
-      if (childStat.isSymbolicLink()) throw new Error(`bootstrap evidence contains a symbolic link: ${relative(root, child)}`);
-      const key = prefix ? `${prefix}/${name}` : name;
-      if (childStat.isDirectory()) await walk(child, key);
-      else if (childStat.isFile()) parts.push(`${key}\0${sha256(await readFile(child))}`);
-      else throw new Error(`bootstrap evidence contains an unsupported entry: ${relative(root, child)}`);
-    }
-  }
-  await walk(path, "");
-  return sha256(parts.join("\n"));
-}
-
-async function migrationPlan(cwd: string, readOnly: boolean): Promise<{ root: string; state: WorkflowState; manifest?: BootstrapManifest; plan: MigrationPlan }> {
-  const active = await loadActiveGoal(cwd, { readOnly });
-  const root = active.record.repositoryRoot;
-  const state = await loadWorkflowState(root, { readOnly });
-  const manifestPath = join(root, ".pi-swarm", "goals", "001", "migration.v1.json");
-  const receiptPath = join(root, ".pi-swarm", "archive", "bootstrap-001", "migration-receipt.v1.json");
-  const plan: MigrationPlan = { schemaVersion: 1, migration: "bootstrap-001", applicable: false, applied: false, actions: [], errors: [] };
-  if (await exists(receiptPath)) {
-    plan.applied = true;
-    plan.actions.push({ action: "receipt", destination: relative(root, receiptPath).split(sep).join("/") });
-    return { root, state, plan };
-  }
-  const value = await readJson(manifestPath, "bootstrap migration manifest", true);
-  if (value === undefined) {
-    const legacy = join(root, ".pi-swarm", "goals", "001");
-    if (await exists(legacy)) plan.errors.push("unsupported bootstrap layout: goals/001/migration.v1.json is absent; legacy evidence was retained");
-    return { root, state, plan };
-  }
-  const manifest = value as BootstrapManifest;
-  if (!manifest || manifest.schemaVersion !== 1 || manifest.goalId !== state.goalId || !Array.isArray(manifest.tickets)) {
-    plan.errors.push("bootstrap migration manifest is invalid or belongs to another active goal");
-    return { root, state, plan };
-  }
-  plan.applicable = true;
-  for (const item of manifest.tickets) {
-    try {
-      if (!validObjectId(item.baseRevision) || !validObjectId(item.acceptedRevision) || !item.snapshotPath || !item.issuedAt || !item.acceptedAt) throw new Error("invalid ticket identity or revision metadata");
-      await verifyCommit(root, item.baseRevision, item.acceptedRevision);
-      const source = projectPath(root, item.snapshotPath, "bootstrap snapshot path");
-      await rejectSymlinks(root, source, "bootstrap snapshot path");
-      const bytes = await readFile(source);
-      const digest = sha256(bytes);
-      const ticketId = migratedTicketId(state.goalId, item.baseRevision, digest);
-      plan.actions.push({ action: "import", source: item.snapshotPath, destination: `.pi-swarm/goals/${state.goalId}/tickets/${ticketId}/ticket.md`, sha256: digest });
-    } catch (error) { plan.errors.push(`${item.snapshotPath ?? "ticket"}: ${error instanceof Error ? error.message : String(error)}`); }
-  }
-  for (const path of manifest.archivePaths ?? [".pi-swarm/goals/001"]) {
-    try {
-      const source = projectPath(root, path, "bootstrap archive source");
-      plan.actions.push({ action: "archive", source: path, destination: `.pi-swarm/archive/bootstrap-001/${basename(path)}`, sha256: await evidenceDigest(root, source) });
-    } catch (error) { plan.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`); }
-  }
-  for (const mirror of manifest.removeMirrors ?? []) {
-    try {
-      const source = projectPath(root, mirror.path, "bootstrap mirror path");
-      const authoritative = projectPath(root, mirror.equivalentTo, "bootstrap authoritative path");
-      const [sourceBytes, authoritativeBytes] = await Promise.all([readFile(source), readFile(authoritative)]);
-      if (!sourceBytes.equals(authoritativeBytes)) throw new Error(`not byte-equivalent to ${mirror.equivalentTo}`);
-      plan.actions.push({ action: "remove", source: mirror.path, destination: mirror.equivalentTo, sha256: sha256(sourceBytes), reason: `byte-equivalent to ${mirror.equivalentTo}` });
-    } catch (error) { plan.errors.push(`${mirror.path}: ${error instanceof Error ? error.message : String(error)}`); }
-  }
-  for (const intentPath of manifest.removeStopIntents ?? []) {
-    try {
-      const absolute = projectPath(root, intentPath, "bootstrap stop intent path");
-      const intent = validateAgentStopIntent(await readJson(absolute, "bootstrap stop intent"));
-      const agent = await readAgentReadonly(join(root, ".pi-swarm"), intent.slug);
-      if (!agent || agent.startedAt !== intent.startedAt || agent.pid !== intent.pid || agent.container !== intent.container || agent.runId !== intent.runId ||
-        agent.lifecycle !== "stopped" || agent.outcome !== "stopped" || agent.terminationKind !== "requested" || agent.stopRequestedAt !== intent.stopRequestedAt) {
-        throw new Error("intent does not match a terminal requested-stop agent outcome");
-      }
-      plan.actions.push({ action: "remove", source: intentPath, sha256: await evidenceDigest(root, absolute), reason: "validated terminal requested-stop intent" });
-    } catch (error) { plan.errors.push(`${intentPath}: ${error instanceof Error ? error.message : String(error)}`); }
-  }
-  plan.actions.push({ action: "receipt", destination: ".pi-swarm/archive/bootstrap-001/migration-receipt.v1.json" });
-  return { root, state, manifest, plan };
-}
-
 export async function migrateBootstrap(options: { cwd?: string; apply?: boolean; now?: Date }): Promise<MigrationPlan> {
-  const { root, state, manifest, plan } = await migrationPlan(options.cwd ?? process.cwd(), !options.apply);
-  if (!options.apply || plan.applied || !manifest) return plan;
-  if (plan.errors.length) throw new Error(`bootstrap migration refused: ${plan.errors.join("; ")}`);
-  const lockPath = join(root, ".pi-swarm", "goals", state.goalId, "workflow.lock");
-  let lock;
-  try { lock = await open(lockPath, "wx", 0o600); } catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("another workflow transition is in progress"); throw error; }
-  try {
-    let current = validateWorkflowState(await readJson(workflowStatePath(root, state.goalId), "workflow state"), state.goalId);
-    const created: string[] = [];
-    const importedIds: string[] = [];
-    let finalAcceptedRevision = current.acceptedCodeRevision;
-    let finalTransitionAt = current.lastTransitionAt;
-    for (const item of manifest.tickets) {
-      const source = projectPath(root, item.snapshotPath, "bootstrap snapshot path");
-      const bytes = await readFile(source);
-      const digest = sha256(bytes);
-      const ticketId = migratedTicketId(state.goalId, item.baseRevision, digest);
-      const directory = join(root, ".pi-swarm", "goals", state.goalId, "tickets", ticketId);
-      const workerDirectory = join(root, ".pi-swarm", "output", "workflow", state.goalId, "tickets", ticketId);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await mkdir(workerDirectory, { recursive: true, mode: 0o700 });
-      const recordPath = join(directory, "record.v1.json");
-      let record: TicketRecord = {
-        schemaVersion: 1, ticketId, goalId: state.goalId, status: "ready", baseRevision: item.baseRevision,
-        snapshotPath: `.pi-swarm/goals/${state.goalId}/tickets/${ticketId}/ticket.md`, snapshotSha256: digest, snapshotBytes: bytes.byteLength,
-        sourcePath: item.snapshotPath, workerPath: `.pi-swarm/output/workflow/${state.goalId}/tickets/${ticketId}/ticket.md`, issuedAt: item.issuedAt,
-      };
-      const goalDirectory = join(root, ".pi-swarm", "goals", state.goalId);
-      if (await exists(recordPath)) {
-        record = validateTicketRecord(await readJson(recordPath, "existing generated ticket record"), { root, goalId: state.goalId, goalDirectory, baseRevision: item.baseRevision });
-        if (record.ticketId !== ticketId || record.snapshotSha256 !== digest || record.snapshotBytes !== bytes.byteLength) throw new Error(`existing generated ticket conflicts with bootstrap evidence: ${ticketId}`);
-      } else validateTicketRecord(record, { root, goalId: state.goalId, goalDirectory, baseRevision: item.baseRevision });
-      for (const [path, content] of [[join(directory, "ticket.md"), bytes], [join(workerDirectory, "ticket.md"), bytes], [recordPath, Buffer.from(`${JSON.stringify(record, null, 2)}\n`)] ] as const) {
-        if (await exists(path)) { if (!(await readFile(path)).equals(content)) throw new Error(`migration destination conflicts: ${relative(root, path)}`); }
-        else { await durableWrite(path, content); created.push(path); }
-      }
-      let publication;
-      if (item.publicationManifestPath) {
-        const p = await readJson(projectPath(root, item.publicationManifestPath, "bootstrap publication manifest"), "bootstrap publication manifest") as Record<string, unknown>;
-        if (p.head !== item.acceptedRevision || p.base !== item.baseRevision || typeof p.agent !== "string") throw new Error(`publication evidence conflicts for ${item.snapshotPath}`);
-        publication = { agent: p.agent, head: p.head, base: p.base, importedRef: p.importedRef, bundlePath: p.bundlePath, manifestPath: item.publicationManifestPath, publishedAt: p.publishedAt };
-      }
-      const result = validateTicketResult({
-        schemaVersion: 1, ticketId, goalId: state.goalId, baseRevision: item.baseRevision, acceptedRevision: item.acceptedRevision,
-        outcome: "accepted", review: item.review, ...(item.statement ? { statement: item.statement } : {}), acceptedAt: item.acceptedAt,
-        ...(item.worker ? { worker: item.worker } : {}), ...(item.runId ? { runId: item.runId } : {}), ...(publication ? { publication } : {}), provenanceMigrated: true,
-      }, { goalId: state.goalId, ticketId, baseRevision: item.baseRevision });
-      const resultPath = ticketResultPath(root, state.goalId, ticketId);
-      if (await exists(resultPath)) {
-        if (canonical(validateTicketResult(await readJson(resultPath, "ticket result"))) !== canonical(result)) throw new Error(`migration result conflicts: ${ticketId}`);
-      } else { await durableWrite(resultPath, `${JSON.stringify(result, null, 2)}\n`); created.push(resultPath); }
-      importedIds.push(ticketId);
-      finalAcceptedRevision = item.acceptedRevision;
-      finalTransitionAt = item.acceptedAt;
-    }
-    if (new Set(importedIds).size !== importedIds.length) throw new Error("bootstrap manifest contains duplicate ticket identities");
-    const unknownExisting = current.ticketOrder.filter((ticketId) => !importedIds.includes(ticketId));
-    if (unknownExisting.length) throw new Error(`workflow contains tickets absent from bootstrap evidence: ${unknownExisting.join(", ")}`);
-    current = validateWorkflowState({
-      ...current,
-      acceptedCodeRevision: finalAcceptedRevision,
-      activeTicketId: null,
-      stateRevision: current.stateRevision + importedIds.filter((ticketId) => !current.ticketOrder.includes(ticketId)).length + (current.activeTicketId ? 1 : 0),
-      lastTransitionAt: finalTransitionAt,
-      ticketOrder: importedIds,
-    }, state.goalId);
-    await atomicWrite(workflowStatePath(root, state.goalId), `${JSON.stringify(current, null, 2)}\n`);
-
-    // Destructive cleanup starts only after every destination validates.
-    for (const entry of await ticketHistory(root)) if (!entry.result) throw new Error(`imported ticket ${entry.ticket.ticketId} has no result`);
-    for (const mirror of manifest.removeMirrors ?? []) {
-      const source = projectPath(root, mirror.path, "bootstrap mirror path");
-      const authoritative = projectPath(root, mirror.equivalentTo, "bootstrap authoritative path");
-      if (!(await readFile(source)).equals(await readFile(authoritative))) throw new Error(`refusing to remove non-equivalent mirror ${mirror.path}`);
-    }
-    const archiveRoot = join(root, ".pi-swarm", "archive", "bootstrap-001");
-    await mkdir(archiveRoot, { recursive: true, mode: 0o700 });
-    for (const mirror of manifest.removeMirrors ?? []) await rm(projectPath(root, mirror.path, "bootstrap mirror path"));
-    for (const intentPath of manifest.removeStopIntents ?? []) await rm(projectPath(root, intentPath, "bootstrap stop intent path"));
-    for (const sourcePath of manifest.archivePaths ?? [".pi-swarm/goals/001"]) {
-      const source = projectPath(root, sourcePath, "bootstrap archive source");
-      if (!await exists(source)) continue;
-      const destination = join(archiveRoot, basename(source));
-      if (await exists(destination)) throw new Error(`archive destination already exists: ${relative(root, destination)}`);
-      await rename(source, destination);
-    }
-    const receipt = { schemaVersion: MIGRATION_RECEIPT_SCHEMA_VERSION, migration: "bootstrap-001", goalId: state.goalId, appliedAt: (options.now ?? new Date()).toISOString(), actions: plan.actions };
-    await durableWrite(join(archiveRoot, "migration-receipt.v1.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-    return { ...plan, applied: true };
-  } finally { await lock.close(); await rm(lockPath, { force: true }); }
+  const { migrateSupportedBootstrap } = await import("./bootstrap.ts");
+  return await migrateSupportedBootstrap(options);
 }

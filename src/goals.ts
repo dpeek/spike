@@ -67,7 +67,8 @@ export type TicketRecord = {
   snapshotBytes: number;
   sourcePath: string;
   workerPath: string;
-  issuedAt: string;
+  issuedAt: string | null;
+  provenanceMigrated?: true;
 };
 
 export type ActiveTicketPointer = {
@@ -349,11 +350,14 @@ export function validateTicketRecord(
   if (record.sourcePath === ".git" || record.sourcePath.startsWith(".git/") || !/\.(?:md|markdown)$/i.test(record.sourcePath)) {
     throw new Error("ticket record has an invalid sourcePath");
   }
-  requireTicketString(record.issuedAt, "issuedAt");
-  const issuedAt = new Date(record.issuedAt as string);
-  if (!Number.isFinite(issuedAt.getTime()) || issuedAt.toISOString() !== record.issuedAt) {
-    throw new Error("ticket record has an invalid issuedAt timestamp");
+  if (record.issuedAt === null) {
+    if (record.provenanceMigrated !== true) throw new Error("ticket record may omit issuedAt only for migrated provenance");
+  } else {
+    requireTicketString(record.issuedAt, "issuedAt");
+    const issuedAt = new Date(record.issuedAt as string);
+    if (!Number.isFinite(issuedAt.getTime())) throw new Error("ticket record has an invalid issuedAt timestamp");
   }
+  if (record.provenanceMigrated !== undefined && record.provenanceMigrated !== true) throw new Error("ticket record has an invalid provenanceMigrated flag");
 
   const expectedSnapshot = `.pi-swarm/goals/${record.goalId}/tickets/${record.ticketId}/ticket.md`;
   if (record.snapshotPath !== expectedSnapshot) throw new Error("ticket record has an invalid snapshotPath");
@@ -383,7 +387,7 @@ async function initialWorkflowState(context: GoalContext, record: GoalRecord): P
     const ticketValue = await readWorkflowJson(join(goalDirectory, "tickets", pointer.ticketId, "record.v1.json"), "active ticket record");
     const ticket = validateTicketRecord(ticketValue, { root: context.root, goalId: record.goalId, goalDirectory, baseRevision: record.acceptedCodeRevision });
     activeTicketId = ticket.ticketId;
-    transitionedAt = ticket.issuedAt;
+    transitionedAt = ticket.issuedAt ?? record.activatedAt;
   }
   return validateWorkflowState({
     schemaVersion: 1,
@@ -444,7 +448,18 @@ async function loadWorkflowFromContext(context: GoalContext, record: GoalRecord,
         if (publicationRef.code !== 0 || output(publicationRef) !== result.acceptedRevision) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication ref`);
         const bundle = resolveRecordedPath(context.root, result.publication.bundlePath, "result publication bundle path");
         if ((await runGit(context.root, ["bundle", "verify", bundle])).code !== 0) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication bundle`);
-      } else if (result.runId) throw new Error(`recoverable acceptance for ${ticket.ticketId} references a missing durable run`);
+      } else {
+        if (result.runId) throw new Error(`recoverable acceptance for ${ticket.ticketId} references a missing durable run`);
+        if (!result.publication || !result.worker || result.provenanceMigrated) throw new Error(`recoverable acceptance for ${ticket.ticketId} has no validated explicit publication`);
+        const publicationManifest = await readWorkflowJson(resolveRecordedPath(context.root, result.publication.manifestPath, "result publication manifest path"), "result publication manifest") as Record<string, unknown>;
+        if (publicationManifest.head !== result.acceptedRevision || publicationManifest.base !== ticket.baseRevision || publicationManifest.agent !== result.worker.slug) {
+          throw new Error(`recoverable acceptance for ${ticket.ticketId} has conflicting explicit publication provenance`);
+        }
+        const publicationRef = await runGit(context.root, ["rev-parse", "--verify", `${result.publication.importedRef}^{commit}`]);
+        if (publicationRef.code !== 0 || output(publicationRef) !== result.acceptedRevision) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication ref`);
+        const bundle = resolveRecordedPath(context.root, result.publication.bundlePath, "result publication bundle path");
+        if ((await runGit(context.root, ["bundle", "verify", bundle])).code !== 0) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication bundle`);
+      }
       if (readOnly) throw new Error(`recoverable acceptance for ${ticket.ticketId} is prepared and requires a normal state load or ticket accept retry`);
       state = validateWorkflowState({
         ...state,

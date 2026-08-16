@@ -51,8 +51,7 @@ export type TicketResult = {
 
 export function validTimestamp(value: unknown): value is string {
   if (typeof value !== "string" || !value) return false;
-  const date = new Date(value);
-  return Number.isFinite(date.getTime()) && date.toISOString() === value;
+  return Number.isFinite(new Date(value).getTime());
 }
 
 function object(value: unknown, label: string): Record<string, unknown> {

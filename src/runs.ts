@@ -219,15 +219,16 @@ function workerSlug(value: string): string {
 }
 
 function validateCorrelation(record: Record<string, unknown>, label: string): void {
-  const values = [record.goalId, record.ticketId, record.runId, record.baseRevision];
-  const present = values.filter((value) => value !== undefined).length;
-  if (present !== 0 && present !== values.length) throw new Error(`${label} has incomplete run correlation`);
+  const identity = [record.goalId, record.ticketId, record.baseRevision];
+  const present = identity.filter((value) => value !== undefined).length;
+  if (present !== 0 && present !== identity.length) throw new Error(`${label} has incomplete ticket correlation`);
+  if (record.runId !== undefined && present !== identity.length) throw new Error(`${label} has a run without ticket correlation`);
   if (present) {
     if (typeof record.goalId !== "string" || !goalIdPattern.test(record.goalId)) throw new Error(`${label} has an invalid goalId`);
     if (typeof record.ticketId !== "string" || !ticketIdPattern.test(record.ticketId)) throw new Error(`${label} has an invalid ticketId`);
-    if (typeof record.runId !== "string" || !runIdPattern.test(record.runId)) throw new Error(`${label} has an invalid runId`);
     if (typeof record.baseRevision !== "string" || !objectIdPattern.test(record.baseRevision)) throw new Error(`${label} has an invalid baseRevision`);
   }
+  if (record.runId !== undefined && (typeof record.runId !== "string" || !runIdPattern.test(record.runId))) throw new Error(`${label} has an invalid runId`);
 }
 
 export function validateAgentState(value: unknown, expectedSlug?: string): AgentState {

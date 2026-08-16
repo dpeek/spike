@@ -230,9 +230,14 @@ spike workflow migrate-bootstrap          # deterministic, read-only plan
 spike workflow migrate-bootstrap --apply  # only after reviewing the plan
 ```
 
-Bootstrap migration imports only independently verifiable records and writes a
-versioned receipt before legacy evidence is considered migrated. Unknown or
-conflicting layouts are retained and reported rather than guessed.
+Bootstrap migration directly parses the supported Goal 001 `approval.md`,
+ticket acceptance Markdown, generated ticket/run records, publication
+manifests/refs/bundles, historical agent reconciliation, and matching stop
+intent; it does not require an operator-authored migration manifest. It imports
+only independently verifiable records and writes a versioned receipt before
+legacy evidence is considered migrated. The current ready ticket is retained on
+its accepted base. Unknown, missing, or conflicting evidence is retained and
+reported rather than guessed.
 
 Current workflow limitations remain intentional: Spike does not parse a
 structured completion report, remediate/cancel a ticket, retry a failed launch,

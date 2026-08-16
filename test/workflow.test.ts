@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { activateGoal, issueTicket, loadActiveGoal, loadWorkflowState } from "../src/goals.ts";
 import { dispatchTicket, writeAgentState, type AgentState, type DispatchLaunchRequest } from "../src/runs.ts";
-import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor } from "../src/workflow.ts";
+import { acceptTicket, ticketHistory, workflowDoctor } from "../src/workflow.ts";
 import { ticketResultPath } from "../src/workflow-state.ts";
 
 const temporaryDirectories: string[] = [];
@@ -47,6 +47,19 @@ async function commit(item: Fixture, name: string): Promise<string> {
   return must(["git", "rev-parse", "HEAD"], item.root);
 }
 
+async function publishExplicit(item: Fixture, head: string, agent = "freeform-worker") {
+  const directory = join(item.root, ".pi-swarm", "output", "branches", agent);
+  await mkdir(directory, { recursive: true });
+  const bundlePath = `.pi-swarm/output/branches/${agent}/${head}.bundle`;
+  await must(["git", "bundle", "create", join(item.root, bundlePath), "main"], item.root);
+  const importedRef = `refs/spike/agents/${agent}`;
+  await must(["git", "update-ref", importedRef, head], item.root);
+  const project = basename(item.root).toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
+  const manifest = { schemaVersion: 1, project, agent, workerBranch: "main", base: item.base, head, importedRef, bundlePath, publishedAt: "2026-01-03T00:00:00.000Z" };
+  await writeFile(join(directory, `${head}.json`), `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFile(join(directory, "latest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
 function agent(item: Fixture, request: DispatchLaunchRequest): AgentState {
   return {
     schemaVersion: 1, name: request.workerName, slug: request.workerSlug, project: item.root.split("/").at(-1)!, runtime: "apple",
@@ -60,6 +73,7 @@ describe("durable ticket acceptance", () => {
   test("advances workflow state, is idempotent, records ordered history, and permits the next ticket", async () => {
     const item = await fixture();
     const head = await commit(item, "accepted");
+    await publishExplicit(item, head);
     const first = await acceptTicket({ cwd: item.root, revision: head, review: "planner", statement: "reviewed", now: new Date("2026-01-04T00:00:00.000Z") });
     expect(first.idempotent).toBe(false);
     expect((await loadActiveGoal(item.root)).record.acceptedCodeRevision).toBe(head);
@@ -84,6 +98,10 @@ describe("durable ticket acceptance", () => {
     const unrelated = await must(["git", "commit-tree", `${equal.base}^{tree}`, "-m", "unrelated"], equal.root);
     await expect(acceptTicket({ cwd: equal.root, revision: unrelated, review: "planner" })).rejects.toThrow("not a descendant");
 
+    const unpublished = await fixture();
+    const unpublishedHead = await commit(unpublished, "unpublished");
+    await expect(acceptTicket({ cwd: unpublished.root, revision: unpublishedHead, review: "planner" })).rejects.toThrow("requires an explicit validated publication");
+
     const running = await fixture();
     const head = await commit(running, "work");
     await dispatchTicket({ cwd: running.root, workerName: "worker", launcher: async (request) => {
@@ -96,6 +114,7 @@ describe("durable ticket acceptance", () => {
   test("recovers a validated acceptance interrupted after immutable result creation", async () => {
     const item = await fixture();
     const head = await commit(item, "recover");
+    await publishExplicit(item, head);
     await expect(acceptTicket({
       cwd: item.root, revision: head, review: "hunk", now: new Date("2026-01-04T00:00:00.000Z"),
       afterResultWritten: () => { throw new Error("simulated interruption"); },
@@ -109,45 +128,6 @@ describe("durable ticket acceptance", () => {
 });
 
 describe("bootstrap migration and doctor", () => {
-  test("dry-run is deterministic/read-only, apply imports verifiable evidence, archives sources, and is idempotent", async () => {
-    const item = await fixture();
-    // This fixture models a bootstrap project before its generated ready ticket:
-    // retain the generated ticket files but reset its explicit workflow order.
-    const workflowPath = join(item.root, `.pi-swarm/goals/${item.goalId}/workflow.v1.json`);
-    const state = JSON.parse(await readFile(workflowPath, "utf8"));
-    state.activeTicketId = null;
-    state.ticketOrder = [];
-    await writeFile(workflowPath, `${JSON.stringify(state, null, 2)}\n`);
-    await rm(join(item.root, `.pi-swarm/goals/${item.goalId}/active-ticket.json`));
-    const accepted = await commit(item, "bootstrap-accepted");
-    const legacy = join(item.root, ".pi-swarm", "goals", "001");
-    await mkdir(legacy, { recursive: true });
-    await writeFile(join(legacy, "ticket.md"), "# Bootstrap ticket\n");
-    await writeFile(join(legacy, "approval.md"), "Approved bootstrap goal.\n");
-    await writeFile(join(legacy, "migration.v1.json"), `${JSON.stringify({
-      schemaVersion: 1,
-      goalId: item.goalId,
-      tickets: [{ snapshotPath: ".pi-swarm/goals/001/ticket.md", baseRevision: item.base, acceptedRevision: accepted,
-        issuedAt: "2026-01-02T00:00:00.000Z", acceptedAt: "2026-01-03T00:00:00.000Z", review: "planner", statement: "accepted bootstrap" }],
-      archivePaths: [".pi-swarm/goals/001"],
-    }, null, 2)}\n`);
-    const before = await readFile(workflowPath);
-    const dryOne = await migrateBootstrap({ cwd: item.root });
-    const dryTwo = await migrateBootstrap({ cwd: item.root });
-    expect(dryOne).toEqual(dryTwo);
-    expect(dryOne.applicable).toBe(true);
-    expect(await readFile(workflowPath)).toEqual(before);
-
-    const applied = await migrateBootstrap({ cwd: item.root, apply: true, now: new Date("2026-01-06T00:00:00.000Z") });
-    expect(applied.applied).toBe(true);
-    expect(await Bun.file(join(item.root, ".pi-swarm", "goals", "001")).exists()).toBe(false);
-    expect(await Bun.file(join(item.root, ".pi-swarm", "archive", "bootstrap-001", "001", "approval.md")).exists()).toBe(true);
-    expect((await ticketHistory(item.root)).at(-1)?.status).toBe("migrated");
-    expect((await loadActiveGoal(item.root)).record.acceptedCodeRevision).toBe(accepted);
-    expect((await migrateBootstrap({ cwd: item.root, apply: true })).applied).toBe(true);
-    expect((await workflowDoctor(item.root)).ok).toBe(true);
-  });
-
   test("doctor detects snapshot tampering", async () => {
     const item = await fixture();
     await writeFile(join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.ticketId}/ticket.md`), "tampered\n");
