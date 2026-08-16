@@ -188,14 +188,39 @@ container is unavailable:
 ```bash
 spike run status
 spike run status --json
+spike run history
+spike run history --json
 ```
 
 Status validates the active goal, ready ticket, pointer, record, identities,
 paths, schema, and snapshot provenance before reporting launch/runtime IDs,
-timestamps, stop intent, and observed process termination. Redispatch is
-refused once an active-run pointer exists, including after launch failure; this
-slice provides no retry flag. Inspect and resolve the durable state rather than
-retrying because a supervisor restarted or a runtime disappeared.
+timestamps, stop intent, and observed process termination. Redispatch remains
+refused once an active-run pointer exists. An active `launch_failed` run can be
+retried only with an explicit acknowledgement of that exact run ID:
+
+```bash
+spike run retry ticket-004-worker \
+  --acknowledge <launch-failed-run-id> \
+  --model openai-codex/gpt-5.4 --thinking high
+```
+
+An active terminal `stopped` or `failed` run requires the same exact active run
+ID acknowledgement **and** an operator-supplied, nonblank reason of at most
+500 UTF-8 bytes. The reason is immutable provenance on the new retry attempt:
+
+```bash
+spike run retry ticket-004-worker \
+  --acknowledge <stopped-or-failed-run-id> \
+  --reason "Verified the terminal worker was recovered; retry after fixing the dependency" \
+  --model openai-codex/gpt-5.4 --thinking high
+```
+
+Retry preserves every immutable prior attempt, creates a distinct new run ID,
+and atomically advances the active-run pointer only through that explicit CLI
+transition. Running, dispatching, and stopping runs, stale acknowledgements,
+corrupt state, implicit redispatch, and concurrent transitions are refused.
+Supervisor restarts or missing live runtime are never implicit reasons to
+redispatch or infer a retry.
 
 The supervisor tool exposes `spike_agents` action `dispatch_ticket`. It requires
 checking both `spike ticket status --json` and `spike run status --json` first.
@@ -243,8 +268,8 @@ its accepted base. Unknown, missing, or conflicting evidence is retained and
 reported rather than guessed.
 
 Current workflow limitations remain intentional: Spike does not parse a
-structured completion report, remediate/cancel a ticket, retry a failed launch,
-or associate detached one-shot work with durable runs.
+structured completion report, remediate/cancel a ticket, or associate detached
+one-shot work with durable runs.
 
 ## Build and start services
 

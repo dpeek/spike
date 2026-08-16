@@ -13,10 +13,13 @@ import {
   loadCompletionReport,
   listAgentFinalizations,
   loadActiveRun,
+  loadRunAttemptHistory,
+  MAX_RETRY_REASON_BYTES,
   normalizeAgentState,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
+  retryActiveRun,
   validateActiveRunPointer,
   validateAgentStopIntent,
   validateRunRecord,
@@ -227,6 +230,19 @@ async function successfulDispatch(item: Fixture, name = "worker-a") {
       return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrWorkspaceId: "workspace-1", herdrTabId: "tab-1", herdrPaneId: "pane-1" };
     },
   });
+}
+
+function runRecordPath(item: Fixture, runId: string): string {
+  return join(item.root, ".pi-swarm", "goals", item.goalId, "tickets", item.ticketId, "runs", runId, "record.v1.json");
+}
+
+async function failedDispatch(item: Fixture, workerName = "broken") {
+  await expect(dispatchTicket({
+    cwd: item.root,
+    workerName,
+    launcher: async () => { throw new Error("runtime unavailable\nwith details"); },
+  })).rejects.toThrow("launch failed");
+  return await loadActiveRun(item.root);
 }
 
 describe("legacy agent state compatibility", () => {
@@ -665,12 +681,218 @@ describe("durable ticket dispatch and recovery", () => {
 
   test("durably classifies launch failure and refuses implicit retry", async () => {
     const item = await fixture();
-    await expect(dispatchTicket({ cwd: item.root, workerName: "broken", launcher: async () => { throw new Error("runtime unavailable\nwith details"); } })).rejects.toThrow("launch failed");
-    const record = await loadActiveRun(item.root);
+    const record = await failedDispatch(item);
     expect(record.status).toBe("launch_failed");
     expect(record.launchError).toBe("runtime unavailable with details");
     expect(record.finishedAt).toBeDefined();
     await expect(dispatchTicket({ cwd: item.root, workerName: "broken", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("automatic redispatch is refused");
+  });
+
+  test("retries a launch_failed run explicitly, preserves the failed record, and exposes both attempts after restart", async () => {
+    const item = await fixture();
+    const failed = await failedDispatch(item);
+    const failedRecord = await readFile(runRecordPath(item, failed.runId), "utf8");
+
+    const retried = await retryActiveRun({
+      cwd: item.root,
+      acknowledgedRunId: failed.runId,
+      workerName: "retry-worker",
+      model: "provider/retry",
+      thinking: "medium",
+      now: new Date("2026-08-17T10:12:12.000Z"),
+      launcher: async (request) => {
+        expect(request.runId).not.toBe(failed.runId);
+        expect(request.baseRevision).toBe(item.base);
+        expect(request.task).toContain(`/output/workflow/${item.goalId}/tickets/${item.ticketId}/ticket.md`);
+        await writeAgentState(item.stateDir, agent(item, request));
+        return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrPaneId: "pane-2" };
+      },
+    });
+
+    expect(retried.runId).not.toBe(failed.runId);
+    expect(retried.retryOfRunId).toBe(failed.runId);
+    expect(retried.status).toBe("running");
+    expect((await loadActiveRun(item.root)).runId).toBe(retried.runId);
+    expect(await readFile(runRecordPath(item, failed.runId), "utf8")).toBe(failedRecord);
+
+    const history = await loadRunAttemptHistory(item.root);
+    expect(history.activeRunId).toBe(retried.runId);
+    expect(history.attempts.map((attempt) => ({ runId: attempt.runId, status: attempt.status, retryOfRunId: attempt.retryOfRunId }))).toEqual([
+      { runId: failed.runId, status: "launch_failed", retryOfRunId: undefined },
+      { runId: retried.runId, status: "running", retryOfRunId: failed.runId },
+    ]);
+
+    const status = await execute([process.execPath, cli, "run", "status", "--json"], item.root);
+    expect(status.code).toBe(0);
+    expect(JSON.parse(status.stdout).runId).toBe(retried.runId);
+    const cliHistory = await execute([process.execPath, cli, "run", "history", "--json"], item.root);
+    expect(cliHistory.code).toBe(0);
+    expect(JSON.parse(cliHistory.stdout)).toMatchObject({
+      activeRunId: retried.runId,
+      attempts: [
+        { runId: failed.runId, status: "launch_failed" },
+        { runId: retried.runId, status: "running", retryOfRunId: failed.runId },
+      ],
+    });
+  });
+
+  test("records a distinct failed retry attempt without rewriting the original failure", async () => {
+    const item = await fixture();
+    const failed = await failedDispatch(item);
+    const failedRecord = await readFile(runRecordPath(item, failed.runId), "utf8");
+    await expect(retryActiveRun({
+      cwd: item.root,
+      acknowledgedRunId: failed.runId,
+      workerName: "retry-worker",
+      now: new Date("2026-08-17T10:12:12.000Z"),
+      launcher: async () => { throw new Error("second launch failed"); },
+    })).rejects.toThrow("launch failed");
+
+    const current = await loadActiveRun(item.root);
+    expect(current.runId).not.toBe(failed.runId);
+    expect(current.retryOfRunId).toBe(failed.runId);
+    expect(current.status).toBe("launch_failed");
+    expect(current.launchError).toBe("second launch failed");
+    expect(await readFile(runRecordPath(item, failed.runId), "utf8")).toBe(failedRecord);
+    expect((await loadRunAttemptHistory(item.root)).attempts).toHaveLength(2);
+  });
+
+  test("reuses an already prepared retry record, refuses stale/live/terminal-without-reason retries, and rejects concurrent transitions", async () => {
+    const item = await fixture();
+    const failed = await failedDispatch(item);
+    const preparedRunId = `run-${"4".repeat(32)}`;
+    await mkdir(join(item.root, ".pi-swarm", "goals", item.goalId, "tickets", item.ticketId, "runs", preparedRunId));
+    await writeFile(runRecordPath(item, preparedRunId), `${JSON.stringify({
+      schemaVersion: 1,
+      runId: preparedRunId,
+      goalId: item.goalId,
+      ticketId: item.ticketId,
+      baseRevision: item.base,
+      worker: { name: "retry-worker", slug: "retry-worker" },
+      backend: "herdr",
+      requestedModel: "provider/retry",
+      requestedThinking: "medium",
+      retryOfRunId: failed.runId,
+      status: "dispatching",
+      createdAt: "2026-08-17T10:12:12.000Z",
+    }, null, 2)}\n`);
+
+    const reused = await retryActiveRun({
+      cwd: item.root,
+      acknowledgedRunId: failed.runId,
+      workerName: "retry-worker",
+      model: "provider/retry",
+      thinking: "medium",
+      launcher: async (request) => {
+        expect(request.runId).toBe(preparedRunId);
+        await writeAgentState(item.stateDir, agent(item, request));
+        return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrPaneId: "pane-3" };
+      },
+    });
+    expect(reused.runId).toBe(preparedRunId);
+    expect((await loadRunAttemptHistory(item.root)).attempts).toHaveLength(2);
+    await expect(retryActiveRun({ cwd: item.root, acknowledgedRunId: failed.runId, workerName: "retry-worker", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("stale acknowledgement");
+    await expect(retryActiveRun({ cwd: item.root, acknowledgedRunId: preparedRunId, workerName: "retry-worker", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("live");
+
+    const failedTerminal = await fixture();
+    const running = await successfulDispatch(failedTerminal);
+    await writeFile(runRecordPath(failedTerminal, running.runId), `${JSON.stringify({
+      ...running,
+      status: "failed",
+      finishedAt: "2026-08-17T10:13:12.000Z",
+      exitCode: 1,
+      terminationKind: "unexpected",
+      outcome: "failed",
+    }, null, 2)}\n`);
+    await expect(retryActiveRun({ cwd: failedTerminal.root, acknowledgedRunId: running.runId, workerName: "retry-worker", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("nonblank --reason");
+
+    const completedTerminal = await fixture();
+    const completed = await successfulDispatch(completedTerminal);
+    await writeFile(runRecordPath(completedTerminal, completed.runId), `${JSON.stringify({
+      ...completed,
+      status: "completed",
+      finishedAt: "2026-08-17T10:13:12.000Z",
+      exitCode: 0,
+      terminationKind: "unexpected",
+      outcome: "completed",
+    }, null, 2)}\n`);
+    await expect(retryActiveRun({ cwd: completedTerminal.root, acknowledgedRunId: completed.runId, workerName: "retry-worker", reason: "not retryable", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("only launch_failed, stopped, or failed");
+
+    const concurrent = await fixture();
+    const concurrentFailed = await failedDispatch(concurrent);
+    await writeFile(join(concurrent.root, ".pi-swarm", "goals", concurrent.goalId, "tickets", concurrent.ticketId, "dispatch.lock"), "busy");
+    await expect(retryActiveRun({ cwd: concurrent.root, acknowledgedRunId: concurrentFailed.runId, workerName: "retry-worker", launcher: async () => ({ runtime: "apple", container: "never" }) })).rejects.toThrow("another ticket dispatch or retry is in progress");
+  });
+
+  test("retries stopped and failed terminal runs only with bounded reason provenance and preserves history", async () => {
+    for (const status of ["stopped", "failed"] as const) {
+      const item = await fixture();
+      const terminal = await successfulDispatch(item, `${status}-worker`);
+      await writeFile(runRecordPath(item, terminal.runId), `${JSON.stringify({
+        ...terminal,
+        status,
+        finishedAt: "2026-08-17T10:13:12.000Z",
+        ...(status === "stopped" ? {
+          stopRequestedAt: "2026-08-17T10:12:12.000Z",
+          stopRequester: "cli",
+          stopReason: "operator-requested",
+          stopRunId: terminal.runId,
+          exitCode: 143,
+          signal: "SIGTERM",
+          expectedSignal: "SIGTERM",
+          terminationKind: "requested",
+          outcome: "stopped",
+        } : {
+          exitCode: 1,
+          terminationKind: "unexpected",
+          outcome: "failed",
+        }),
+      }, null, 2)}\n`);
+      const original = await readFile(runRecordPath(item, terminal.runId), "utf8");
+      const reason = `operator recovery for ${status}`;
+
+      const missingReason = await execute([process.execPath, cli, "run", "retry", "retry-worker", "--acknowledge", terminal.runId], item.root);
+      expect(missingReason.code).toBe(1);
+      expect(missingReason.stderr).toContain("nonblank --reason");
+      await expect(retryActiveRun({
+        cwd: item.root,
+        acknowledgedRunId: terminal.runId,
+        workerName: "retry-worker",
+        reason: " \t ",
+        launcher: async () => ({ runtime: "apple", container: "never" }),
+      })).rejects.toThrow("nonblank");
+      await expect(retryActiveRun({
+        cwd: item.root,
+        acknowledgedRunId: terminal.runId,
+        workerName: "retry-worker",
+        reason: "x".repeat(MAX_RETRY_REASON_BYTES + 1),
+        launcher: async () => ({ runtime: "apple", container: "never" }),
+      })).rejects.toThrow("at most");
+
+      const retried = await retryActiveRun({
+        cwd: item.root,
+        acknowledgedRunId: terminal.runId,
+        workerName: "retry-worker",
+        reason,
+        now: new Date("2026-08-17T10:14:12.000Z"),
+        launcher: async (request) => {
+          await writeAgentState(item.stateDir, agent(item, request));
+          return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrPaneId: "pane-retry" };
+        },
+      });
+      expect(retried).toMatchObject({ status: "running", retryOfRunId: terminal.runId, retryReason: reason });
+      expect(await readFile(runRecordPath(item, terminal.runId), "utf8")).toBe(original);
+
+      const history = await loadRunAttemptHistory(item.root);
+      expect(history.activeRunId).toBe(retried.runId);
+      expect(history.attempts.map(({ runId, status: attemptStatus, retryOfRunId, retryReason }) => ({ runId, status: attemptStatus, retryOfRunId, retryReason }))).toEqual([
+        { runId: terminal.runId, status, retryOfRunId: undefined, retryReason: undefined },
+        { runId: retried.runId, status: "running", retryOfRunId: terminal.runId, retryReason: reason },
+      ]);
+      const freshHistory = await execute([process.execPath, cli, "run", "history", "--json"], item.root);
+      expect(freshHistory.code).toBe(0);
+      expect(JSON.parse(freshHistory.stdout).attempts[1]).toMatchObject({ runId: retried.runId, retryOfRunId: terminal.runId, retryReason: reason });
+    }
   });
 
   test("rejects malformed schemas, stale pointers, and identity/path tampering without a runtime", async () => {
@@ -684,6 +906,9 @@ describe("durable ticket dispatch and recovery", () => {
     expect(() => validateActiveRunPointer({ ...pointer, schemaVersion: 9 }, { goalId: item.goalId, ticketId: item.ticketId })).toThrow("unsupported");
     expect(() => validateActiveRunPointer({ ...pointer, recordPath: "../record.json" }, { goalId: item.goalId, ticketId: item.ticketId })).toThrow("recordPath");
     expect(() => validateRunRecord({ ...record, ticketId: `ticket-${"a".repeat(32)}` }, { goalId: item.goalId, ticketId: item.ticketId, baseRevision: item.base, runId: record.runId })).toThrow("identity/base");
+    expect(() => validateRunRecord({ ...record, retryReason: "operator recovery" }, { goalId: item.goalId, ticketId: item.ticketId, baseRevision: item.base, runId: record.runId })).toThrow("no retryOfRunId");
+    expect(() => validateRunRecord({ ...record, retryOfRunId: `run-${"e".repeat(32)}`, retryReason: " \t " }, { goalId: item.goalId, ticketId: item.ticketId, baseRevision: item.base, runId: record.runId })).toThrow("invalid retryReason");
+    expect(() => validateRunRecord({ ...record, retryOfRunId: `run-${"e".repeat(32)}`, retryReason: "x".repeat(MAX_RETRY_REASON_BYTES + 1) }, { goalId: item.goalId, ticketId: item.ticketId, baseRevision: item.base, runId: record.runId })).toThrow("invalid retryReason");
 
     await writeFile(pointerPath, JSON.stringify({ ...pointer, runId: `run-${"f".repeat(32)}`, recordPath: `.pi-swarm/goals/${item.goalId}/tickets/${item.ticketId}/runs/run-${"f".repeat(32)}/record.v1.json` }));
     await expect(loadActiveRun(item.root)).rejects.toThrow("active run record is missing");

@@ -14,6 +14,7 @@ export const COMPLETION_REPORT_SCHEMA_VERSION = 1;
 const MAX_REPORT_BYTES = 128 * 1024;
 const MAX_REPORT_TEXT = 4_000;
 const MAX_REPORT_LIST = 64;
+export const MAX_RETRY_REASON_BYTES = 500;
 const runIdPattern = /^run-[0-9a-f]{32}$/;
 const finalizationIdPattern = /^(?:run|start)-[0-9a-f]{32}$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
@@ -34,6 +35,8 @@ export type RunRecord = {
   backend: "herdr";
   requestedModel?: string;
   requestedThinking?: string;
+  retryOfRunId?: string;
+  retryReason?: string;
   status: RunStatus;
   createdAt: string;
   launchedAt?: string;
@@ -86,6 +89,14 @@ export type ActiveRunPointer = {
   ticketId: string;
   runId: string;
   recordPath: string;
+};
+
+export type RunAttemptHistory = {
+  goalId: string;
+  ticketId: string;
+  baseRevision: string;
+  activeRunId: string | null;
+  attempts: RunRecord[];
 };
 
 export type AgentStopIntent = {
@@ -221,6 +232,10 @@ function requireTimestamp(value: unknown, label: string): asserts value is strin
 
 function validOptionalString(value: unknown): value is string | undefined {
   return value === undefined || (typeof value === "string" && value.length > 0);
+}
+
+function validRetryReason(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && !value.includes("\0") && Buffer.byteLength(value, "utf8") <= MAX_RETRY_REASON_BYTES;
 }
 
 function within(root: string, path: string, label: string): string {
@@ -646,11 +661,11 @@ export function validateRunRecord(value: unknown, expected: { goalId: string; ti
   for (const field of ["requestedModel", "requestedThinking", "container", "herdrName", "herdrWorkspaceId", "herdrTabId", "herdrPaneId", "stopRequester", "stopReason", "signal", "expectedSignal", "launchError"] as const) {
     if (!validOptionalString(record[field])) throw new Error(`run record has an invalid ${field}`);
   }
-  if (record.runtime !== undefined && record.runtime !== "apple" && record.runtime !== "docker") throw new Error("run record has an invalid runtime");
-  if (record.stopRunId !== undefined && record.stopRunId !== record.runId) throw new Error("run record stop intent belongs to another run");
-  if (record.exitCode !== undefined && !Number.isSafeInteger(record.exitCode)) throw new Error("run record has an invalid exitCode");
-  if (record.terminationKind !== undefined && record.terminationKind !== "requested" && record.terminationKind !== "unexpected") throw new Error("run record has an invalid terminationKind");
-  if (record.outcome !== undefined && !["stopped", "failed", "completed"].includes(String(record.outcome))) throw new Error("run record has an invalid outcome");
+  if (record.retryOfRunId !== undefined && (typeof record.retryOfRunId !== "string" || !runIdPattern.test(record.retryOfRunId) || record.retryOfRunId === record.runId)) {
+    throw new Error("run record has an invalid retryOfRunId");
+  }
+  if (record.retryReason !== undefined && !validRetryReason(record.retryReason)) throw new Error("run record has an invalid retryReason");
+  if (record.retryReason !== undefined && record.retryOfRunId === undefined) throw new Error("run record retryReason has no retryOfRunId");
   if (record.report !== undefined) {
     const report = requireObject(record.report, "run report pointer");
     if (report.schemaVersion !== COMPLETION_REPORT_SCHEMA_VERSION || typeof report.path !== "string" ||
@@ -658,6 +673,11 @@ export function validateRunRecord(value: unknown, expected: { goalId: string; ti
       !["completed", "partial", "blocked"].includes(String(report.outcome))) throw new Error("run record has an invalid report pointer");
     requireTimestamp(report.createdAt, "run report pointer createdAt");
   }
+  if (record.runtime !== undefined && record.runtime !== "apple" && record.runtime !== "docker") throw new Error("run record has an invalid runtime");
+  if (record.stopRunId !== undefined && record.stopRunId !== record.runId) throw new Error("run record stop intent belongs to another run");
+  if (record.exitCode !== undefined && !Number.isSafeInteger(record.exitCode)) throw new Error("run record has an invalid exitCode");
+  if (record.terminationKind !== undefined && record.terminationKind !== "requested" && record.terminationKind !== "unexpected") throw new Error("run record has an invalid terminationKind");
+  if (record.outcome !== undefined && !["stopped", "failed", "completed"].includes(String(record.outcome))) throw new Error("run record has an invalid outcome");
   if (record.status === "running" && (!record.launchedAt || !record.runtime || !record.container || record.finishedAt !== undefined)) throw new Error("running run record has incomplete launch data");
   if (record.status === "launch_failed" && (!record.finishedAt || !record.launchError || record.outcome !== "failed")) throw new Error("launch-failed run record has incomplete failure data");
   if (record.status === "stopping" && (!record.stopRequestedAt || record.stopRunId !== record.runId)) throw new Error("stopping run record has invalid stop intent");
@@ -674,32 +694,199 @@ async function context(cwd: string): Promise<RunContext> {
   return { root, stateDir, goal: active.record, ticket: ready.record, ticketDirectory, runsDirectory: join(ticketDirectory, "runs") };
 }
 
-async function loadRunFromContext(ctx: RunContext): Promise<RunRecord> {
+async function readActiveRunPointer(ctx: RunContext, allowMissing = false): Promise<ActiveRunPointer | undefined> {
   const pointerPath = join(ctx.ticketDirectory, "active-run.json");
   await rejectSymlinks(ctx.root, pointerPath, "active run pointer path");
   try { await access(pointerPath, constants.F_OK); }
   catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && allowMissing) return undefined;
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("no run for the ready ticket; dispatch it with spike ticket dispatch <worker-name>");
     throw error;
   }
-  const pointer = validateActiveRunPointer(await smallJson(pointerPath, "active run pointer"), { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
+  return validateActiveRunPointer(await smallJson(pointerPath, "active run pointer"), { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
+}
+
+function runRecordPath(ctx: RunContext, runId: string): string {
+  return join(ctx.runsDirectory, runId, "record.v1.json");
+}
+
+function activeRunPointer(runId: string, ctx: RunContext): ActiveRunPointer {
+  const pointer: ActiveRunPointer = {
+    schemaVersion: ACTIVE_RUN_POINTER_SCHEMA_VERSION,
+    goalId: ctx.goal.goalId,
+    ticketId: ctx.ticket.ticketId,
+    runId,
+    recordPath: `.pi-swarm/goals/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/record.v1.json`,
+  };
+  return validateActiveRunPointer(pointer, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
+}
+
+async function loadRunById(ctx: RunContext, runId: string, label = "run record"): Promise<RunRecord> {
+  if (!runIdPattern.test(runId)) throw new Error(`${label} has an invalid runId`);
+  const directory = join(ctx.runsDirectory, runId);
+  const path = runRecordPath(ctx, runId);
+  await rejectSymlinks(ctx.root, directory, `${label} directory`);
+  await rejectSymlinks(ctx.root, path, `${label} path`);
+  return validateRunRecord(await smallJson(path, label), {
+    goalId: ctx.goal.goalId,
+    ticketId: ctx.ticket.ticketId,
+    baseRevision: ctx.ticket.baseRevision,
+    runId,
+  });
+}
+
+async function loadRunFromContext(ctx: RunContext): Promise<RunRecord> {
+  const pointer = await readActiveRunPointer(ctx);
   const path = within(ctx.root, pointer.recordPath, "active run record path");
   const expectedDirectory = join(ctx.runsDirectory, pointer.runId);
   if (path !== join(expectedDirectory, "record.v1.json")) throw new Error("active run pointer resolves outside its run directory");
-  await rejectSymlinks(ctx.root, expectedDirectory, "active run directory");
-  await rejectSymlinks(ctx.root, path, "active run record path");
-  return validateRunRecord(await smallJson(path, "active run record"), {
-    goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, runId: pointer.runId,
-  });
+  return loadRunById(ctx, pointer.runId, "active run record");
+}
+
+async function listRunAttemptsFromContext(ctx: RunContext): Promise<RunRecord[]> {
+  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
+  let entries: string[];
+  try { entries = (await readdir(ctx.runsDirectory)).sort(); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const attempts: RunRecord[] = [];
+  for (const entry of entries) {
+    if (!runIdPattern.test(entry)) throw new Error(`run state contains an unexpected entry: ${entry}`);
+    attempts.push(await loadRunById(ctx, entry));
+  }
+  return attempts.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId));
+}
+
+async function ensureRunsDirectory(ctx: RunContext): Promise<void> {
+  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
+  await mkdir(ctx.runsDirectory, { recursive: true, mode: 0o700 });
+  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
+}
+
+async function withRunTransitionLock<T>(ctx: RunContext, operation: () => Promise<T>): Promise<T> {
+  const lockPath = join(ctx.ticketDirectory, "dispatch.lock");
+  let lock;
+  try { lock = await open(lockPath, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("another ticket dispatch or retry is in progress");
+    throw error;
+  }
+  try { return await operation(); }
+  finally {
+    await lock.close();
+    await rm(lockPath, { force: true });
+  }
+}
+
+function retryLineage(attempts: RunRecord[], failedRunId: string): RunRecord[] {
+  return attempts.filter((attempt) => attempt.retryOfRunId === failedRunId)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId));
+}
+
+function workerTask(ctx: RunContext, runId: string): string {
+  const workerPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/ticket.md`;
+  const reportPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/report.v1.json`;
+  const artifactRoot = `/output/artifacts/${runId}/`;
+  return `Implement durable ticket ${ctx.ticket.ticketId} from ${workerPath}. Test and commit it. Write the completion report to ${reportPath}; export artifacts only under ${artifactRoot}.`;
+}
+
+async function createDispatchingRun(ctx: RunContext, options: {
+  workerName: string;
+  workerSlug: string;
+  model?: string;
+  thinking?: string;
+  now?: Date;
+  retryOfRunId?: string;
+  retryReason?: string;
+  runId?: string;
+}): Promise<RunRecord> {
+  const runId = options.runId ?? `run-${randomUUID().replaceAll("-", "")}`;
+  const record: RunRecord = {
+    schemaVersion: RUN_SCHEMA_VERSION,
+    runId,
+    goalId: ctx.goal.goalId,
+    ticketId: ctx.ticket.ticketId,
+    baseRevision: ctx.ticket.baseRevision,
+    worker: { name: options.workerName, slug: options.workerSlug },
+    backend: "herdr",
+    ...(options.model ? { requestedModel: options.model } : {}),
+    ...(options.thinking ? { requestedThinking: options.thinking } : {}),
+    ...(options.retryOfRunId ? { retryOfRunId: options.retryOfRunId } : {}),
+    ...(options.retryReason ? { retryReason: options.retryReason } : {}),
+    status: "dispatching",
+    createdAt: iso(options.now),
+  };
+  await mkdir(join(ctx.runsDirectory, runId), { mode: 0o700 });
+  await durableWrite(runRecordPath(ctx, runId), `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
+async function pointActiveRun(ctx: RunContext, runId: string): Promise<void> {
+  await atomicWrite(join(ctx.ticketDirectory, "active-run.json"), `${JSON.stringify(activeRunPointer(runId, ctx), null, 2)}\n`);
+}
+
+async function launchPreparedRun(ctx: RunContext, record: RunRecord, options: { launcher: TicketLauncher; model?: string; thinking?: string; now?: Date }): Promise<RunRecord> {
+  await mkdir(dirname(completionReportStagingPath(ctx.root, ctx.goal.goalId, ctx.ticket.ticketId, record.runId)), { recursive: true, mode: 0o700 });
+  await mkdir(completionArtifactRoot(ctx.root, record.runId), { recursive: true, mode: 0o700 });
+  const request: DispatchLaunchRequest = {
+    runId: record.runId,
+    goalId: ctx.goal.goalId,
+    ticketId: ctx.ticket.ticketId,
+    baseRevision: ctx.ticket.baseRevision,
+    workerName: record.worker.name,
+    workerSlug: record.worker.slug,
+    task: workerTask(ctx, record.runId),
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.thinking ? { thinking: options.thinking } : {}),
+  };
+  try {
+    const launch = await options.launcher(request);
+    const current = await loadRunById(ctx, record.runId, "prepared run record");
+    const launched: RunRecord = {
+      ...current,
+      ...launch,
+      ...(!current.launchedAt ? { launchedAt: iso(options.now) } : {}),
+      ...(current.status === "dispatching" ? { status: "running" as const } : {}),
+    };
+    await writeRun(ctx, launched);
+    return launched;
+  } catch (error) {
+    const current = await loadRunById(ctx, record.runId, "prepared run record");
+    const failed: RunRecord = {
+      ...current,
+      status: "launch_failed",
+      finishedAt: iso(options.now),
+      launchError: cleanError(error),
+      outcome: "failed",
+      terminationKind: "unexpected",
+    };
+    await writeRun(ctx, failed);
+    throw new Error(`ticket run ${record.runId} launch failed: ${failed.launchError}`);
+  }
 }
 
 export async function loadActiveRun(cwd = process.cwd()): Promise<RunRecord> {
   return loadRunFromContext(await context(cwd));
 }
 
+export async function loadRunAttemptHistory(cwd = process.cwd()): Promise<RunAttemptHistory> {
+  const ctx = await context(cwd);
+  const pointer = await readActiveRunPointer(ctx, true);
+  const attempts = await listRunAttemptsFromContext(ctx);
+  return {
+    goalId: ctx.goal.goalId,
+    ticketId: ctx.ticket.ticketId,
+    baseRevision: ctx.ticket.baseRevision,
+    activeRunId: pointer?.runId ?? null,
+    attempts,
+  };
+}
+
 async function writeRun(ctx: RunContext, record: RunRecord): Promise<void> {
   validateRunRecord(record, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, runId: record.runId });
-  await atomicWrite(join(ctx.runsDirectory, record.runId, "record.v1.json"), `${JSON.stringify(record, null, 2)}\n`);
+  await atomicWrite(runRecordPath(ctx, record.runId), `${JSON.stringify(record, null, 2)}\n`);
 }
 
 function completionReportPath(ctx: RunContext, runId: string): string {
@@ -895,66 +1082,84 @@ export async function dispatchTicket(options: { cwd?: string; workerName: string
   if (!options.workerName.trim()) throw new Error("ticket dispatch requires a worker name");
   if (options.model !== undefined && !options.model) throw new Error("model must not be empty");
   if (options.thinking !== undefined && !options.thinking) throw new Error("thinking level must not be empty");
-  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
-  await mkdir(ctx.runsDirectory, { recursive: true, mode: 0o700 });
-  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
-  const lockPath = join(ctx.ticketDirectory, "dispatch.lock");
-  let lock;
-  try { lock = await open(lockPath, "wx", 0o600); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("another ticket dispatch is in progress");
-    throw error;
-  }
-  try {
+  await ensureRunsDirectory(ctx);
+  return withRunTransitionLock(ctx, async () => {
     try {
       const existing = await loadRunFromContext(ctx);
       throw new Error(`ticket already has run ${existing.runId} (${existing.status}); automatic redispatch is refused`);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.startsWith("no run for the ready ticket")) throw error;
     }
-    const runId = `run-${randomUUID().replaceAll("-", "")}`;
-    const createdAt = iso(options.now);
-    let record: RunRecord = {
-      schemaVersion: RUN_SCHEMA_VERSION, runId, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId,
-      baseRevision: ctx.ticket.baseRevision, worker: { name: options.workerName, slug }, backend: "herdr",
-      ...(options.model ? { requestedModel: options.model } : {}), ...(options.thinking ? { requestedThinking: options.thinking } : {}),
-      status: "dispatching", createdAt,
-    };
-    const runDirectory = join(ctx.runsDirectory, runId);
-    await mkdir(runDirectory, { mode: 0o700 });
-    await durableWrite(join(runDirectory, "record.v1.json"), `${JSON.stringify(record, null, 2)}\n`);
-    const pointer: ActiveRunPointer = {
-      schemaVersion: ACTIVE_RUN_POINTER_SCHEMA_VERSION, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, runId,
-      recordPath: `.pi-swarm/goals/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/record.v1.json`,
-    };
-    validateActiveRunPointer(pointer, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
-    await atomicWrite(join(ctx.ticketDirectory, "active-run.json"), `${JSON.stringify(pointer, null, 2)}\n`);
-    const workerPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/ticket.md`;
-    const reportPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/report.v1.json`;
-    const artifactRoot = `/output/artifacts/${runId}/`;
-    await mkdir(dirname(completionReportStagingPath(ctx.root, ctx.goal.goalId, ctx.ticket.ticketId, runId)), { recursive: true, mode: 0o700 });
-    await mkdir(completionArtifactRoot(ctx.root, runId), { recursive: true, mode: 0o700 });
-    const task = `Implement durable ticket ${ctx.ticket.ticketId} from ${workerPath}. Test and commit it. Write the completion report to ${reportPath}; export artifacts only under ${artifactRoot}.`;
-    try {
-      const launch = await options.launcher({ runId, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, workerName: options.workerName, workerSlug: slug, task, model: options.model, thinking: options.thinking });
-      const current = await loadRunFromContext(ctx);
-      record = {
-        ...current, ...launch,
-        ...(!current.launchedAt ? { launchedAt: iso() } : {}),
-        ...(current.status === "dispatching" ? { status: "running" as const } : {}),
-      };
-      await writeRun(ctx, record);
-      return record;
-    } catch (error) {
-      const current = await loadRunFromContext(ctx);
-      record = { ...current, status: "launch_failed", finishedAt: iso(), launchError: cleanError(error), outcome: "failed", terminationKind: "unexpected" };
-      await writeRun(ctx, record);
-      throw new Error(`ticket run ${runId} launch failed: ${record.launchError}`);
+    const record = await createDispatchingRun(ctx, {
+      workerName: options.workerName,
+      workerSlug: slug,
+      model: options.model,
+      thinking: options.thinking,
+      now: options.now,
+    });
+    await pointActiveRun(ctx, record.runId);
+    return launchPreparedRun(ctx, record, options);
+  });
+}
+
+export async function retryActiveRun(options: {
+  cwd?: string;
+  acknowledgedRunId: string;
+  workerName: string;
+  model?: string;
+  thinking?: string;
+  reason?: string;
+  now?: Date;
+  launcher: TicketLauncher;
+}): Promise<RunRecord> {
+  const cwd = options.cwd ?? process.cwd();
+  if (!runIdPattern.test(options.acknowledgedRunId)) throw new Error("run retry requires an exact acknowledged run ID");
+  if (!options.workerName.trim()) throw new Error("run retry requires a worker name");
+  if (options.model !== undefined && !options.model) throw new Error("model must not be empty");
+  if (options.thinking !== undefined && !options.thinking) throw new Error("thinking level must not be empty");
+  if (options.reason !== undefined && !validRetryReason(options.reason)) throw new Error(`run retry reason must be nonblank text of at most ${MAX_RETRY_REASON_BYTES} UTF-8 bytes`);
+  const ctx = await context(cwd);
+  const slug = workerSlug(options.workerName);
+  await ensureRunsDirectory(ctx);
+  return withRunTransitionLock(ctx, async () => {
+    const current = await loadRunFromContext(ctx);
+    if (current.runId !== options.acknowledgedRunId) {
+      if (current.retryOfRunId === options.acknowledgedRunId) throw new Error(`active run ${current.runId} already retried failed run ${options.acknowledgedRunId}; stale acknowledgement is refused`);
+      throw new Error(`active run ${current.runId} does not match acknowledged failed run ${options.acknowledgedRunId}`);
     }
-  } finally {
-    await lock.close();
-    await rm(lockPath, { force: true });
-  }
+    if (["dispatching", "running", "stopping"].includes(current.status)) throw new Error(`active run ${current.runId} is live (${current.status}); explicit retry is refused`);
+    const retryableTerminal = current.status === "stopped" || current.status === "failed";
+    if (current.status !== "launch_failed" && !retryableTerminal) {
+      throw new Error(`active run ${current.runId} is ${current.status}; only launch_failed, stopped, or failed runs can be retried`);
+    }
+    if (retryableTerminal && !validRetryReason(options.reason)) {
+      throw new Error(`run retry of ${current.status} run ${current.runId} requires a nonblank --reason of at most ${MAX_RETRY_REASON_BYTES} UTF-8 bytes`);
+    }
+
+    const lineage = retryLineage(await listRunAttemptsFromContext(ctx), current.runId);
+    if (lineage.length > 1) throw new Error(`multiple retry records already acknowledge failed run ${current.runId}; concurrent retry recovery is required`);
+    let record = lineage[0];
+    if (record) {
+      if (record.status !== "dispatching" || record.launchedAt || record.finishedAt || record.runtime || record.container || record.launchError) {
+        throw new Error(`retry record ${record.runId} for failed run ${current.runId} is not resumable`);
+      }
+      if (record.worker.name !== options.workerName || record.worker.slug !== slug || record.requestedModel !== options.model || record.requestedThinking !== options.thinking || record.retryReason !== options.reason) {
+        throw new Error(`retry record ${record.runId} for run ${current.runId} conflicts with the requested worker or launch provenance`);
+      }
+    } else {
+      record = await createDispatchingRun(ctx, {
+        workerName: options.workerName,
+        workerSlug: slug,
+        model: options.model,
+        thinking: options.thinking,
+        ...(options.reason !== undefined ? { retryReason: options.reason } : {}),
+        now: options.now,
+        retryOfRunId: current.runId,
+      });
+    }
+    await pointActiveRun(ctx, record.runId);
+    return launchPreparedRun(ctx, record, options);
+  });
 }
 
 export function agentStatePath(stateDir: string, name: string): string {
