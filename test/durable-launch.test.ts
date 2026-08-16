@@ -37,13 +37,14 @@ async function must(command: string[], cwd: string, env?: Record<string, string 
   return result.stdout.trim();
 }
 
-type RepoFixture = { root: string; seed: string; workspace: string; evidencePath: string; base: string; head: string };
+type RepoFixture = { root: string; seed: string; workspace: string; stateDir: string; evidencePath: string; base: string; head: string };
 
 async function repoFixture(): Promise<RepoFixture> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "spike-durable-launch-")));
   temporaryDirectories.push(root);
   const seed = join(root, "seed");
   const workspace = join(root, "workspace");
+  const stateDir = join(root, "agent-state");
   await mkdir(seed, { recursive: true });
   await must(["git", "init", "-b", "main"], seed);
   await must(["git", "config", "user.name", "Spike Test"], seed);
@@ -56,7 +57,7 @@ async function repoFixture(): Promise<RepoFixture> {
   await must(["git", "add", "tracked.txt"], seed);
   await must(["git", "commit", "-m", "main advance"], seed);
   const head = await must(["git", "rev-parse", "HEAD"], seed);
-  return { root, seed, workspace, evidencePath: join(root, "launch-evidence.json"), base, head };
+  return { root, seed, workspace, stateDir, evidencePath: join(root, "launch-evidence.json"), base, head };
 }
 
 async function runEntrypoint(
@@ -68,6 +69,7 @@ async function runEntrypoint(
     ...process.env,
     AGENT_WORKSPACE: item.workspace,
     AGENT_REPO_DIR: join(item.workspace, "project"),
+    AGENT_STATE_DIR: item.stateDir,
     AGENT_NAME: "worker-one",
     AGENT_BRANCH: "agent/worker-one",
     REPOSITORY_URL: item.seed,

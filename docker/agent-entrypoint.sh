@@ -5,7 +5,7 @@ workspace=${AGENT_WORKSPACE:-/workspace}
 repo=${AGENT_REPO_DIR:-${workspace}/project}
 agent_name=${AGENT_NAME:-default}
 agent_branch=${AGENT_BRANCH:-agent/${agent_name}}
-agent_dir=/home/node/.pi/agent
+agent_dir=${AGENT_STATE_DIR:-/home/node/.pi/agent}
 
 # Apple container volumes are fresh ext4 filesystems owned by root. Its launcher
 # starts this entrypoint as root so it can hand only the mounted directories to
