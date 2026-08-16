@@ -25,7 +25,9 @@ import {
   finalizedAgentComplete,
   finalizedAgentMatchesState,
   listAgentFinalizations,
+  importCompletionReport,
   loadActiveRun,
+  loadCompletionReport,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
@@ -74,6 +76,8 @@ Usage:
   spike workflow migrate-bootstrap [--apply]
   spike workflow doctor [--json]
   spike run status [--json]
+  spike run report import
+  spike run report show [--json]
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -376,6 +380,8 @@ async function launchPersistentTicket(request: DispatchLaunchRequest): Promise<P
     SPIKE_GOAL_ID: request.goalId,
     SPIKE_TICKET_ID: request.ticketId,
     SPIKE_RUN_ID: request.runId,
+    SPIKE_REPORT_PATH: `/output/workflow/${request.goalId}/tickets/${request.ticketId}/runs/${request.runId}/report.v1.json`,
+    SPIKE_ARTIFACT_ROOT: `/output/artifacts/${request.runId}/`,
     SPIKE_LAUNCH_EVIDENCE_TOKEN: launchToken,
     ...baseEnvironment,
     ...(process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
@@ -496,15 +502,47 @@ function printRunStatus(record: RunRecord) {
   if (record.signal) console.log(`Signal: ${record.signal}`);
   if (record.expectedSignal) console.log(`Expected signal: ${record.expectedSignal}`);
   if (record.launchError) console.log(`Launch error: ${record.launchError}`);
+  if (record.report) console.log(`Completion report: ${record.report.outcome} (${record.report.createdAt})`);
+}
+
+function printCompletionReport(report: Awaited<ReturnType<typeof loadCompletionReport>>) {
+  console.log(`Outcome: ${report.outcome}`);
+  console.log(`Summary: ${report.summary}`);
+  console.log(`Git: ${report.baseRevision}...${report.resultingRevision}; commits: ${report.producedCommitIds.join(", ") || "none"}; worktree: ${report.dirtyWorktree ? "dirty" : "clean"}`);
+  console.log(`Verification: ${report.verification.map((entry) => `${entry.outcome} ${entry.command}${entry.exitCode !== undefined ? ` (exit ${entry.exitCode})` : ""}`).join("; ") || "none"}`);
+  console.log(`Services: ${report.services.map((service) => `${service.verification} ${service.operatorUrl ?? service.internalUrl}`).join("; ") || "none"}`);
+  console.log(`Artifacts: ${report.artifacts.map((artifact) => `${artifact.kind}: ${artifact.path}`).join("; ") || "none"}`);
+  console.log(`Risks: ${report.risks.join("; ") || "none"}`);
+  console.log(`Follow-up: ${report.followUp.state}${report.followUp.reason ? ` (${report.followUp.reason})` : ""}`);
 }
 
 async function runCommand(action: string | undefined, args: string[]) {
   try {
-    if (action !== "status") fail("expected run status", 2);
-    if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
-    const record = await loadActiveRun();
-    if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
-    else printRunStatus(record);
+    if (action === "status") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
+      const record = await loadActiveRun();
+      if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
+      else printRunStatus(record);
+      return;
+    }
+    if (action === "report") {
+      const reportAction = args.shift();
+      if (reportAction === "import") {
+        if (args.length) fail("run report import accepts no arguments", 2);
+        const result = await importCompletionReport();
+        console.log(`${result.idempotent ? "Already imported" : "Imported"} completion report: ${result.report.outcome}`);
+        return;
+      }
+      if (reportAction === "show") {
+        if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run report show accepts only --json", 2);
+        const report = await loadCompletionReport();
+        if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
+        else printCompletionReport(report);
+        return;
+      }
+      fail("expected run report import or show", 2);
+    }
+    fail("expected run status or report", 2);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
@@ -830,7 +868,7 @@ async function supervisor(args: string[]) {
     "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",
     "Delegate independent implementation, investigation, testing, and review tasks to isolated workers with spike_agents.",
     "Give each worker a focused task and a unique stable name. Workers have persistent clones and should commit completed work.",
-    "Continue coordinating while workers run; their completion reports will arrive asynchronously.",
+    "Continue coordinating while workers run; completion notifications are supporting evidence only. After a durable worker reports completion, run spike run report import and spike run report show before publication or acceptance; never synthesize a report from terminal prose.",
     "Do not ask workers to access host secrets or modify the host checkout directly.",
   ].join(" ");
   const useHerdr = args.includes("--herdr");
@@ -977,6 +1015,8 @@ async function runAgent(name: string | undefined, args: string[]) {
     "--env", `AGENT_BRANCH=${process.env.AGENT_BRANCH ?? `agent/${agent}`}`,
     "--env", `AGENT_BASE_REF=${baseEnvironment.AGENT_BASE_REF}`,
     ...(baseEnvironment.SPIKE_BASE_REVISION ? ["--env", `SPIKE_BASE_REVISION=${baseEnvironment.SPIKE_BASE_REVISION}`] : []),
+    ...(process.env.SPIKE_REPORT_PATH ? ["--env", `SPIKE_REPORT_PATH=${process.env.SPIKE_REPORT_PATH}`] : []),
+    ...(process.env.SPIKE_ARTIFACT_ROOT ? ["--env", `SPIKE_ARTIFACT_ROOT=${process.env.SPIKE_ARTIFACT_ROOT}`] : []),
     ...(launchEvidenceToken ? [
       "--env", `SPIKE_LAUNCH_EVIDENCE_TOKEN=${launchEvidenceToken}`,
       "--env", `SPIKE_LAUNCH_EVIDENCE_PATH=/output/launch/${launchEvidenceToken}.json`,
@@ -1115,6 +1155,8 @@ async function persistentAgent(name: string | undefined, args: string[]) {
     ...(process.env.SPIKE_GOAL_ID ? { SPIKE_GOAL_ID: process.env.SPIKE_GOAL_ID } : {}),
     ...(process.env.SPIKE_TICKET_ID ? { SPIKE_TICKET_ID: process.env.SPIKE_TICKET_ID } : {}),
     ...(process.env.SPIKE_RUN_ID ? { SPIKE_RUN_ID: process.env.SPIKE_RUN_ID } : {}),
+    ...(process.env.SPIKE_REPORT_PATH ? { SPIKE_REPORT_PATH: process.env.SPIKE_REPORT_PATH } : {}),
+    ...(process.env.SPIKE_ARTIFACT_ROOT ? { SPIKE_ARTIFACT_ROOT: process.env.SPIKE_ARTIFACT_ROOT } : {}),
     ...(process.env.SPIKE_LAUNCH_EVIDENCE_TOKEN ? { SPIKE_LAUNCH_EVIDENCE_TOKEN: process.env.SPIKE_LAUNCH_EVIDENCE_TOKEN } : {}),
   };
   // Herdr transports pane commands through a bounded command field. Durable

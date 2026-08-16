@@ -3,6 +3,8 @@ import { basename, join, relative, sep } from "node:path";
 import { loadActiveGoal, loadReadyTicket, loadWorkflowState, validateTicketRecord, type TicketRecord } from "./goals.ts";
 import {
   loadActiveRun,
+  loadCompletionReport,
+  validateStoredCompletionReport,
   normalizeAgentState,
   validateAgentFinalizationRecord,
   validateAgentStopIntent,
@@ -296,7 +298,7 @@ export type DoctorReport = {
   ok: boolean;
   errors: string[];
   warnings: string[];
-  summary: { goalId?: string; acceptedCodeRevision?: string; activeTicketId?: string | null; activeRunId?: string | null; tickets: number; results: number };
+  summary: { goalId?: string; acceptedCodeRevision?: string; activeTicketId?: string | null; activeRunId?: string | null; completionReport?: { available: boolean; outcome?: string; createdAt?: string }; tickets: number; results: number };
 };
 
 async function inspectResultPublication(root: string, result: TicketResult): Promise<void> {
@@ -336,6 +338,7 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
           try {
             const runRecord = validateRunRecord(await readJson(runPath, "result run record"), { goalId: state.goalId, ticketId: entry.ticket.ticketId, baseRevision: entry.ticket.baseRevision, runId: entry.result.runId });
             if (!terminalRuns.has(runRecord.status) || runRecord.worker.slug !== entry.result.worker?.slug) throw new Error(`run provenance for ${entry.ticket.ticketId} is inconsistent`);
+            if (runRecord.report) await validateStoredCompletionReport(root, runRecord);
             const agent = await readAgentReadonly(join(root, ".pi-swarm"), runRecord.worker.slug);
             const activeMatches = Boolean(agent && agent.runId === runRecord.runId && agent.goalId === runRecord.goalId && agent.ticketId === runRecord.ticketId &&
               agent.baseRevision === runRecord.baseRevision && agent.finishedAt);
@@ -369,8 +372,14 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
           goalId: state.goalId, ticketId: state.activeTicketId, baseRevision: activeEntry.ticket.baseRevision, runId: pointer.runId,
         });
         report.summary.activeRunId = record.runId;
+        if (record.report) {
+          try {
+            const completion = await loadCompletionReport(root);
+            report.summary.completionReport = { available: true, outcome: completion.outcome, createdAt: completion.createdAt };
+          } catch (error) { report.errors.push(`completion report: ${error instanceof Error ? error.message : String(error)}`); }
+        } else report.summary.completionReport = { available: false };
       } catch (error) { report.errors.push(error instanceof Error ? error.message : String(error)); }
-    } else report.summary.activeRunId = null;
+    } else { report.summary.activeRunId = null; report.summary.completionReport = { available: false }; }
 
     const pointerPath = join(root, ".pi-swarm", "goals", state.goalId, "active-ticket.json");
     const ticketPointer = await readJson(pointerPath, "active ticket pointer", true);

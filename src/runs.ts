@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
@@ -10,6 +10,10 @@ export const AGENT_SCHEMA_VERSION = 1;
 export const AGENT_STOP_INTENT_SCHEMA_VERSION = 1;
 export const AGENT_FINALIZATION_SCHEMA_VERSION = 1;
 const MAX_RECORD_BYTES = 128 * 1024;
+export const COMPLETION_REPORT_SCHEMA_VERSION = 1;
+const MAX_REPORT_BYTES = 128 * 1024;
+const MAX_REPORT_TEXT = 4_000;
+const MAX_REPORT_LIST = 64;
 const runIdPattern = /^run-[0-9a-f]{32}$/;
 const finalizationIdPattern = /^(?:run|start)-[0-9a-f]{32}$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
@@ -50,6 +54,30 @@ export type RunRecord = {
   terminationKind?: "requested" | "unexpected";
   outcome?: "stopped" | "failed" | "completed";
   launchError?: string;
+  report?: { schemaVersion: 1; path: string; outcome: CompletionOutcome; createdAt: string };
+};
+
+export type CompletionOutcome = "completed" | "partial" | "blocked";
+export type CompletionReport = {
+  schemaVersion: 1;
+  goalId: string;
+  ticketId: string;
+  runId: string;
+  worker: { name: string; slug: string };
+  baseRevision: string;
+  resultingRevision: string;
+  producedCommitIds: string[];
+  dirtyWorktree: boolean;
+  outcome: CompletionOutcome;
+  summary: string;
+  verification: Array<{ command: string; outcome: "passed" | "failed" | "skipped"; exitCode?: number; detail?: string }>;
+  services: Array<{ internalUrl: string; operatorUrl?: string; verification: "verified" | "unverified" | "failed" }>;
+  artifacts: Array<{ kind: string; description: string; path: string }>;
+  assumptions: string[];
+  limitations: string[];
+  risks: string[];
+  followUp: { state: "ready" | "blocked"; reason?: string };
+  createdAt: string;
 };
 
 export type ActiveRunPointer = {
@@ -623,6 +651,13 @@ export function validateRunRecord(value: unknown, expected: { goalId: string; ti
   if (record.exitCode !== undefined && !Number.isSafeInteger(record.exitCode)) throw new Error("run record has an invalid exitCode");
   if (record.terminationKind !== undefined && record.terminationKind !== "requested" && record.terminationKind !== "unexpected") throw new Error("run record has an invalid terminationKind");
   if (record.outcome !== undefined && !["stopped", "failed", "completed"].includes(String(record.outcome))) throw new Error("run record has an invalid outcome");
+  if (record.report !== undefined) {
+    const report = requireObject(record.report, "run report pointer");
+    if (report.schemaVersion !== COMPLETION_REPORT_SCHEMA_VERSION || typeof report.path !== "string" ||
+      report.path !== `.pi-swarm/goals/${expected.goalId}/tickets/${expected.ticketId}/runs/${expected.runId}/report.v1.json` ||
+      !["completed", "partial", "blocked"].includes(String(report.outcome))) throw new Error("run record has an invalid report pointer");
+    requireTimestamp(report.createdAt, "run report pointer createdAt");
+  }
   if (record.status === "running" && (!record.launchedAt || !record.runtime || !record.container || record.finishedAt !== undefined)) throw new Error("running run record has incomplete launch data");
   if (record.status === "launch_failed" && (!record.finishedAt || !record.launchError || record.outcome !== "failed")) throw new Error("launch-failed run record has incomplete failure data");
   if (record.status === "stopping" && (!record.stopRequestedAt || record.stopRunId !== record.runId)) throw new Error("stopping run record has invalid stop intent");
@@ -665,6 +700,186 @@ export async function loadActiveRun(cwd = process.cwd()): Promise<RunRecord> {
 async function writeRun(ctx: RunContext, record: RunRecord): Promise<void> {
   validateRunRecord(record, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, runId: record.runId });
   await atomicWrite(join(ctx.runsDirectory, record.runId, "record.v1.json"), `${JSON.stringify(record, null, 2)}\n`);
+}
+
+function completionReportPath(ctx: RunContext, runId: string): string {
+  return join(ctx.runsDirectory, runId, "report.v1.json");
+}
+
+export function completionReportStagingPath(root: string, goalId: string, ticketId: string, runId: string): string {
+  return join(root, ".pi-swarm", "output", "workflow", goalId, "tickets", ticketId, "runs", runId, "report.v1.json");
+}
+
+export function completionArtifactRoot(root: string, runId: string): string {
+  return join(root, ".pi-swarm", "output", "artifacts", runId);
+}
+
+function reportObject(value: unknown, label: string, keys: string[]): Record<string, unknown> {
+  const result = requireObject(value, label);
+  const unknown = Object.keys(result).filter((key) => !keys.includes(key));
+  const missing = keys.filter((key) => result[key] === undefined);
+  if (unknown.length || missing.length) throw new Error(`${label} has ${unknown.length ? `unknown fields: ${unknown.join(", ")}` : `missing fields: ${missing.join(", ")}`}`);
+  return result;
+}
+
+function reportText(value: unknown, label: string, max = MAX_REPORT_TEXT): string {
+  if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > max) throw new Error(`${label} must be a bounded non-empty string`);
+  return value;
+}
+
+function reportList(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > MAX_REPORT_LIST || value.some((item) => typeof item !== "string" || !item.trim() || Buffer.byteLength(item, "utf8") > MAX_REPORT_TEXT) || new Set(value).size !== value.length) {
+    throw new Error(`${label} must be a bounded list of unique strings`);
+  }
+  return value as string[];
+}
+
+function reportUrl(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length > 2_000) throw new Error(`${label} has an invalid URL`);
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
+    return value;
+  } catch { throw new Error(`${label} has an invalid URL`); }
+}
+
+function reportArtifactPath(value: unknown, runId: string): string {
+  if (typeof value !== "string" || !value.startsWith(`.pi-swarm/output/artifacts/${runId}/`) || value.endsWith("/") || isAbsolute(value) || value.includes("\\0")) {
+    throw new Error("report artifact path is outside its run artifact boundary");
+  }
+  const root = `.pi-swarm/output/artifacts/${runId}`;
+  if (relative(root, value).split(sep).join("/") !== value.slice(root.length + 1) || value.includes("..")) throw new Error("report artifact path is not normalized");
+  return value;
+}
+
+export function validateCompletionReport(value: unknown, expected: { goalId: string; ticketId: string; runId: string; baseRevision: string; worker: { name: string; slug: string } }): CompletionReport {
+  const report = reportObject(value, "completion report", [
+    "schemaVersion", "goalId", "ticketId", "runId", "worker", "baseRevision", "resultingRevision", "producedCommitIds", "dirtyWorktree", "outcome", "summary",
+    "verification", "services", "artifacts", "assumptions", "limitations", "risks", "followUp", "createdAt",
+  ]);
+  if (report.schemaVersion !== COMPLETION_REPORT_SCHEMA_VERSION) throw new Error(`unsupported completion report schema: ${String(report.schemaVersion)}`);
+  if (report.goalId !== expected.goalId || report.ticketId !== expected.ticketId || report.runId !== expected.runId || report.baseRevision !== expected.baseRevision) throw new Error("completion report correlation/base does not match the active run");
+  const worker = reportObject(report.worker, "completion report worker", ["name", "slug"]);
+  if (worker.name !== expected.worker.name || worker.slug !== expected.worker.slug) throw new Error("completion report worker does not match the active run");
+  if (typeof report.resultingRevision !== "string" || !objectIdPattern.test(report.resultingRevision)) throw new Error("completion report has an invalid resultingRevision");
+  if (!Array.isArray(report.producedCommitIds) || report.producedCommitIds.length > MAX_REPORT_LIST || report.producedCommitIds.some((id) => typeof id !== "string" || !objectIdPattern.test(id)) || new Set(report.producedCommitIds).size !== report.producedCommitIds.length) throw new Error("completion report has invalid or duplicate producedCommitIds");
+  if (typeof report.dirtyWorktree !== "boolean") throw new Error("completion report has an invalid dirtyWorktree flag");
+  if (!["completed", "partial", "blocked"].includes(String(report.outcome))) throw new Error("completion report has an invalid outcome");
+  reportText(report.summary, "completion report summary", 2_000);
+  if (!Array.isArray(report.verification) || report.verification.length > MAX_REPORT_LIST) throw new Error("completion report has an invalid verification list");
+  const commands = new Set<string>();
+  for (const entry of report.verification) {
+    const verification = reportObject(entry, "completion report verification", ["command", "outcome", "exitCode", "detail"].filter((key) => (entry as Record<string, unknown>)?.[key] !== undefined));
+    const command = reportText(verification.command, "completion report verification command");
+    if (commands.has(command)) throw new Error("completion report has duplicate verification entries"); commands.add(command);
+    if (!["passed", "failed", "skipped"].includes(String(verification.outcome))) throw new Error("completion report verification has an invalid outcome");
+    if (verification.exitCode !== undefined && (!Number.isSafeInteger(verification.exitCode) || Math.abs(verification.exitCode as number) > 255)) throw new Error("completion report verification has an invalid exitCode");
+    if (verification.detail !== undefined) reportText(verification.detail, "completion report verification detail");
+  }
+  if (!Array.isArray(report.services) || report.services.length > MAX_REPORT_LIST) throw new Error("completion report has an invalid services list");
+  const serviceUrls = new Set<string>();
+  for (const entry of report.services) {
+    const service = reportObject(entry, "completion report service", ["internalUrl", "operatorUrl", "verification"].filter((key) => (entry as Record<string, unknown>)?.[key] !== undefined));
+    const internal = reportUrl(service.internalUrl, "completion report service internalUrl");
+    if (serviceUrls.has(internal)) throw new Error("completion report has duplicate services"); serviceUrls.add(internal);
+    if (service.operatorUrl !== undefined) reportUrl(service.operatorUrl, "completion report service operatorUrl");
+    if (!["verified", "unverified", "failed"].includes(String(service.verification))) throw new Error("completion report service has an invalid verification status");
+  }
+  if (!Array.isArray(report.artifacts) || report.artifacts.length > MAX_REPORT_LIST) throw new Error("completion report has an invalid artifacts list");
+  const artifactPaths = new Set<string>();
+  for (const entry of report.artifacts) {
+    const artifact = reportObject(entry, "completion report artifact", ["kind", "description", "path"]);
+    reportText(artifact.kind, "completion report artifact kind", 100);
+    reportText(artifact.description, "completion report artifact description", 1_000);
+    const path = reportArtifactPath(artifact.path, expected.runId);
+    if (artifactPaths.has(path)) throw new Error("completion report has duplicate artifacts"); artifactPaths.add(path);
+  }
+  reportList(report.assumptions, "completion report assumptions"); reportList(report.limitations, "completion report limitations"); reportList(report.risks, "completion report risks");
+  const followUp = reportObject(report.followUp, "completion report followUp", ["state", "reason"].filter((key) => (report.followUp as Record<string, unknown>)?.[key] !== undefined));
+  if (followUp.state !== "ready" && followUp.state !== "blocked") throw new Error("completion report followUp has an invalid state");
+  if (followUp.reason !== undefined) reportText(followUp.reason, "completion report followUp reason");
+  if (followUp.state === "blocked" && !followUp.reason) throw new Error("blocked completion report followUp requires a reason");
+  if (report.outcome === "blocked" && followUp.state !== "blocked") throw new Error("blocked completion report must have blocked followUp state");
+  if (report.outcome === "completed" && followUp.state === "blocked") throw new Error("completed completion report cannot have blocked followUp state");
+  requireTimestamp(report.createdAt, "completion report createdAt");
+  return report as CompletionReport;
+}
+
+async function gitReportCheck(root: string, base: string, revision: string, label: string): Promise<void> {
+  const object = await Bun.spawn(["git", "-C", root, "cat-file", "-t", revision], { stdout: "pipe", stderr: "pipe" });
+  if (await object.exited !== 0 || (await new Response(object.stdout).text()).trim() !== "commit") throw new Error(`completion report ${label} is not an available commit: ${revision}`);
+  const ancestor = Bun.spawn(["git", "-C", root, "merge-base", "--is-ancestor", base, revision], { stdout: "ignore", stderr: "ignore" });
+  if (await ancestor.exited !== 0) throw new Error(`completion report ${label} is not a descendant of base ${base}`);
+}
+
+async function validateReportEvidence(root: string, report: CompletionReport): Promise<void> {
+  await gitReportCheck(root, report.baseRevision, report.resultingRevision, "resultingRevision");
+  for (const commit of report.producedCommitIds) await gitReportCheck(root, report.baseRevision, commit, "produced commit");
+  for (const artifact of report.artifacts) {
+    const path = within(root, artifact.path, "completion report artifact path");
+    await rejectSymlinks(root, path, "completion report artifact path");
+    let info;
+    try { info = await lstat(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`completion report artifact is missing: ${artifact.path}`); throw error; }
+    if (!info.isFile()) throw new Error(`completion report artifact is not a regular file: ${artifact.path}`);
+  }
+}
+
+function canonicalCompletionReport(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalCompletionReport).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${canonicalCompletionReport(child)}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+export async function validateStoredCompletionReport(root: string, run: RunRecord): Promise<CompletionReport | undefined> {
+  const path = join(root, `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json`);
+  try {
+    await rejectSymlinks(root, path, "completion report path");
+    const value = await smallJson(path, "completion report");
+    const report = validateCompletionReport(value, { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+    await validateReportEvidence(root, report);
+    if (!run.report || run.report.path !== `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json` || run.report.outcome !== report.outcome || run.report.createdAt !== report.createdAt) throw new Error("completion report pointer is missing or inconsistent");
+    return report;
+  } catch (error) {
+    if (error instanceof Error && error.message === "completion report is missing" && !run.report) return undefined;
+    if (error instanceof Error && error.message === "completion report is missing") throw new Error("completion report pointer references a missing report");
+    throw error;
+  }
+}
+
+export async function importCompletionReport(cwd = process.cwd()): Promise<{ report: CompletionReport; idempotent: boolean }> {
+  const ctx = await context(cwd);
+  const run = await loadRunFromContext(ctx);
+  const staging = completionReportStagingPath(ctx.root, run.goalId, run.ticketId, run.runId);
+  await rejectSymlinks(ctx.root, staging, "completion report staging path");
+  let info;
+  try { info = await lstat(staging); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`completion report staging file is missing: ${relative(ctx.root, staging).split(sep).join("/")}`); throw error; }
+  if (!info.isFile()) throw new Error("completion report staging path is not a regular file");
+  const report = validateCompletionReport(await smallJson(staging, "completion report staging file"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+  await validateReportEvidence(ctx.root, report);
+  const destination = completionReportPath(ctx, run.runId);
+  await rejectSymlinks(ctx.root, destination, "completion report destination path");
+  const serialized = `${JSON.stringify(report, null, 2)}\n`;
+  let idempotent = false;
+  try {
+    await durableWrite(destination, serialized);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const current = validateCompletionReport(await smallJson(destination, "completion report"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+    if (canonicalCompletionReport(current) !== canonicalCompletionReport(report)) throw new Error("completion report already exists with conflicting content");
+    idempotent = true;
+  }
+  const current = await loadRunFromContext(ctx);
+  const pointer = { schemaVersion: COMPLETION_REPORT_SCHEMA_VERSION as const, path: `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json`, outcome: report.outcome, createdAt: report.createdAt };
+  if (current.report && (current.report.path !== pointer.path || current.report.outcome !== pointer.outcome || current.report.createdAt !== pointer.createdAt)) throw new Error("run already has a conflicting completion report pointer");
+  if (!current.report) await writeRun(ctx, { ...current, report: pointer });
+  return { report, idempotent };
+}
+
+export async function loadCompletionReport(cwd = process.cwd()): Promise<CompletionReport> {
+  const ctx = await context(cwd);
+  const report = await validateStoredCompletionReport(ctx.root, await loadRunFromContext(ctx));
+  if (!report) throw new Error("no imported completion report for the active run; use spike run report import");
+  return report;
 }
 
 function iso(now?: Date): string {
@@ -715,7 +930,11 @@ export async function dispatchTicket(options: { cwd?: string; workerName: string
     validateActiveRunPointer(pointer, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
     await atomicWrite(join(ctx.ticketDirectory, "active-run.json"), `${JSON.stringify(pointer, null, 2)}\n`);
     const workerPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/ticket.md`;
-    const task = `Implement durable ticket ${ctx.ticket.ticketId} from ${workerPath}. Follow every requirement, test and commit the work, and report verification, blockers, and risks.`;
+    const reportPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/report.v1.json`;
+    const artifactRoot = `/output/artifacts/${runId}/`;
+    await mkdir(dirname(completionReportStagingPath(ctx.root, ctx.goal.goalId, ctx.ticket.ticketId, runId)), { recursive: true, mode: 0o700 });
+    await mkdir(completionArtifactRoot(ctx.root, runId), { recursive: true, mode: 0o700 });
+    const task = `Implement durable ticket ${ctx.ticket.ticketId} from ${workerPath}. Test and commit it. Write the completion report to ${reportPath}; export artifacts only under ${artifactRoot}.`;
     try {
       const launch = await options.launcher({ runId, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, workerName: options.workerName, workerSlug: slug, task, model: options.model, thinking: options.thinking });
       const current = await loadRunFromContext(ctx);

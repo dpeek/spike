@@ -7,7 +7,10 @@ import { agentOutcomeDescription } from "../src/lifecycle.ts";
 import { publishBranch } from "../src/publication.ts";
 import {
   agentStopIntentPath,
+  completionReportStagingPath,
   dispatchTicket,
+  importCompletionReport,
+  loadCompletionReport,
   listAgentFinalizations,
   loadActiveRun,
   normalizeAgentState,
@@ -907,5 +910,39 @@ describe("intentional shutdown classification", () => {
     expect(staleFailed.runId).toBe(run.runId);
     expect(staleFailed.lifecycle).toBe("failed");
     expect(staleFailed.terminationKind).toBe("unexpected");
+  });
+});
+
+describe("durable completion reports", () => {
+  test("imports immutable validated evidence and rejects conflicting replacement", async () => {
+    const item = await fixture();
+    const run = await successfulDispatch(item);
+    await writeFile(join(item.root, "implementation.txt"), "done\n");
+    await must(["git", "add", "implementation.txt"], item.root);
+    await must(["git", "commit", "-m", "implementation"], item.root);
+    const head = await must(["git", "rev-parse", "HEAD"], item.root);
+    const artifactPath = `.pi-swarm/output/artifacts/${run.runId}/verification.txt`;
+    await writeFile(join(item.root, artifactPath), "verified\n");
+    const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
+    const report = {
+      schemaVersion: 1, goalId: item.goalId, ticketId: item.ticketId, runId: run.runId, worker: run.worker,
+      baseRevision: item.base, resultingRevision: head, producedCommitIds: [head], dirtyWorktree: false,
+      outcome: "completed", summary: "Implemented report import.",
+      verification: [{ command: "bun test", outcome: "passed", exitCode: 0, detail: "all tests" }],
+      services: [], artifacts: [{ kind: "test-output", description: "verification evidence", path: artifactPath }],
+      assumptions: [], limitations: [], risks: [], followUp: { state: "ready" }, createdAt: "2026-08-18T12:00:00.000Z",
+    };
+    await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
+    const before = await must(["git", "status", "--porcelain=v1"], item.root);
+    expect((await importCompletionReport(item.root)).idempotent).toBe(false);
+    expect((await importCompletionReport(item.root)).idempotent).toBe(true);
+    expect(await loadCompletionReport(item.root)).toEqual(report);
+    const shown = await execute([process.execPath, cli, "run", "report", "show", "--json"], item.root);
+    expect(shown.code).toBe(0);
+    expect(JSON.parse(shown.stdout).resultingRevision).toBe(head);
+    expect(await must(["git", "status", "--porcelain=v1"], item.root)).toBe(before);
+    report.summary = "conflicting replacement";
+    await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
+    await expect(importCompletionReport(item.root)).rejects.toThrow("conflicting");
   });
 });
