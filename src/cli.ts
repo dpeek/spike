@@ -77,7 +77,8 @@ Usage:
   spike workflow doctor [--json]
   spike run status [--json]
   spike run history [--json]
-  spike run retry <worker-name> --acknowledge <failed-run-id> [--model <model>] [--thinking <level>]
+  spike run retry <worker-name> --acknowledge <run-id> [--reason <text>] [--model <model>] [--thinking <level>]
+    # --reason is required when retrying a stopped or failed run
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -482,6 +483,7 @@ function printRunStatus(record: RunRecord) {
   console.log(`Worker: ${record.worker.slug}`);
   console.log(`Base revision: ${record.baseRevision}`);
   if (record.retryOfRunId) console.log(`Retry of run: ${record.retryOfRunId}`);
+  if (record.retryReason) console.log(`Retry reason: ${record.retryReason}`);
   console.log(`Status: ${record.status}`);
   console.log(`Created at: ${record.createdAt}`);
   if (record.launchedAt) console.log(`Launched at: ${record.launchedAt}`);
@@ -503,14 +505,15 @@ function printRunStatus(record: RunRecord) {
   if (record.launchError) console.log(`Launch error: ${record.launchError}`);
 }
 
-function parseRunRetryArgs(args: string[]): { workerName: string; acknowledgedRunId: string; model?: string; thinking?: string } {
+function parseRunRetryArgs(args: string[]): { workerName: string; acknowledgedRunId: string; model?: string; thinking?: string; reason?: string } {
   let workerName: string | undefined;
   let acknowledgedRunId: string | undefined;
   let model: string | undefined;
   let thinking: string | undefined;
+  let reason: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index];
-    if (["--acknowledge", "--model", "--thinking"].includes(argument)) {
+    if (["--acknowledge", "--model", "--thinking", "--reason"].includes(argument)) {
       if (index + 1 >= args.length || args[index + 1].startsWith("-")) fail(`run retry requires ${argument} <value>`, 2);
       const value = args[++index];
       if (argument === "--acknowledge") {
@@ -519,17 +522,20 @@ function parseRunRetryArgs(args: string[]): { workerName: string; acknowledgedRu
       } else if (argument === "--model") {
         if (model !== undefined) fail("run retry accepts --model only once", 2);
         model = value;
-      } else {
+      } else if (argument === "--thinking") {
         if (thinking !== undefined) fail("run retry accepts --thinking only once", 2);
         thinking = value;
+      } else {
+        if (reason !== undefined) fail("run retry accepts --reason only once", 2);
+        reason = value;
       }
     } else if (argument.startsWith("-")) fail(`unknown run retry option: ${argument}`, 2);
     else if (workerName === undefined) workerName = argument;
     else fail("run retry accepts exactly one worker name", 2);
   }
   if (!workerName) fail("run retry requires a worker name", 2);
-  if (!acknowledgedRunId) fail("run retry requires --acknowledge <failed-run-id>", 2);
-  return { workerName, acknowledgedRunId, model, thinking };
+  if (!acknowledgedRunId) fail("run retry requires --acknowledge <run-id>", 2);
+  return { workerName, acknowledgedRunId, model, thinking, ...(reason !== undefined ? { reason } : {}) };
 }
 
 function printRunHistory(history: Awaited<ReturnType<typeof loadRunAttemptHistory>>) {
@@ -538,7 +544,7 @@ function printRunHistory(history: Awaited<ReturnType<typeof loadRunAttemptHistor
   console.log(`Base revision: ${history.baseRevision}`);
   console.log(`Active run: ${history.activeRunId ?? "none"}`);
   for (const attempt of history.attempts) {
-    console.log(`${attempt.runId}${attempt.runId === history.activeRunId ? " *" : ""} ${attempt.status} worker=${attempt.worker.slug}${attempt.retryOfRunId ? ` retry-of=${attempt.retryOfRunId}` : ""} created=${attempt.createdAt}`);
+    console.log(`${attempt.runId}${attempt.runId === history.activeRunId ? " *" : ""} ${attempt.status} worker=${attempt.worker.slug}${attempt.retryOfRunId ? ` retry-of=${attempt.retryOfRunId}` : ""}${attempt.retryReason ? ` retry-reason=${JSON.stringify(attempt.retryReason)}` : ""} created=${attempt.createdAt}`);
   }
 }
 
@@ -884,7 +890,7 @@ async function supervisor(args: string[]) {
   const systemPrompt = [
     "You are the Spike supervisor for this repository.",
     "Before drafting or activating a goal, inspect durable state with spike goal status --json; never replace an existing active goal.",
-    "Before dispatching a durable ticket, inspect both spike ticket status --json and spike run status --json; durable ready tickets and runs survive restarts, and a supervisor restart or missing live runtime is never a reason to redispatch or infer a retry.",
+    "Before dispatching a durable ticket, inspect both spike ticket status --json and spike run status --json; durable ready tickets and runs survive restarts, and a supervisor restart or missing live runtime is never a reason to redispatch or infer a retry. A stopped or failed durable run may be retried only by an operator's explicit spike run retry command with the exact active run ID acknowledgement and a nonblank --reason; launch_failed retains its exact-ID acknowledgement path.",
     "Before drafting a ticket, inspect spike ticket status --json and spike ticket show.",
     "Issuing a ticket preserves planner state but does not dispatch a worker; dispatch it exactly once with the run-aware spike_agents dispatch_ticket action.",
     "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",

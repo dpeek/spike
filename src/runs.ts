@@ -10,6 +10,7 @@ export const AGENT_SCHEMA_VERSION = 1;
 export const AGENT_STOP_INTENT_SCHEMA_VERSION = 1;
 export const AGENT_FINALIZATION_SCHEMA_VERSION = 1;
 const MAX_RECORD_BYTES = 128 * 1024;
+export const MAX_RETRY_REASON_BYTES = 500;
 const runIdPattern = /^run-[0-9a-f]{32}$/;
 const finalizationIdPattern = /^(?:run|start)-[0-9a-f]{32}$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
@@ -31,6 +32,7 @@ export type RunRecord = {
   requestedModel?: string;
   requestedThinking?: string;
   retryOfRunId?: string;
+  retryReason?: string;
   status: RunStatus;
   createdAt: string;
   launchedAt?: string;
@@ -202,6 +204,10 @@ function requireTimestamp(value: unknown, label: string): asserts value is strin
 
 function validOptionalString(value: unknown): value is string | undefined {
   return value === undefined || (typeof value === "string" && value.length > 0);
+}
+
+function validRetryReason(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && !value.includes("\0") && Buffer.byteLength(value, "utf8") <= MAX_RETRY_REASON_BYTES;
 }
 
 function within(root: string, path: string, label: string): string {
@@ -630,6 +636,8 @@ export function validateRunRecord(value: unknown, expected: { goalId: string; ti
   if (record.retryOfRunId !== undefined && (typeof record.retryOfRunId !== "string" || !runIdPattern.test(record.retryOfRunId) || record.retryOfRunId === record.runId)) {
     throw new Error("run record has an invalid retryOfRunId");
   }
+  if (record.retryReason !== undefined && !validRetryReason(record.retryReason)) throw new Error("run record has an invalid retryReason");
+  if (record.retryReason !== undefined && record.retryOfRunId === undefined) throw new Error("run record retryReason has no retryOfRunId");
   if (record.runtime !== undefined && record.runtime !== "apple" && record.runtime !== "docker") throw new Error("run record has an invalid runtime");
   if (record.stopRunId !== undefined && record.stopRunId !== record.runId) throw new Error("run record stop intent belongs to another run");
   if (record.exitCode !== undefined && !Number.isSafeInteger(record.exitCode)) throw new Error("run record has an invalid exitCode");
@@ -754,6 +762,7 @@ async function createDispatchingRun(ctx: RunContext, options: {
   thinking?: string;
   now?: Date;
   retryOfRunId?: string;
+  retryReason?: string;
   runId?: string;
 }): Promise<RunRecord> {
   const runId = options.runId ?? `run-${randomUUID().replaceAll("-", "")}`;
@@ -768,6 +777,7 @@ async function createDispatchingRun(ctx: RunContext, options: {
     ...(options.model ? { requestedModel: options.model } : {}),
     ...(options.thinking ? { requestedThinking: options.thinking } : {}),
     ...(options.retryOfRunId ? { retryOfRunId: options.retryOfRunId } : {}),
+    ...(options.retryReason ? { retryReason: options.retryReason } : {}),
     status: "dispatching",
     createdAt: iso(options.now),
   };
@@ -879,14 +889,16 @@ export async function retryActiveRun(options: {
   workerName: string;
   model?: string;
   thinking?: string;
+  reason?: string;
   now?: Date;
   launcher: TicketLauncher;
 }): Promise<RunRecord> {
   const cwd = options.cwd ?? process.cwd();
-  if (!runIdPattern.test(options.acknowledgedRunId)) throw new Error("run retry requires an exact failed run ID");
+  if (!runIdPattern.test(options.acknowledgedRunId)) throw new Error("run retry requires an exact acknowledged run ID");
   if (!options.workerName.trim()) throw new Error("run retry requires a worker name");
   if (options.model !== undefined && !options.model) throw new Error("model must not be empty");
   if (options.thinking !== undefined && !options.thinking) throw new Error("thinking level must not be empty");
+  if (options.reason !== undefined && !validRetryReason(options.reason)) throw new Error(`run retry reason must be nonblank text of at most ${MAX_RETRY_REASON_BYTES} UTF-8 bytes`);
   const ctx = await context(cwd);
   const slug = workerSlug(options.workerName);
   await ensureRunsDirectory(ctx);
@@ -897,7 +909,13 @@ export async function retryActiveRun(options: {
       throw new Error(`active run ${current.runId} does not match acknowledged failed run ${options.acknowledgedRunId}`);
     }
     if (["dispatching", "running", "stopping"].includes(current.status)) throw new Error(`active run ${current.runId} is live (${current.status}); explicit retry is refused`);
-    if (current.status !== "launch_failed") throw new Error(`active run ${current.runId} is ${current.status}; only launch_failed runs can be retried`);
+    const retryableTerminal = current.status === "stopped" || current.status === "failed";
+    if (current.status !== "launch_failed" && !retryableTerminal) {
+      throw new Error(`active run ${current.runId} is ${current.status}; only launch_failed, stopped, or failed runs can be retried`);
+    }
+    if (retryableTerminal && !validRetryReason(options.reason)) {
+      throw new Error(`run retry of ${current.status} run ${current.runId} requires a nonblank --reason of at most ${MAX_RETRY_REASON_BYTES} UTF-8 bytes`);
+    }
 
     const lineage = retryLineage(await listRunAttemptsFromContext(ctx), current.runId);
     if (lineage.length > 1) throw new Error(`multiple retry records already acknowledge failed run ${current.runId}; concurrent retry recovery is required`);
@@ -906,8 +924,8 @@ export async function retryActiveRun(options: {
       if (record.status !== "dispatching" || record.launchedAt || record.finishedAt || record.runtime || record.container || record.launchError) {
         throw new Error(`retry record ${record.runId} for failed run ${current.runId} is not resumable`);
       }
-      if (record.worker.name !== options.workerName || record.worker.slug !== slug || record.requestedModel !== options.model || record.requestedThinking !== options.thinking) {
-        throw new Error(`retry record ${record.runId} for failed run ${current.runId} conflicts with the requested worker or launch provenance`);
+      if (record.worker.name !== options.workerName || record.worker.slug !== slug || record.requestedModel !== options.model || record.requestedThinking !== options.thinking || record.retryReason !== options.reason) {
+        throw new Error(`retry record ${record.runId} for run ${current.runId} conflicts with the requested worker or launch provenance`);
       }
     } else {
       record = await createDispatchingRun(ctx, {
@@ -915,6 +933,7 @@ export async function retryActiveRun(options: {
         workerSlug: slug,
         model: options.model,
         thinking: options.thinking,
+        ...(options.reason !== undefined ? { retryReason: options.reason } : {}),
         now: options.now,
         retryOfRunId: current.runId,
       });
