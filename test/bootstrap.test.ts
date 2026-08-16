@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { activateGoal, issueTicket, loadWorkflowState, type TicketRecord } from "../src/goals.ts";
-import { migrateBootstrap, ticketHistory, workflowDoctor } from "../src/workflow.ts";
+import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor } from "../src/workflow.ts";
 import { sha256 } from "../src/workflow-state.ts";
 
 const roots: string[] = [];
@@ -44,10 +44,13 @@ async function actualLayoutFixture() {
   const ticket4 = await generatedTicket(root, goal.record.goalId, bases[3], "004", Buffer.from("# Ticket 004\n"), "2026-08-16T03:21:00.000Z");
   const ticket5 = await generatedTicket(root, goal.record.goalId, bases[4], "005", Buffer.from("# Ticket 005\n"), "2026-08-16T03:57:00.000Z");
   const activeSource = join(root, ".pi-swarm", "drafts", "006.md"); await writeFile(activeSource, "# Ticket 006\n"); const active = await issueTicket({ cwd: root, ticketFile: activeSource, now: new Date("2026-08-16T04:40:00.000Z") });
+  await writeFile(join(root, "work-6"), "6\n"); await git(root, "add", "work-6"); await git(root, "commit", "-m", "ticket 6 retry"); const retryHead = await git(root, "rev-parse", "HEAD");
   const workers = ["ticket-001-publish-review", "ticket-002-durable-goal-state", "ticket-003-ready-ticket-state", "ticket-004-run-lifecycle", "ticket-005-stop-intent-compat"];
   for (let i = 0; i < 5; i++) await publication(root, workers[i], bases[i], heads[i]);
+  const retryWorker = "ticket-006-state-migration"; await publication(root, retryWorker, heads[4], retryHead);
   const legacy = join(root, ".pi-swarm", "goals", "001"); for (let i = 1; i <= 5; i++) await mkdir(join(legacy, "tickets", String(i).padStart(3, "0")), { recursive: true });
-  await writeFile(join(legacy, "approval.md"), `# Goal 001 approval\n\nStatus: Approved\n\n- Goal: \`doc/goal.md\`\n- Approved goal blob: \`${blob}\`\n- Repository revision at approval: \`${base}\`\n- Approved at: \`2026-08-15T23:55:12Z\`\n- Operator statement: \`go\`\n`);
+  const failedRetryRunId = `run-${"6".repeat(32)}`;
+  await writeFile(join(legacy, "approval.md"), `# Goal 001 approval\n\nStatus: Approved\n\n- Goal: \`doc/goal.md\`\n- Approved goal blob: \`${blob}\`\n- Repository revision at approval: \`${base}\`\n- Approved at: \`2026-08-15T23:55:12Z\`\n- Operator statement: \`go\`\n\n## Active ticket\n\n- Ticket ID: \`${active.record.ticketId}\`\n- Initial run ID: \`${failedRetryRunId}\` (\`launch_failed\`: Herdr command truncation)\n- Explicit bootstrap retry worker: \`${retryWorker}\`\n- Base revision: \`${heads[4]}\`\n- Status: Implementing\n`);
   const ticket2 = Buffer.from("# Ticket 002\n"), ticket3 = Buffer.from("# Ticket 003\n"); await writeFile(join(legacy, "tickets", "002", "ticket.md"), ticket2); await writeFile(join(legacy, "tickets", "003", "ticket.md"), ticket3);
   const acceptedAt = ["2026-08-16T00:52:28Z", "2026-08-16T01:16:09Z", "2026-08-16T03:20:32Z", "2026-08-16T03:56:14Z", "2026-08-16T04:38:46Z"];
   for (let i = 1; i <= 5; i++) {
@@ -58,16 +61,21 @@ async function actualLayoutFixture() {
   const agentsDir = join(root, ".pi-swarm", "agents"); await mkdir(join(agentsDir, "stop-intents"), { recursive: true });
   for (let i = 0; i < 4; i++) await writeFile(join(agentsDir, `${workers[i]}.json`), `${JSON.stringify(stoppedAgent(root, workers[i]), null, 2)}\n`);
   const runId = `run-${"5".repeat(32)}`; const fifthAgent = stoppedAgent(root, workers[4], { goalId: goal.record.goalId, ticketId: ticket5.ticketId, runId, baseRevision: bases[4], stopRunId: runId }); await writeFile(join(agentsDir, `${workers[4]}.json`), `${JSON.stringify(fifthAgent, null, 2)}\n`);
+  const retryAgent = stoppedAgent(root, retryWorker, { task: `Implement durable ticket ${active.record.ticketId} through explicit bootstrap retry.` }); await writeFile(join(agentsDir, `${retryWorker}.json`), `${JSON.stringify(retryAgent, null, 2)}\n`);
   const runDirectory = join(root, `.pi-swarm/goals/${goal.record.goalId}/tickets/${ticket5.ticketId}/runs/${runId}`); await mkdir(runDirectory, { recursive: true });
   const runRecord = { schemaVersion: 1, runId, goalId: goal.record.goalId, ticketId: ticket5.ticketId, baseRevision: bases[4], worker: { name: workers[4], slug: workers[4] }, backend: "herdr", status: "stopped", createdAt: "2026-08-16T03:57:00.000Z", launchedAt: "2026-08-16T03:57:01.000Z", finishedAt: fifthAgent.finishedAt, runtime: "apple", container: fifthAgent.container, stopRequestedAt: fifthAgent.stopRequestedAt, stopRequester: fifthAgent.stopRequester, stopReason: fifthAgent.stopReason, stopRunId: runId, exitCode: 143, signal: "SIGTERM", expectedSignal: "SIGTERM", terminationKind: "requested", outcome: "stopped" };
   const ticket5Directory = dirname(dirname(runDirectory));
   await writeFile(join(runDirectory, "record.v1.json"), `${JSON.stringify(runRecord, null, 2)}\n`); await writeFile(join(ticket5Directory, "active-run.json"), `${JSON.stringify({ schemaVersion: 1, goalId: goal.record.goalId, ticketId: ticket5.ticketId, runId, recordPath: `.pi-swarm/goals/${goal.record.goalId}/tickets/${ticket5.ticketId}/runs/${runId}/record.v1.json` }, null, 2)}\n`);
+  const activeTicketDirectory = join(root, `.pi-swarm/goals/${goal.record.goalId}/tickets/${active.record.ticketId}`); const failedRunDirectory = join(activeTicketDirectory, "runs", failedRetryRunId); await mkdir(failedRunDirectory, { recursive: true });
+  const failedRun = { schemaVersion: 1, runId: failedRetryRunId, goalId: goal.record.goalId, ticketId: active.record.ticketId, baseRevision: heads[4], worker: { name: retryWorker, slug: retryWorker }, backend: "herdr", status: "launch_failed", createdAt: "2026-08-16T04:41:00.000Z", finishedAt: "2026-08-16T04:41:01.000Z", launchError: "Herdr command truncation", outcome: "failed", terminationKind: "unexpected" }; await writeFile(join(failedRunDirectory, "record.v1.json"), `${JSON.stringify(failedRun, null, 2)}\n`); await writeFile(join(activeTicketDirectory, "active-run.json"), `${JSON.stringify({ schemaVersion: 1, goalId: goal.record.goalId, ticketId: active.record.ticketId, runId: failedRetryRunId, recordPath: `.pi-swarm/goals/${goal.record.goalId}/tickets/${active.record.ticketId}/runs/${failedRetryRunId}/record.v1.json` }, null, 2)}\n`);
   const intent = { schemaVersion: 1, slug: workers[4], startedAt: fifthAgent.startedAt, pid: fifthAgent.pid, container: fifthAgent.container, runId, stopRequestedAt: fifthAgent.stopRequestedAt, stopRequester: fifthAgent.stopRequester, stopReason: fifthAgent.stopReason }; await writeFile(join(agentsDir, "stop-intents", `${workers[4]}.v1.json`), `${JSON.stringify(intent, null, 2)}\n`);
+  const ticket4Directory = join(root, `.pi-swarm/goals/${goal.record.goalId}/tickets/${ticket4.ticketId}`);
+  await writeFile(join(ticket4Directory, "acceptance.bootstrap.json"), `${JSON.stringify({ schemaVersion: 1, ticketId: ticket4.ticketId, goalId: goal.record.goalId, baseRevision: bases[3], acceptedRevision: heads[3], acceptedAt: acceptedAt[3], worker: workers[3] }, null, 2)}\n`);
   await writeFile(join(ticket5Directory, "acceptance.bootstrap.json"), `${JSON.stringify({ schemaVersion: 1, ticketId: ticket5.ticketId, goalId: goal.record.goalId, runId, baseRevision: bases[4], acceptedRevision: heads[4], acceptedAt: acceptedAt[4], worker: workers[4] }, null, 2)}\n`);
   const reconciliation = join(root, ".pi-swarm", "reconciliation"); await mkdir(reconciliation, { recursive: true }); await writeFile(join(reconciliation, "historical-stops.v1.json"), `${JSON.stringify({ schemaVersion: 1, reconciledAt: "2026-08-16T04:38:00Z", agents: workers.slice(0, 4).map((slug, i) => ({ slug, ticketAcceptance: `.pi-swarm/goals/001/tickets/${String(i + 1).padStart(3, "0")}/acceptance.md` })) }, null, 2)}\n`);
   const mirrorDir = join(root, ".pi-swarm", "output", "tickets"); await mkdir(mirrorDir, { recursive: true }); await writeFile(join(mirrorDir, "002.md"), ticket2); await writeFile(join(mirrorDir, "003.md"), ticket3);
   await rm(workflowPath); // Actual bootstrap checkout predates Ticket 006 workflow state.
-  return { root, goalId: goal.record.goalId, activeId: active.record.ticketId, accepted: heads[4], workers, ticket5 };
+  return { root, goalId: goal.record.goalId, activeId: active.record.ticketId, accepted: heads[4], workers, ticket5, retryWorker, retryHead, failedRetryRunId };
 }
 
 describe("actual bootstrap layout migration", () => {
@@ -83,15 +91,24 @@ describe("actual bootstrap layout migration", () => {
     await mkdir(logs, { recursive: true });
     await writeFile(join(logs, "acceptance.bootstrap.json"), "unrelated log output\n");
     const first = await migrateBootstrap({ cwd: item.root }); const second = await migrateBootstrap({ cwd: item.root });
-    expect(first).toEqual(second); expect(first.applicable).toBe(true); expect(first.errors).toEqual([]); expect(first.actions.some((action) => action.action === "retain" && action.source?.includes(item.activeId))).toBe(true); expect(await Bun.file(workflowPath).exists()).toBe(false);
+    expect(first).toEqual(second); expect(first.applicable).toBe(true); expect(first.errors).toEqual([]); expect(first.actions.some((action) => action.action === "retain" && action.source?.includes(item.activeId))).toBe(true);
+    expect(first.actions.filter((action) => action.action === "archive" && action.source?.endsWith("acceptance.bootstrap.json"))).toHaveLength(2);
+    expect(first.actions.some((action) => action.action === "archive" && action.source?.endsWith(`${item.activeId}/active-run.json`))).toBe(true);
+    expect(await Bun.file(workflowPath).exists()).toBe(false);
     const applied = await migrateBootstrap({ cwd: item.root, apply: true, now: new Date("2026-08-16T05:00:00.000Z") }); expect(applied.applied).toBe(true);
     const state = await loadWorkflowState(item.root); expect(state.activeTicketId).toBe(item.activeId); expect(state.acceptedCodeRevision).toBe(item.accepted);
     const history = await ticketHistory(item.root); expect(history.map((entry) => entry.status)).toEqual(["migrated", "migrated", "migrated", "migrated", "migrated", "ready"]);
+    expect(await Bun.file(join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.activeId}/active-run.json`)).exists()).toBe(false);
+    const retainedFailedRun = JSON.parse(await readFile(join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.activeId}/runs/${item.failedRetryRunId}/record.v1.json`), "utf8")); expect(retainedFailedRun.status).toBe("launch_failed");
+    const retryAgent = JSON.parse(await readFile(join(item.root, ".pi-swarm", "agents", `${item.retryWorker}.json`), "utf8")); expect(retryAgent).toMatchObject({ goalId: item.goalId, ticketId: item.activeId, baseRevision: item.accepted }); expect(retryAgent.runId).toBeUndefined();
+    expect(await Bun.file(join(item.root, ".pi-swarm", "archive", "bootstrap-001", "ticket-004-acceptance.bootstrap.json")).exists()).toBe(true); expect(await Bun.file(join(item.root, ".pi-swarm", "archive", "bootstrap-001", "ticket-005-acceptance.bootstrap.json")).exists()).toBe(true);
     for (const worker of item.workers.slice(0, 4)) { const agent = JSON.parse(await readFile(join(item.root, ".pi-swarm", "agents", `${worker}.json`), "utf8")); expect(agent.goalId).toBe(item.goalId); expect(agent.runId).toBeUndefined(); }
     expect(await Bun.file(join(item.root, ".pi-swarm", "agents", "stop-intents", `${item.workers[4]}.v1.json`)).exists()).toBe(false);
     expect(await Bun.file(join(item.root, ".pi-swarm", "output", "tickets", "002.md")).exists()).toBe(false); expect(await Bun.file(join(item.root, ".pi-swarm", "drafts", "006.md")).exists()).toBe(true);
     expect(await Bun.file(join(item.root, ".pi-swarm", "archive", "bootstrap-001", "goals-001", "approval.md")).exists()).toBe(true);
     expect((await workflowDoctor(item.root)).ok).toBe(true); expect((await migrateBootstrap({ cwd: item.root, apply: true })).applied).toBe(true);
+    const accepted = await acceptTicket({ cwd: item.root, revision: item.retryHead, review: "planner", statement: "accepted bootstrap retry" }); expect(accepted.result.runId).toBeUndefined(); expect(accepted.result.publication?.agent).toBe(item.retryWorker);
+    expect((await loadWorkflowState(item.root)).activeTicketId).toBeNull(); expect((await ticketHistory(item.root)).at(-1)?.status).toBe("accepted"); expect((await workflowDoctor(item.root)).ok).toBe(true);
   });
 
   test("reports all preflight conflicts and leaves a tampered layout untouched", async () => {

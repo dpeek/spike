@@ -21,11 +21,20 @@ type ParsedTicket = {
   run?: RunRecord;
 };
 
+type ActiveRetry = {
+  agentPath: string;
+  agent: AgentState;
+  publication: ResultPublication;
+  failedRun: RunRecord;
+  pointerPath: string;
+};
+
 type Prepared = {
   root: string;
   state: WorkflowState;
   tickets: ParsedTicket[];
   activeTicket?: TicketRecord;
+  activeRetry?: ActiveRetry;
   intentPath: string;
   mirrors: string[];
   archivePaths: Array<{ source: string; destination: string }>;
@@ -51,6 +60,12 @@ function requireField(text: string, label: string, source: string): string {
   const value = markdownField(text, label);
   if (!value) throw new Error(`${source} has no ${label}`);
   return value;
+}
+function markdownSection(text: string, heading: string): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = text.match(new RegExp(`^##[ \\t]+${escaped}[ \\t]*\\r?\\n([\\s\\S]*?)(?=^##[ \\t]+|(?![\\s\\S]))`, "im"));
+  if (!match) throw new Error(`legacy approval has no ${heading} section`);
+  return match[1];
 }
 function migratedTicketId(goalId: string, baseRevision: string, digest: string): string {
   return `ticket-${new Bun.CryptoHasher("sha256").update(`spike-ticket-v1\0${JSON.stringify({ goalId, baseRevision, digest })}`).digest("hex").slice(0, 32)}`;
@@ -127,6 +142,7 @@ async function prepare(cwd: string): Promise<Prepared> {
   }
   const tickets: ParsedTicket[] = [];
   let activeTicket: TicketRecord | undefined;
+  let activeRetry: ActiveRetry | undefined;
   let intentPath = "";
   const mirrors: string[] = [];
   const archivePaths = [
@@ -220,24 +236,52 @@ async function prepare(cwd: string): Promise<Prepared> {
     if (state.activeTicketId) {
       activeTicket = (await readGeneratedTicket(root, state, state.activeTicketId)).ticket;
       if (activeTicket.baseRevision !== state.acceptedCodeRevision) throw new Error("current active ticket does not retain the accepted Ticket 005 base");
+      const activeSection = markdownSection(approval, "Active ticket");
+      const approvalTicketId = requireField(activeSection, "Ticket ID", "legacy approval Active ticket");
+      const initialRunEvidence = requireField(activeSection, "Initial run ID", "legacy approval Active ticket");
+      const initialRunId = initialRunEvidence.match(/run-[0-9a-f]{32}/)?.[0];
+      if (!initialRunId || !/launch_failed/i.test(initialRunEvidence)) throw new Error("legacy approval Active ticket has invalid initial launch_failed run evidence");
+      const retryWorker = requireField(activeSection, "Explicit bootstrap retry worker", "legacy approval Active ticket");
+      const activeBase = requireField(activeSection, "Base revision", "legacy approval Active ticket");
+      if (!/^Implementing$/i.test(requireField(activeSection, "Status", "legacy approval Active ticket")) || approvalTicketId !== activeTicket.ticketId || activeBase !== activeTicket.baseRevision) throw new Error("legacy approval active ticket identity/base/status conflicts with workflow state");
+      const ticketDirectory = join(root, ".pi-swarm", "goals", state.goalId, "tickets", activeTicket.ticketId);
+      const pointerPath = join(ticketDirectory, "active-run.json");
+      await rejectSymlinks(root, pointerPath, "Ticket 006 initial failed run pointer");
+      const pointer = validateActiveRunPointer(await readJson(pointerPath, "Ticket 006 initial failed run pointer"), { goalId: state.goalId, ticketId: activeTicket.ticketId });
+      if (pointer.runId !== initialRunId) throw new Error("Ticket 006 initial run pointer conflicts with legacy approval");
+      const failedRun = validateRunRecord(await readJson(projectPath(root, pointer.recordPath, "Ticket 006 initial failed run record"), "Ticket 006 initial failed run record"), { goalId: state.goalId, ticketId: activeTicket.ticketId, baseRevision: activeTicket.baseRevision, runId: initialRunId });
+      if (failedRun.status !== "launch_failed" || failedRun.worker.slug !== retryWorker) throw new Error("Ticket 006 initial run is not the authoritative launch_failed retry predecessor");
+      const agentPath = join(root, ".pi-swarm", "agents", `${retryWorker}.json`);
+      await rejectSymlinks(root, agentPath, "Ticket 006 bootstrap retry agent");
+      const agent = normalizeAgentState(await readJson(agentPath, "Ticket 006 bootstrap retry agent"), retryWorker).state;
+      if (agent.runId !== undefined || agent.goalId !== undefined || agent.ticketId !== undefined || agent.baseRevision !== undefined || !agent.task?.includes(activeTicket.ticketId)) throw new Error("Ticket 006 bootstrap retry agent is not authoritative free-form retry evidence");
+      const latestPath = join(root, ".pi-swarm", "output", "branches", retryWorker, "latest.json");
+      const latest = await readJson(latestPath, "Ticket 006 bootstrap retry latest publication") as Record<string, unknown>;
+      if (typeof latest.head !== "string") throw new Error("Ticket 006 bootstrap retry publication has no head");
+      await verifyCommit(root, activeTicket.baseRevision, latest.head);
+      const publicationEvidence = await publication(root, retryWorker, activeTicket.baseRevision, latest.head);
+      activeRetry = { agentPath, agent, publication: publicationEvidence, failedRun, pointerPath };
+      archivePaths.push({ source: pointerPath, destination: join(root, ".pi-swarm", "archive", "bootstrap-001", "ticket-006-initial-active-run.json") });
     }
     const known = new Set([...tickets.map((item) => item.ticket.ticketId), ...(activeTicket ? [activeTicket.ticketId] : [])]);
     const unknown = state.ticketOrder.filter((id) => !known.has(id));
     if (unknown.length) throw new Error(`workflow contains unknown tickets: ${unknown.join(", ")}`);
 
-    // Bootstrap acceptance belongs to the known generated Ticket 005. Never
-    // discover it by traversing all of .pi-swarm: shared Pi auth/session state,
-    // logs, and inspection output are unrelated and may legitimately contain
-    // symlinks or similarly named files.
-    const bootstrapRecord = join(root, ".pi-swarm", "goals", state.goalId, "tickets", tickets[4].ticket.ticketId, "acceptance.bootstrap.json");
-    await rejectSymlinks(root, bootstrapRecord, "Ticket 005 bootstrap acceptance");
-    if (!await exists(bootstrapRecord)) throw new Error("generated Ticket 005 acceptance.bootstrap.json is missing from its ticket directory");
-    archivePaths.push({ source: bootstrapRecord, destination: join(root, ".pi-swarm", "archive", "bootstrap-001", "ticket-005-acceptance.bootstrap.json") });
-    const bootstrap = await readJson(bootstrapRecord, "Ticket 005 bootstrap acceptance") as Record<string, unknown>;
-    const fifth = tickets[4];
-    for (const [field, expected] of [["ticketId", fifth.ticket.ticketId], ["goalId", state.goalId], ["runId", fifth.result.runId], ["baseRevision", fifth.ticket.baseRevision], ["acceptedRevision", fifth.result.acceptedRevision], ["acceptedAt", fifth.result.acceptedAt], ["worker", fifth.agent.slug]] as const) {
-      if (bootstrap[field] !== expected) throw new Error(`Ticket 005 bootstrap acceptance has conflicting ${field}`);
+    // Bootstrap acceptance belongs only to known generated Tickets 004–005.
+    // Never discover it by traversing all of .pi-swarm: shared Pi auth/session
+    // state, logs, and inspection output are unrelated.
+    for (const item of tickets.slice(3, 5)) {
+      const bootstrapRecord = join(root, ".pi-swarm", "goals", state.goalId, "tickets", item.ticket.ticketId, "acceptance.bootstrap.json");
+      await rejectSymlinks(root, bootstrapRecord, `Ticket 00${item.ordinal} bootstrap acceptance`);
+      if (!await exists(bootstrapRecord)) throw new Error(`generated Ticket 00${item.ordinal} acceptance.bootstrap.json is missing from its ticket directory`);
+      archivePaths.push({ source: bootstrapRecord, destination: join(root, ".pi-swarm", "archive", "bootstrap-001", `ticket-00${item.ordinal}-acceptance.bootstrap.json`) });
+      const bootstrap = await readJson(bootstrapRecord, `Ticket 00${item.ordinal} bootstrap acceptance`) as Record<string, unknown>;
+      const expectedFields: Array<[string, unknown]> = [["ticketId", item.ticket.ticketId], ["goalId", state.goalId], ["baseRevision", item.ticket.baseRevision], ["acceptedRevision", item.result.acceptedRevision], ["acceptedAt", item.result.acceptedAt], ["worker", item.agent.slug]];
+      if (item.result.runId) expectedFields.push(["runId", item.result.runId]);
+      else if (bootstrap.runId !== undefined) throw new Error("Ticket 004 bootstrap acceptance must not invent a run");
+      for (const [field, expected] of expectedFields) if (bootstrap[field] !== expected) throw new Error(`Ticket 00${item.ordinal} bootstrap acceptance has conflicting ${field}`);
     }
+    const fifth = tickets[4];
 
     intentPath = join(root, ".pi-swarm", "agents", "stop-intents", `${fifth.agent.slug}.v1.json`);
     await rejectSymlinks(root, intentPath, "Ticket 005 stale stop intent");
@@ -278,6 +322,15 @@ async function prepare(cwd: string): Promise<Prepared> {
       }
     }
     if (activeTicket) plan.actions.push({ action: "retain", source: activeTicket.snapshotPath, destination: activeTicket.snapshotPath, sha256: activeTicket.snapshotSha256, reason: `current active ticket on accepted base ${state.acceptedCodeRevision}` });
+    if (activeRetry) {
+      const runRecordPath = projectPath(root, `.pi-swarm/goals/${state.goalId}/tickets/${activeTicket!.ticketId}/runs/${activeRetry.failedRun.runId}/record.v1.json`, "Ticket 006 failed run record");
+      const publicationManifestPath = projectPath(root, activeRetry.publication.manifestPath, "Ticket 006 retry publication manifest");
+      const publicationBundlePath = projectPath(root, activeRetry.publication.bundlePath, "Ticket 006 retry publication bundle");
+      plan.actions.push({ action: "retain", source: rel(root, runRecordPath), destination: rel(root, runRecordPath), sha256: sha256(await readFile(runRecordPath)), reason: "historical Ticket 006 launch_failed run" });
+      plan.actions.push({ action: "correlate", source: rel(root, activeRetry.agentPath), destination: rel(root, activeRetry.agentPath), sha256: sha256(await readFile(activeRetry.agentPath)), reason: "authoritative successful free-form Ticket 006 bootstrap retry; no run fabricated" });
+      plan.actions.push({ action: "retain", source: rel(root, publicationManifestPath), destination: rel(root, publicationManifestPath), sha256: sha256(await readFile(publicationManifestPath)), reason: "validated Ticket 006 retry publication manifest" });
+      plan.actions.push({ action: "retain", source: rel(root, publicationBundlePath), destination: rel(root, publicationBundlePath), sha256: sha256(await readFile(publicationBundlePath)), reason: "validated Ticket 006 retry publication bundle" });
+    }
     plan.actions.push({ action: "remove", source: rel(root, intentPath), sha256: sha256(await readFile(intentPath)), reason: "validated matching terminal Ticket 005 stop intent" });
     for (const mirror of mirrors.sort()) plan.actions.push({ action: "remove", source: rel(root, mirror), sha256: sha256(await readFile(mirror)), reason: "byte-equivalent legacy mirror or source draft" });
     for (const archive of archivePaths) {
@@ -287,7 +340,7 @@ async function prepare(cwd: string): Promise<Prepared> {
     }
     plan.actions.push({ action: "receipt", destination: rel(root, receipt), reason: `issuance order ${finalOrder.join(",")}` });
   } catch (error) { plan.errors.push(error instanceof Error ? error.message : String(error)); }
-  return { root, state, tickets, activeTicket, intentPath, mirrors, archivePaths, plan };
+  return { root, state, tickets, activeTicket, activeRetry, intentPath, mirrors, archivePaths, plan };
 }
 
 export async function migrateSupportedBootstrap(options: { cwd?: string; apply?: boolean; now?: Date }): Promise<BootstrapPlan> {
@@ -334,6 +387,13 @@ export async function migrateSupportedBootstrap(options: { cwd?: string; apply?:
       normalizeAgentState(correlated, correlated.slug);
       backups.set(item.agentPath, await readFile(item.agentPath));
       await atomicWrite(item.agentPath, `${JSON.stringify(correlated, null, 2)}\n`);
+    }
+    if (prepared.activeRetry && prepared.activeTicket) {
+      const correlated: AgentState = { ...prepared.activeRetry.agent, goalId: state.goalId, ticketId: prepared.activeTicket.ticketId, baseRevision: prepared.activeTicket.baseRevision };
+      delete correlated.runId;
+      normalizeAgentState(correlated, correlated.slug);
+      backups.set(prepared.activeRetry.agentPath, await readFile(prepared.activeRetry.agentPath));
+      await atomicWrite(prepared.activeRetry.agentPath, `${JSON.stringify(correlated, null, 2)}\n`);
     }
     const order = [...prepared.tickets.map((item) => item.ticket.ticketId), ...state.ticketOrder.filter((id) => !prepared.tickets.some((item) => item.ticket.ticketId === id))];
     const transitioned = validateWorkflowState({ ...state, ticketOrder: order, stateRevision: state.stateRevision + 1, lastTransitionAt: (options.now ?? new Date()).toISOString() }, state.goalId);
