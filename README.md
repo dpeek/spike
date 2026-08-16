@@ -175,9 +175,12 @@ spike ticket dispatch ticket-004-worker \
 Spike briefs Pi with the existing worker-visible
 `/output/workflow/<goal-id>/tickets/<ticket-id>/ticket.md` path. Before launch it
 creates a distinct run ID, schema-versioned run record, and atomic active-run
-pointer under the ticket directory. The correlated agent record carries the
-goal, ticket, run, worker, backend, and exact base identities. Requested model
-and thinking overrides are provenance, not part of the ticket snapshot.
+pointer under the ticket directory. Durable dispatch starts the worker clone at
+that ticket's exact accepted base revision, verifies the clone `HEAD` and
+`spike.agentBase` before `pi` begins, and fails closed instead of falling back
+to `HEAD`. The correlated agent record carries the goal, ticket, run, worker,
+backend, and exact base identities. Requested model and thinking overrides are
+provenance, not part of the ticket snapshot.
 
 Recover the association from any later CLI process, even when Herdr or the
 container is unavailable:

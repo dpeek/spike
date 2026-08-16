@@ -244,6 +244,14 @@ describe("worker branch publication", () => {
     expect(await readFile(join(item.root, first.latestManifestPath), "utf8")).toBe(latestBefore);
   });
 
+  test("rejects a durable publication whose derived base mismatches the correlated ticket base before moving refs", async () => {
+    const item = await fixture();
+    const latestPath = join(item.context.stateDir, "output", "branches", "frontend", "latest.json");
+    await expect(publishBranch(item.context, { ...item.state, baseRevision: "f".repeat(40) }, item.run)).rejects.toThrow("correlated durable base");
+    expect((await execute(["git", "rev-parse", "--verify", "refs/spike/agents/frontend"], item.root)).code).not.toBe(0);
+    expect(await Bun.file(latestPath).exists()).toBe(false);
+  });
+
   test("refuses detached, stopped, non-persistent, and empty worker branches", async () => {
     const detached = await fixture();
     await must(["git", "checkout", "--detach"], detached.worker);

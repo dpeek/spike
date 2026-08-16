@@ -3,9 +3,19 @@ import { closeSync, existsSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
+import {
+  assertDurableLaunchEvidence,
+  buildPersistentLaunchScript,
+  canonicalBaseEnvironment,
+  createLaunchEvidenceToken,
+  launchEvidencePath,
+  readLaunchEvidence,
+  shellQuote,
+  waitForLaunchEvidence,
+} from "./durable-launch.ts";
 import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor, type TicketHistoryEntry } from "./workflow.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
 import {
@@ -134,10 +144,6 @@ async function inherit(command: string[], cwd?: string): Promise<number> {
 
 async function available(command: string): Promise<boolean> {
   return (await capture(["sh", "-c", `command -v "$1" >/dev/null 2>&1`, "sh", command])).code === 0;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 async function herdrJson(args: string[]): Promise<any> {
@@ -334,55 +340,87 @@ function parseDispatchOptions(args: string[]): { workerName: string; model?: str
   return { workerName, model, thinking };
 }
 
+async function cleanupFailedPersistentLaunch(request: DispatchLaunchRequest, message: string): Promise<never> {
+  try {
+    const context = await loadContext();
+    const partial = await readState(context.stateDir, request.workerSlug);
+    if (partial && !partial.finishedAt && partial.runId === request.runId) {
+      await requestAgentStop({
+        cwd: context.root,
+        name: partial.slug,
+        requester: "ticket-dispatch",
+        reason: "launch-failed",
+        stopRuntime: async (state) => {
+          const stopped = await capture([runtimeCommand(state.runtime), "stop", state.container]);
+          if (stopped.code !== 0) throw new Error(stopped.stderr || stopped.stdout || `runtime stop exited ${stopped.code}`);
+        },
+      });
+      await removeAlias(partial.alias);
+    }
+  } catch (cleanupError) {
+    message = `${message}; launch cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+  }
+  throw new Error(message);
+}
+
 async function launchPersistentTicket(request: DispatchLaunchRequest): Promise<Pick<AgentState, "runtime" | "container" | "herdrName" | "herdrWorkspaceId" | "herdrTabId" | "herdrPaneId">> {
+  const launchToken = createLaunchEvidenceToken();
+  const baseEnvironment = canonicalBaseEnvironment({ SPIKE_BASE_REVISION: request.baseRevision, AGENT_BASE_REF: request.baseRevision });
   const command = [process.execPath, process.argv[1], "agent", "persistent", request.workerSlug, "--task", request.task];
   if (request.model) command.push("--model", request.model);
   if (request.thinking) command.push("--thinking", request.thinking);
+  const context = await loadContext();
+  const evidencePath = launchEvidencePath(context.stateDir, launchToken);
   const result = await capture(command, process.cwd(), {
     ...process.env,
     SPIKE_GOAL_ID: request.goalId,
     SPIKE_TICKET_ID: request.ticketId,
     SPIKE_RUN_ID: request.runId,
-    SPIKE_BASE_REVISION: request.baseRevision,
-    AGENT_BASE_REF: request.baseRevision,
+    SPIKE_LAUNCH_EVIDENCE_TOKEN: launchToken,
+    ...baseEnvironment,
     ...(process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
   });
   if (result.code !== 0) {
     let message = result.stderr || result.stdout || `persistent launcher exited ${result.code}`;
     try {
-      const context = await loadContext();
-      const partial = await readState(context.stateDir, request.workerSlug);
-      if (partial && !partial.finishedAt && partial.runId === request.runId) {
-        await requestAgentStop({
-          cwd: context.root,
-          name: partial.slug,
-          requester: "ticket-dispatch",
-          reason: "launch-failed",
-          stopRuntime: async (state) => {
-            const stopped = await capture([runtimeCommand(state.runtime), "stop", state.container]);
-            if (stopped.code !== 0) throw new Error(stopped.stderr || stopped.stdout || `runtime stop exited ${stopped.code}`);
-          },
-        });
-        await removeAlias(partial.alias);
+      const evidence = await readLaunchEvidence(evidencePath, launchToken);
+      if (evidence.status === "launch_failed" && evidence.error) {
+        message = `${message}; exact-base evidence: ${evidence.error} (${relative(context.root, evidencePath)})`;
       }
-    } catch (cleanupError) {
-      message = `${message}; launch cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+    } catch {
+      // Keep the launcher output when no evidence was produced.
     }
-    throw new Error(message);
+    return await cleanupFailedPersistentLaunch(request, message);
   }
-  const context = await loadContext();
-  const state = await readState(context.stateDir, request.workerSlug);
-  if (!state || state.runId !== request.runId || state.goalId !== request.goalId || state.ticketId !== request.ticketId) {
-    throw new Error("persistent launcher did not persist matching agent/run state");
+  try {
+    const state = await readState(context.stateDir, request.workerSlug);
+    if (!state || state.runId !== request.runId || state.goalId !== request.goalId || state.ticketId !== request.ticketId || state.baseRevision !== request.baseRevision) {
+      throw new Error("persistent launcher did not persist matching agent/run/base state");
+    }
+    const evidence = await waitForLaunchEvidence(evidencePath, launchToken);
+    assertDurableLaunchEvidence(evidence, {
+      token: launchToken,
+      workerSlug: request.workerSlug,
+      runId: request.runId,
+      goalId: request.goalId,
+      ticketId: request.ticketId,
+      baseRevision: request.baseRevision,
+      container: state.container,
+      startedAt: state.startedAt,
+      pid: state.pid,
+    });
+    return {
+      runtime: state.runtime,
+      container: state.container,
+      ...(state.herdrName ? { herdrName: state.herdrName } : {}),
+      ...(state.herdrWorkspaceId ? { herdrWorkspaceId: state.herdrWorkspaceId } : {}),
+      ...(state.herdrTabId ? { herdrTabId: state.herdrTabId } : {}),
+      ...(state.herdrPaneId ? { herdrPaneId: state.herdrPaneId } : {}),
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return await cleanupFailedPersistentLaunch(request, `${detail} (${relative(context.root, evidencePath)})`);
   }
-  return {
-    runtime: state.runtime,
-    container: state.container,
-    ...(state.herdrName ? { herdrName: state.herdrName } : {}),
-    ...(state.herdrWorkspaceId ? { herdrWorkspaceId: state.herdrWorkspaceId } : {}),
-    ...(state.herdrTabId ? { herdrTabId: state.herdrTabId } : {}),
-    ...(state.herdrPaneId ? { herdrPaneId: state.herdrPaneId } : {}),
-  };
 }
 
 async function ticketCommand(action: string | undefined, args: string[]) {
@@ -901,6 +939,13 @@ async function runAgent(name: string | undefined, args: string[]) {
   const cli = runtimeCommand(runtime);
   const run = [cli, "run"];
   if (runtime === "apple") run.push("--user", "root");
+  const startedAt = new Date().toISOString();
+  const baseEnvironment = (() => {
+    try { return canonicalBaseEnvironment({ SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION, AGENT_BASE_REF: process.env.AGENT_BASE_REF }); }
+    catch (error) { fail(error instanceof Error ? error.message : String(error)); }
+  })();
+  const launchEvidenceToken = process.env.SPIKE_LAUNCH_EVIDENCE_TOKEN?.trim();
+  if (launchEvidenceToken) await mkdir(join(output, "launch"), { recursive: true });
   const hostPiState = process.env.SPIKE_HOST_PI_STATE ?? join(process.env.HOME ?? "", ".pi", "agent");
   run.push(
     "--rm", "--name", container, "--network", network,
@@ -930,7 +975,15 @@ async function runAgent(name: string | undefined, args: string[]) {
   run.push(
     "--env", `AGENT_NAME=${agent}`,
     "--env", `AGENT_BRANCH=${process.env.AGENT_BRANCH ?? `agent/${agent}`}`,
-    "--env", `AGENT_BASE_REF=${process.env.AGENT_BASE_REF ?? "HEAD"}`,
+    "--env", `AGENT_BASE_REF=${baseEnvironment.AGENT_BASE_REF}`,
+    ...(baseEnvironment.SPIKE_BASE_REVISION ? ["--env", `SPIKE_BASE_REVISION=${baseEnvironment.SPIKE_BASE_REVISION}`] : []),
+    ...(launchEvidenceToken ? [
+      "--env", `SPIKE_LAUNCH_EVIDENCE_TOKEN=${launchEvidenceToken}`,
+      "--env", `SPIKE_LAUNCH_EVIDENCE_PATH=/output/launch/${launchEvidenceToken}.json`,
+      "--env", `SPIKE_AGENT_CONTAINER=${container}`,
+      "--env", `SPIKE_AGENT_STARTED_AT=${startedAt}`,
+      "--env", `SPIKE_AGENT_PID=${process.pid}`,
+    ] : []),
     "--env", `INTERNAL_URL=http://127.0.0.1:${containerPort}`,
   );
   if (operatorUrl) run.push("--env", `OPERATOR_URL=${operatorUrl}`);
@@ -961,9 +1014,9 @@ async function runAgent(name: string | undefined, args: string[]) {
     ...(process.env.SPIKE_GOAL_ID ? { goalId: process.env.SPIKE_GOAL_ID } : {}),
     ...(process.env.SPIKE_TICKET_ID ? { ticketId: process.env.SPIKE_TICKET_ID } : {}),
     ...(process.env.SPIKE_RUN_ID ? { runId: process.env.SPIKE_RUN_ID } : {}),
-    ...(process.env.SPIKE_BASE_REVISION ? { baseRevision: process.env.SPIKE_BASE_REVISION } : {}),
+    ...(baseEnvironment.SPIKE_BASE_REVISION ? { baseRevision: baseEnvironment.SPIKE_BASE_REVISION } : {}),
     lifecycle: "running",
-    startedAt: new Date().toISOString(), pid: process.pid,
+    startedAt, pid: process.pid,
   };
   await writeState(context.stateDir, state);
   console.log(`Starting ${agent} with ${runtime}`);
@@ -1041,6 +1094,10 @@ async function persistentAgent(name: string | undefined, args: string[]) {
 
   const herdrName = herdrAgentName(`${context.project}-${agent}`);
   const placement = await createHerdrPane(context.root, context.project, agent);
+  const baseEnvironment = (() => {
+    try { return canonicalBaseEnvironment({ SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION, AGENT_BASE_REF: process.env.AGENT_BASE_REF }); }
+    catch (error) { fail(error instanceof Error ? error.message : String(error)); }
+  })();
   const piArgs: string[] = [];
   if (model) piArgs.push("--model", model);
   if (thinking) piArgs.push("--thinking", thinking);
@@ -1053,13 +1110,13 @@ async function persistentAgent(name: string | undefined, args: string[]) {
     SPIKE_HERDR_WORKSPACE_ID: placement.workspaceId,
     SPIKE_HERDR_TAB_ID: placement.tabId,
     SPIKE_HERDR_PANE_ID: placement.paneId,
+    ...baseEnvironment,
     ...(owner ? { SPIKE_OWNER: owner } : process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
     ...(process.env.SPIKE_GOAL_ID ? { SPIKE_GOAL_ID: process.env.SPIKE_GOAL_ID } : {}),
     ...(process.env.SPIKE_TICKET_ID ? { SPIKE_TICKET_ID: process.env.SPIKE_TICKET_ID } : {}),
     ...(process.env.SPIKE_RUN_ID ? { SPIKE_RUN_ID: process.env.SPIKE_RUN_ID } : {}),
-    ...(process.env.SPIKE_BASE_REVISION ? { SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION } : {}),
+    ...(process.env.SPIKE_LAUNCH_EVIDENCE_TOKEN ? { SPIKE_LAUNCH_EVIDENCE_TOKEN: process.env.SPIKE_LAUNCH_EVIDENCE_TOKEN } : {}),
   };
-  const assignments = Object.entries(environment).map(([key, value]) => `${key}=${shellQuote(value)}`);
   // Herdr transports pane commands through a bounded command field. Durable
   // ticket IDs plus the worker-visible path can push an inline invocation over
   // that boundary and silently truncate the final prompt. Keep the pane command
@@ -1068,8 +1125,12 @@ async function persistentAgent(name: string | undefined, args: string[]) {
   await mkdir(launchDirectory, { recursive: true });
   const launchIdentity = process.env.SPIKE_RUN_ID ?? crypto.randomUUID();
   const launchPath = join(launchDirectory, `${launchIdentity}.sh`);
-  const invocation = ["exec", "env", ...assignments, shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))), "agent", "run", shellQuote(agent), ...piArgs.map(shellQuote)].join(" ");
-  const script = `#!/bin/sh\n${invocation}\n`;
+  const script = buildPersistentLaunchScript({
+    environment,
+    spikePath: fileURLToPath(new URL("../bin/spike", import.meta.url)),
+    agent,
+    piArgs,
+  });
   try { await writeFile(launchPath, script, { flag: "wx", mode: 0o700 }); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readFile(launchPath, "utf8") !== script) throw error;

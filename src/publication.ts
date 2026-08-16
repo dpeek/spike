@@ -13,6 +13,10 @@ export type PublicationAgentState = {
   container: string;
   backend?: "headless" | "herdr";
   finishedAt?: string;
+  goalId?: string;
+  ticketId?: string;
+  runId?: string;
+  baseRevision?: string;
 };
 
 export type CommandResult = { code: number; stdout: string; stderr: string };
@@ -256,6 +260,9 @@ export async function publishBranch(
   const status = await workerGit(run, state, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], "could not inspect the worker tree");
   if (status.length) throw new Error(`agent ${agent} has uncommitted or untracked changes; commit or discard them and rerun publish`);
   const base = await deriveBase(run, state, branch, head);
+  if (state.baseRevision && base !== state.baseRevision) {
+    throw new Error(`agent ${agent} publication base ${base} does not match its correlated durable base ${state.baseRevision}`);
+  }
   if (base === head) throw new Error(`agent ${agent} has no commits beyond its base ${base}; commit the intended changes before publishing`);
 
   const importedRef = `refs/spike/agents/${agent}`;
