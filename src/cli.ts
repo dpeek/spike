@@ -7,6 +7,18 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
+import {
+  agentStatePath,
+  dispatchTicket as dispatchReadyTicket,
+  loadActiveRun,
+  readAgentState,
+  recordAgentExit,
+  requestAgentStop,
+  writeAgentState,
+  type AgentState,
+  type DispatchLaunchRequest,
+  type RunRecord,
+} from "./runs.ts";
 
 const VERSION = "0.3.1";
 const setupRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -21,33 +33,6 @@ type Config = {
   memory?: string;
   shmSize?: string;
   pids?: number;
-};
-
-type AgentState = {
-  name: string;
-  slug: string;
-  project: string;
-  runtime: Runtime;
-  container: string;
-  workspaceVolume: string;
-  network: string;
-  alias?: string;
-  hostPort?: number;
-  containerPort: number;
-  operatorUrl?: string;
-  task?: string;
-  owner?: string;
-  log?: string;
-  errorLog?: string;
-  backend?: "headless" | "herdr";
-  herdrName?: string;
-  herdrWorkspaceId?: string;
-  herdrTabId?: string;
-  herdrPaneId?: string;
-  startedAt: string;
-  finishedAt?: string;
-  exitCode?: number;
-  pid: number;
 };
 
 const help = `spike ${VERSION} — isolated Pi agents
@@ -65,6 +50,8 @@ Usage:
   spike ticket issue <ticket-file>
   spike ticket status [--json]
   spike ticket show
+  spike ticket dispatch <worker-name> [--model <model>] [--thinking <level>]
+  spike run status [--json]
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -114,9 +101,9 @@ function slug(value: string): string {
   return result;
 }
 
-async function capture(command: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
+async function capture(command: string[], cwd?: string, env?: Record<string, string | undefined>): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const child = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn(command, { cwd, env, stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
@@ -287,6 +274,82 @@ function printTicketStatus(record: TicketRecord) {
   console.log(`Worker-visible path: ${record.workerPath}`);
 }
 
+function parseDispatchOptions(args: string[]): { workerName: string; model?: string; thinking?: string } {
+  let workerName: string | undefined;
+  let model: string | undefined;
+  let thinking: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index];
+    if (argument === "--model" || argument === "--thinking") {
+      if (index + 1 >= args.length || args[index + 1].startsWith("-")) fail(`ticket dispatch requires ${argument} <value>`, 2);
+      const value = args[++index];
+      if (argument === "--model") {
+        if (model !== undefined) fail("ticket dispatch accepts --model only once", 2);
+        model = value;
+      } else {
+        if (thinking !== undefined) fail("ticket dispatch accepts --thinking only once", 2);
+        thinking = value;
+      }
+    } else if (argument.startsWith("-")) {
+      fail(`unknown ticket dispatch option: ${argument}`, 2);
+    } else if (workerName === undefined) workerName = argument;
+    else fail("ticket dispatch accepts exactly one worker name", 2);
+  }
+  if (!workerName) fail("ticket dispatch requires a worker name", 2);
+  return { workerName, model, thinking };
+}
+
+async function launchPersistentTicket(request: DispatchLaunchRequest): Promise<Pick<AgentState, "runtime" | "container" | "herdrName" | "herdrWorkspaceId" | "herdrTabId" | "herdrPaneId">> {
+  const command = [process.execPath, process.argv[1], "agent", "persistent", request.workerSlug, "--task", request.task];
+  if (request.model) command.push("--model", request.model);
+  if (request.thinking) command.push("--thinking", request.thinking);
+  const result = await capture(command, process.cwd(), {
+    ...process.env,
+    SPIKE_GOAL_ID: request.goalId,
+    SPIKE_TICKET_ID: request.ticketId,
+    SPIKE_RUN_ID: request.runId,
+    SPIKE_BASE_REVISION: request.baseRevision,
+    AGENT_BASE_REF: request.baseRevision,
+    ...(process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
+  });
+  if (result.code !== 0) {
+    let message = result.stderr || result.stdout || `persistent launcher exited ${result.code}`;
+    try {
+      const context = await loadContext();
+      const partial = await readState(context.stateDir, request.workerSlug);
+      if (partial && !partial.finishedAt && partial.runId === request.runId) {
+        await requestAgentStop({
+          cwd: context.root,
+          name: partial.slug,
+          requester: "ticket-dispatch",
+          reason: "launch-failed",
+          stopRuntime: async (state) => {
+            const stopped = await capture([runtimeCommand(state.runtime), "stop", state.container]);
+            if (stopped.code !== 0) throw new Error(stopped.stderr || stopped.stdout || `runtime stop exited ${stopped.code}`);
+          },
+        });
+        await removeAlias(partial.alias);
+      }
+    } catch (cleanupError) {
+      message = `${message}; launch cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+    }
+    throw new Error(message);
+  }
+  const context = await loadContext();
+  const state = await readState(context.stateDir, request.workerSlug);
+  if (!state || state.runId !== request.runId || state.goalId !== request.goalId || state.ticketId !== request.ticketId) {
+    throw new Error("persistent launcher did not persist matching agent/run state");
+  }
+  return {
+    runtime: state.runtime,
+    container: state.container,
+    ...(state.herdrName ? { herdrName: state.herdrName } : {}),
+    ...(state.herdrWorkspaceId ? { herdrWorkspaceId: state.herdrWorkspaceId } : {}),
+    ...(state.herdrTabId ? { herdrTabId: state.herdrTabId } : {}),
+    ...(state.herdrPaneId ? { herdrPaneId: state.herdrPaneId } : {}),
+  };
+}
+
 async function ticketCommand(action: string | undefined, args: string[]) {
   try {
     if (action === "issue") {
@@ -311,7 +374,52 @@ async function ticketCommand(action: string | undefined, args: string[]) {
       process.stdout.write(ready.snapshot);
       return;
     }
-    fail("expected ticket issue, status, or show", 2);
+    if (action === "dispatch") {
+      const options = parseDispatchOptions(args);
+      const record = await dispatchReadyTicket({ ...options, launcher: launchPersistentTicket });
+      console.log(JSON.stringify(record, null, 2));
+      return;
+    }
+    fail("expected ticket issue, status, show, or dispatch", 2);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function printRunStatus(record: RunRecord) {
+  console.log(`Run ID: ${record.runId}`);
+  console.log(`Goal ID: ${record.goalId}`);
+  console.log(`Ticket ID: ${record.ticketId}`);
+  console.log(`Worker: ${record.worker.slug}`);
+  console.log(`Base revision: ${record.baseRevision}`);
+  console.log(`Status: ${record.status}`);
+  console.log(`Created at: ${record.createdAt}`);
+  if (record.launchedAt) console.log(`Launched at: ${record.launchedAt}`);
+  if (record.finishedAt) console.log(`Finished at: ${record.finishedAt}`);
+  if (record.runtime) console.log(`Runtime: ${record.runtime}`);
+  if (record.container) console.log(`Container: ${record.container}`);
+  if (record.herdrName) console.log(`Herdr agent: ${record.herdrName}`);
+  if (record.herdrWorkspaceId) console.log(`Herdr workspace: ${record.herdrWorkspaceId}`);
+  if (record.herdrTabId) console.log(`Herdr tab: ${record.herdrTabId}`);
+  if (record.herdrPaneId) console.log(`Herdr pane: ${record.herdrPaneId}`);
+  if (record.stopRequestedAt) console.log(`Stop requested at: ${record.stopRequestedAt}`);
+  if (record.stopRequester) console.log(`Stop requester: ${record.stopRequester}`);
+  if (record.stopReason) console.log(`Stop reason: ${record.stopReason}`);
+  if (record.terminationKind) console.log(`Termination: ${record.terminationKind}`);
+  if (record.outcome) console.log(`Outcome: ${record.outcome}`);
+  if (record.exitCode !== undefined) console.log(`Exit code: ${record.exitCode}`);
+  if (record.signal) console.log(`Signal: ${record.signal}`);
+  if (record.expectedSignal) console.log(`Expected signal: ${record.expectedSignal}`);
+  if (record.launchError) console.log(`Launch error: ${record.launchError}`);
+}
+
+async function runCommand(action: string | undefined, args: string[]) {
+  try {
+    if (action !== "status") fail("expected run status", 2);
+    if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
+    const record = await loadActiveRun();
+    if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
+    else printRunStatus(record);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
@@ -386,24 +494,9 @@ async function freePort(): Promise<number> {
   });
 }
 
-function statePath(stateDir: string, name: string): string {
-  return join(stateDir, "agents", `${slug(name)}.json`);
-}
-
-async function readState(stateDir: string, name: string): Promise<AgentState | undefined> {
-  try {
-    return JSON.parse(await readFile(statePath(stateDir, name), "utf8")) as AgentState;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function writeState(stateDir: string, state: AgentState) {
-  const path = statePath(stateDir, state.slug);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
-}
+const statePath = agentStatePath;
+const readState = readAgentState;
+const writeState = writeAgentState;
 
 async function removeAlias(alias?: string) {
   if (alias && await available("portless")) await capture(["portless", "alias", "--remove", alias]);
@@ -505,8 +598,9 @@ async function supervisor(args: string[]) {
   const systemPrompt = [
     "You are the Spike supervisor for this repository.",
     "Before drafting or activating a goal, inspect durable state with spike goal status --json; never replace an existing active goal.",
-    "Before drafting a ticket, inspect spike ticket status --json and spike ticket show; a ready ticket is durable, and a supervisor restart is never a reason to redispatch it.",
-    "Issuing a ticket preserves planner state but does not dispatch a worker.",
+    "Before dispatching a durable ticket, inspect both spike ticket status --json and spike run status --json; durable ready tickets and runs survive restarts, and a supervisor restart or missing live runtime is never a reason to redispatch.",
+    "Before drafting a ticket, inspect spike ticket status --json and spike ticket show.",
+    "Issuing a ticket preserves planner state but does not dispatch a worker; dispatch it exactly once with the run-aware spike_agents dispatch_ticket action.",
     "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",
     "Delegate independent implementation, investigation, testing, and review tasks to isolated workers with spike_agents.",
     "Give each worker a focused task and a unique stable name. Workers have persistent clones and should commit completed work.",
@@ -663,6 +757,7 @@ async function runAgent(name: string | undefined, args: string[]) {
   run.push(imageFor(context.config), ...command);
 
   const state: AgentState = {
+    schemaVersion: 1,
     name, slug: agent, project: context.project, runtime, container, workspaceVolume, network,
     ...(alias ? { alias } : {}), ...(hostPort ? { hostPort } : {}), containerPort,
     ...(operatorUrl ? { operatorUrl } : {}),
@@ -675,6 +770,11 @@ async function runAgent(name: string | undefined, args: string[]) {
     ...(process.env.SPIKE_HERDR_WORKSPACE_ID ? { herdrWorkspaceId: process.env.SPIKE_HERDR_WORKSPACE_ID } : {}),
     ...(process.env.SPIKE_HERDR_TAB_ID ? { herdrTabId: process.env.SPIKE_HERDR_TAB_ID } : {}),
     ...(process.env.SPIKE_HERDR_PANE_ID ? { herdrPaneId: process.env.SPIKE_HERDR_PANE_ID } : {}),
+    ...(process.env.SPIKE_GOAL_ID ? { goalId: process.env.SPIKE_GOAL_ID } : {}),
+    ...(process.env.SPIKE_TICKET_ID ? { ticketId: process.env.SPIKE_TICKET_ID } : {}),
+    ...(process.env.SPIKE_RUN_ID ? { runId: process.env.SPIKE_RUN_ID } : {}),
+    ...(process.env.SPIKE_BASE_REVISION ? { baseRevision: process.env.SPIKE_BASE_REVISION } : {}),
+    lifecycle: "running",
     startedAt: new Date().toISOString(), pid: process.pid,
   };
   await writeState(context.stateDir, state);
@@ -687,7 +787,7 @@ async function runAgent(name: string | undefined, args: string[]) {
     exitCode = await inherit(run);
   } finally {
     await removeAlias(alias);
-    await writeState(context.stateDir, { ...state, finishedAt: new Date().toISOString(), exitCode });
+    await recordAgentExit({ cwd: context.root, state, exitCode });
   }
   if (exitCode !== 0) process.exit(exitCode);
 }
@@ -765,7 +865,11 @@ async function persistentAgent(name: string | undefined, args: string[]) {
     SPIKE_HERDR_WORKSPACE_ID: placement.workspaceId,
     SPIKE_HERDR_TAB_ID: placement.tabId,
     SPIKE_HERDR_PANE_ID: placement.paneId,
-    ...(owner ? { SPIKE_OWNER: owner } : {}),
+    ...(owner ? { SPIKE_OWNER: owner } : process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
+    ...(process.env.SPIKE_GOAL_ID ? { SPIKE_GOAL_ID: process.env.SPIKE_GOAL_ID } : {}),
+    ...(process.env.SPIKE_TICKET_ID ? { SPIKE_TICKET_ID: process.env.SPIKE_TICKET_ID } : {}),
+    ...(process.env.SPIKE_RUN_ID ? { SPIKE_RUN_ID: process.env.SPIKE_RUN_ID } : {}),
+    ...(process.env.SPIKE_BASE_REVISION ? { SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION } : {}),
   };
   const assignments = Object.entries(environment).map(([key, value]) => `${key}=${shellQuote(value)}`);
   const command = ["env", ...assignments, shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))), "agent", "run", shellQuote(agent), ...piArgs.map(shellQuote)].join(" ");
@@ -820,7 +924,8 @@ async function listAgents() {
   const glob = new Bun.Glob("*.json");
   const states: AgentState[] = [];
   for await (const file of glob.scan({ cwd: directory })) {
-    try { states.push(JSON.parse(await readFile(join(directory, file), "utf8")) as AgentState); } catch { /* ignore corrupt state */ }
+    const state = await readState(stateDir, file.replace(/\.json$/, ""));
+    if (state) states.push(state);
   }
   if (!states.length) return console.log("No agents have been started.");
   let herdrAgents: any[] = [];
@@ -833,20 +938,29 @@ async function listAgents() {
   console.log("AGENT\tSTATUS\tBACKEND\tRUNTIME\tURL");
   for (const state of states.sort((a, b) => a.slug.localeCompare(b.slug))) {
     const herdrAgent = herdrAgents.find((candidate) => candidate.name === state.herdrName || candidate.pane_id === state.herdrPaneId);
-    const status = state.finishedAt ? `exited (${state.exitCode})` : herdrAgent?.agent_status ?? "running";
+    const status = state.finishedAt ? state.lifecycle : state.lifecycle === "stopping" ? "stopping" : herdrAgent?.agent_status ?? "running";
     console.log(`${state.slug}\t${status}\t${state.backend ?? "headless"}\t${state.runtime}\t${state.operatorUrl ?? "-"}`);
   }
 }
 
 async function stopAgent(name: string | undefined) {
   if (!name) fail("agent stop requires a name", 2);
-  const { stateDir } = await loadContext();
-  const state = await readState(stateDir, name);
-  if (!state) fail(`unknown agent: ${name}`);
-  const result = await capture([runtimeCommand(state.runtime), "stop", state.container]);
-  if (result.code !== 0 && !state.finishedAt) fail(`could not stop ${state.slug}: ${result.stderr}`);
-  await removeAlias(state.alias);
-  console.log(`Stopped ${state.slug}`);
+  try {
+    let stopped: AgentState | undefined;
+    stopped = await requestAgentStop({
+      name,
+      requester: process.env.SPIKE_STOP_REQUESTER ?? "cli",
+      reason: "operator-requested",
+      stopRuntime: async (state) => {
+        const result = await capture([runtimeCommand(state.runtime), "stop", state.container]);
+        if (result.code !== 0) throw new Error(`could not stop ${state.slug}: ${result.stderr || result.stdout}`);
+      },
+    });
+    await removeAlias(stopped.alias);
+    console.log(`Stop requested for ${stopped.slug}`);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function removeAgent(name: string | undefined, force: boolean) {
@@ -948,8 +1062,20 @@ async function down() {
   if (!existsSync(directory)) return;
   const glob = new Bun.Glob("*.json");
   for await (const file of glob.scan({ cwd: directory })) {
-    const state = JSON.parse(await readFile(join(directory, file), "utf8")) as AgentState;
-    if (!state.finishedAt) await capture([runtimeCommand(state.runtime), "stop", state.container]);
+    const name = file.replace(/\.json$/, "");
+    const state = await readState(stateDir, name);
+    if (!state) continue;
+    if (!state.finishedAt && state.lifecycle !== "stopping") {
+      await requestAgentStop({
+        name: state.slug,
+        requester: "cli:down",
+        reason: "operator-requested",
+        stopRuntime: async (stopping) => {
+          const result = await capture([runtimeCommand(stopping.runtime), "stop", stopping.container]);
+          if (result.code !== 0) throw new Error(`could not stop ${stopping.slug}: ${result.stderr || result.stdout}`);
+        },
+      });
+    }
     await removeAlias(state.alias);
   }
   console.log("Stopped project agents. Portless remains available for other projects.");
@@ -967,6 +1093,7 @@ else if (command === "supervisor" || command === "start") await supervisor(args)
 else if (command === "herdr") await herdrCommand(args.shift());
 else if (command === "goal") await goalCommand(args.shift(), args);
 else if (command === "ticket") await ticketCommand(args.shift(), args);
+else if (command === "run") await runCommand(args.shift(), args);
 else if (command === "down") await down();
 else if (command === "agent") {
   const action = args.shift();

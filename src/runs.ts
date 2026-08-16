@@ -1,0 +1,496 @@
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
+
+export const RUN_SCHEMA_VERSION = 1;
+export const ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1;
+export const AGENT_SCHEMA_VERSION = 1;
+const MAX_RECORD_BYTES = 128 * 1024;
+const runIdPattern = /^run-[0-9a-f]{32}$/;
+const goalIdPattern = /^goal-[0-9a-f]{32}$/;
+const ticketIdPattern = /^ticket-[0-9a-f]{32}$/;
+const objectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const workerPattern = /^[a-z0-9_.-]+$/;
+
+export type RunStatus = "dispatching" | "running" | "launch_failed" | "stopping" | "stopped" | "failed" | "completed";
+export type AgentLifecycle = "running" | "stopping" | "stopped" | "failed" | "completed";
+
+export type RunRecord = {
+  schemaVersion: 1;
+  runId: string;
+  goalId: string;
+  ticketId: string;
+  baseRevision: string;
+  worker: { name: string; slug: string };
+  backend: "herdr";
+  requestedModel?: string;
+  requestedThinking?: string;
+  status: RunStatus;
+  createdAt: string;
+  launchedAt?: string;
+  finishedAt?: string;
+  runtime?: "apple" | "docker";
+  container?: string;
+  herdrName?: string;
+  herdrWorkspaceId?: string;
+  herdrTabId?: string;
+  herdrPaneId?: string;
+  stopRequestedAt?: string;
+  stopRequester?: string;
+  stopReason?: string;
+  stopRunId?: string;
+  exitCode?: number;
+  signal?: string;
+  expectedSignal?: string;
+  terminationKind?: "requested" | "unexpected";
+  outcome?: "stopped" | "failed" | "completed";
+  launchError?: string;
+};
+
+export type ActiveRunPointer = {
+  schemaVersion: 1;
+  goalId: string;
+  ticketId: string;
+  runId: string;
+  recordPath: string;
+};
+
+export type AgentState = {
+  schemaVersion: 1;
+  name: string;
+  slug: string;
+  project: string;
+  runtime: "apple" | "docker";
+  container: string;
+  workspaceVolume: string;
+  network: string;
+  alias?: string;
+  hostPort?: number;
+  containerPort: number;
+  operatorUrl?: string;
+  task?: string;
+  owner?: string;
+  log?: string;
+  errorLog?: string;
+  backend: "headless" | "herdr";
+  herdrName?: string;
+  herdrWorkspaceId?: string;
+  herdrTabId?: string;
+  herdrPaneId?: string;
+  goalId?: string;
+  ticketId?: string;
+  runId?: string;
+  baseRevision?: string;
+  lifecycle: AgentLifecycle;
+  startedAt: string;
+  finishedAt?: string;
+  stopRequestedAt?: string;
+  stopRequester?: string;
+  stopReason?: string;
+  stopRunId?: string;
+  exitCode?: number;
+  signal?: string;
+  expectedSignal?: string;
+  terminationKind?: "requested" | "unexpected";
+  outcome?: "stopped" | "failed" | "completed";
+  pid: number;
+};
+
+export type DispatchLaunchRequest = {
+  runId: string;
+  goalId: string;
+  ticketId: string;
+  baseRevision: string;
+  workerName: string;
+  workerSlug: string;
+  task: string;
+  model?: string;
+  thinking?: string;
+};
+
+export type LaunchMetadata = Pick<AgentState,
+  "runtime" | "container" | "herdrName" | "herdrWorkspaceId" | "herdrTabId" | "herdrPaneId">;
+
+export type TicketLauncher = (request: DispatchLaunchRequest) => Promise<LaunchMetadata>;
+
+type RunContext = {
+  root: string;
+  stateDir: string;
+  goal: GoalRecord;
+  ticket: TicketRecord;
+  ticketDirectory: string;
+  runsDirectory: string;
+};
+
+function requireObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} is not a JSON object`);
+  return value as Record<string, unknown>;
+}
+
+function validTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !value) return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
+}
+
+function requireTimestamp(value: unknown, label: string): asserts value is string {
+  if (!validTimestamp(value)) throw new Error(`${label} has an invalid timestamp`);
+}
+
+function validOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || (typeof value === "string" && value.length > 0);
+}
+
+function within(root: string, path: string, label: string): string {
+  if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\0")) throw new Error(`${label} must be a project-relative path`);
+  const absolute = resolve(root, path);
+  if (!absolute.startsWith(`${resolve(root)}${sep}`)) throw new Error(`${label} escapes the project repository`);
+  if (relative(root, absolute).split(sep).join("/") !== path) throw new Error(`${label} is not normalized`);
+  return absolute;
+}
+
+async function rejectSymlinks(root: string, path: string, label: string): Promise<void> {
+  const rel = relative(root, path);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`${label} is outside the repository`);
+  let current = root;
+  for (const part of rel.split(sep).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) throw new Error(`${label} must not contain symbolic links: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
+async function smallJson(path: string, label: string): Promise<unknown> {
+  let bytes: Buffer;
+  try { bytes = await readFile(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`${label} is missing`);
+    throw new Error(`cannot read ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (bytes.byteLength > MAX_RECORD_BYTES) throw new Error(`${label} is unexpectedly large`);
+  try { return JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error(`${label} is invalid JSON`); }
+}
+
+async function durableWrite(path: string, contents: string): Promise<void> {
+  await writeFile(path, contents, { flag: "wx", mode: 0o600 });
+  const handle = await open(path, "r");
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function atomicWrite(path: string, contents: string): Promise<void> {
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    await durableWrite(temporary, contents);
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function cleanError(error: unknown): string {
+  const text = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
+  return (text || "unknown launch error").slice(0, 500);
+}
+
+function workerSlug(value: string): string {
+  const result = value.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!result || !/[a-z0-9]/.test(result)) throw new Error("worker name must contain a letter or number");
+  return result;
+}
+
+function validateCorrelation(record: Record<string, unknown>, label: string): void {
+  const values = [record.goalId, record.ticketId, record.runId, record.baseRevision];
+  const present = values.filter((value) => value !== undefined).length;
+  if (present !== 0 && present !== values.length) throw new Error(`${label} has incomplete run correlation`);
+  if (present) {
+    if (typeof record.goalId !== "string" || !goalIdPattern.test(record.goalId)) throw new Error(`${label} has an invalid goalId`);
+    if (typeof record.ticketId !== "string" || !ticketIdPattern.test(record.ticketId)) throw new Error(`${label} has an invalid ticketId`);
+    if (typeof record.runId !== "string" || !runIdPattern.test(record.runId)) throw new Error(`${label} has an invalid runId`);
+    if (typeof record.baseRevision !== "string" || !objectIdPattern.test(record.baseRevision)) throw new Error(`${label} has an invalid baseRevision`);
+  }
+}
+
+export function validateAgentState(value: unknown, expectedSlug?: string): AgentState {
+  const state = requireObject(value, "agent state");
+  if (state.schemaVersion !== AGENT_SCHEMA_VERSION) throw new Error(`unsupported agent state schema: ${String(state.schemaVersion)}`);
+  if (typeof state.slug !== "string" || !workerPattern.test(state.slug) || (expectedSlug && state.slug !== expectedSlug)) throw new Error("agent state has an invalid slug");
+  if (typeof state.name !== "string" || !state.name || typeof state.project !== "string" || !state.project) throw new Error("agent state has invalid identity");
+  if (state.runtime !== "apple" && state.runtime !== "docker") throw new Error("agent state has an invalid runtime");
+  for (const field of ["container", "workspaceVolume", "network"] as const) if (typeof state[field] !== "string" || !state[field]) throw new Error(`agent state has an invalid ${field}`);
+  if (!Number.isSafeInteger(state.containerPort) || (state.containerPort as number) < 1 || (state.containerPort as number) > 65535) throw new Error("agent state has an invalid containerPort");
+  if (state.backend !== "headless" && state.backend !== "herdr") throw new Error("agent state has an invalid backend");
+  if (!["running", "stopping", "stopped", "failed", "completed"].includes(String(state.lifecycle))) throw new Error("agent state has an invalid lifecycle");
+  requireTimestamp(state.startedAt, "agent state startedAt");
+  if (state.finishedAt !== undefined) requireTimestamp(state.finishedAt, "agent state finishedAt");
+  if (state.stopRequestedAt !== undefined) requireTimestamp(state.stopRequestedAt, "agent state stopRequestedAt");
+  if (!Number.isSafeInteger(state.pid) || (state.pid as number) < 1) throw new Error("agent state has an invalid pid");
+  if (state.exitCode !== undefined && !Number.isSafeInteger(state.exitCode)) throw new Error("agent state has an invalid exitCode");
+  validateCorrelation(state, "agent state");
+  if (state.runId && state.backend !== "herdr") throw new Error("correlated ticket agent must be Herdr-backed");
+  if (state.lifecycle === "running" && state.finishedAt !== undefined) throw new Error("running agent state must not be finished");
+  if (state.lifecycle === "stopping" && (!state.stopRequestedAt || (state.runId && state.stopRunId !== state.runId))) throw new Error("stopping agent state has invalid stop intent");
+  if (["stopped", "failed", "completed"].includes(String(state.lifecycle)) && (!state.finishedAt || state.exitCode === undefined || state.outcome !== state.lifecycle)) throw new Error("terminal agent state has incomplete termination data");
+  return state as AgentState;
+}
+
+export function validateActiveRunPointer(value: unknown, expected: { goalId: string; ticketId: string }): ActiveRunPointer {
+  const pointer = requireObject(value, "active run pointer");
+  if (pointer.schemaVersion !== ACTIVE_RUN_POINTER_SCHEMA_VERSION) throw new Error(`unsupported active run pointer schema: ${String(pointer.schemaVersion)}`);
+  if (pointer.goalId !== expected.goalId || pointer.ticketId !== expected.ticketId) throw new Error("active run pointer identity does not match the ready ticket");
+  if (typeof pointer.runId !== "string" || !runIdPattern.test(pointer.runId)) throw new Error("active run pointer has an invalid runId");
+  const expectedPath = `.pi-swarm/goals/${expected.goalId}/tickets/${expected.ticketId}/runs/${pointer.runId}/record.v1.json`;
+  if (pointer.recordPath !== expectedPath) throw new Error("active run pointer has an invalid recordPath");
+  return pointer as ActiveRunPointer;
+}
+
+export function validateRunRecord(value: unknown, expected: { goalId: string; ticketId: string; baseRevision: string; runId: string }): RunRecord {
+  const record = requireObject(value, "run record");
+  if (record.schemaVersion !== RUN_SCHEMA_VERSION) throw new Error(`unsupported run record schema: ${String(record.schemaVersion)}`);
+  if (record.runId !== expected.runId || typeof record.runId !== "string" || !runIdPattern.test(record.runId)) throw new Error("run record identity does not match the active pointer");
+  if (record.goalId !== expected.goalId || record.ticketId !== expected.ticketId || record.baseRevision !== expected.baseRevision) throw new Error("run record identity/base does not match the ready ticket");
+  if (record.backend !== "herdr") throw new Error("run record has an invalid backend");
+  const worker = requireObject(record.worker, "run worker identity");
+  if (typeof worker.name !== "string" || !worker.name || typeof worker.slug !== "string" || !workerPattern.test(worker.slug) || workerSlug(worker.name) !== worker.slug) throw new Error("run record has an invalid worker identity");
+  if (!["dispatching", "running", "launch_failed", "stopping", "stopped", "failed", "completed"].includes(String(record.status))) throw new Error("run record has an invalid status");
+  requireTimestamp(record.createdAt, "run record createdAt");
+  for (const field of ["launchedAt", "finishedAt", "stopRequestedAt"] as const) if (record[field] !== undefined) requireTimestamp(record[field], `run record ${field}`);
+  for (const field of ["requestedModel", "requestedThinking", "container", "herdrName", "herdrWorkspaceId", "herdrTabId", "herdrPaneId", "stopRequester", "stopReason", "signal", "expectedSignal", "launchError"] as const) {
+    if (!validOptionalString(record[field])) throw new Error(`run record has an invalid ${field}`);
+  }
+  if (record.runtime !== undefined && record.runtime !== "apple" && record.runtime !== "docker") throw new Error("run record has an invalid runtime");
+  if (record.stopRunId !== undefined && record.stopRunId !== record.runId) throw new Error("run record stop intent belongs to another run");
+  if (record.exitCode !== undefined && !Number.isSafeInteger(record.exitCode)) throw new Error("run record has an invalid exitCode");
+  if (record.terminationKind !== undefined && record.terminationKind !== "requested" && record.terminationKind !== "unexpected") throw new Error("run record has an invalid terminationKind");
+  if (record.outcome !== undefined && !["stopped", "failed", "completed"].includes(String(record.outcome))) throw new Error("run record has an invalid outcome");
+  if (record.status === "running" && (!record.launchedAt || !record.runtime || !record.container || record.finishedAt !== undefined)) throw new Error("running run record has incomplete launch data");
+  if (record.status === "launch_failed" && (!record.finishedAt || !record.launchError || record.outcome !== "failed")) throw new Error("launch-failed run record has incomplete failure data");
+  if (record.status === "stopping" && (!record.stopRequestedAt || record.stopRunId !== record.runId)) throw new Error("stopping run record has invalid stop intent");
+  if (["stopped", "failed", "completed"].includes(String(record.status)) && (!record.finishedAt || record.exitCode === undefined || record.outcome !== record.status || !record.terminationKind)) throw new Error("terminal run record has incomplete termination data");
+  return record as RunRecord;
+}
+
+async function context(cwd: string): Promise<RunContext> {
+  const [active, ready] = await Promise.all([loadActiveGoal(cwd), loadReadyTicket(cwd)]);
+  if (ready.record.goalId !== active.record.goalId || ready.record.baseRevision !== active.record.acceptedCodeRevision) throw new Error("ready ticket base does not match the active goal accepted code revision");
+  const root = await realpath(active.record.repositoryRoot);
+  const stateDir = join(root, ".pi-swarm");
+  const ticketDirectory = join(stateDir, "goals", active.record.goalId, "tickets", ready.record.ticketId);
+  return { root, stateDir, goal: active.record, ticket: ready.record, ticketDirectory, runsDirectory: join(ticketDirectory, "runs") };
+}
+
+async function loadRunFromContext(ctx: RunContext): Promise<RunRecord> {
+  const pointerPath = join(ctx.ticketDirectory, "active-run.json");
+  await rejectSymlinks(ctx.root, pointerPath, "active run pointer path");
+  try { await access(pointerPath, constants.F_OK); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("no run for the ready ticket; dispatch it with spike ticket dispatch <worker-name>");
+    throw error;
+  }
+  const pointer = validateActiveRunPointer(await smallJson(pointerPath, "active run pointer"), { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
+  const path = within(ctx.root, pointer.recordPath, "active run record path");
+  const expectedDirectory = join(ctx.runsDirectory, pointer.runId);
+  if (path !== join(expectedDirectory, "record.v1.json")) throw new Error("active run pointer resolves outside its run directory");
+  await rejectSymlinks(ctx.root, expectedDirectory, "active run directory");
+  await rejectSymlinks(ctx.root, path, "active run record path");
+  return validateRunRecord(await smallJson(path, "active run record"), {
+    goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, runId: pointer.runId,
+  });
+}
+
+export async function loadActiveRun(cwd = process.cwd()): Promise<RunRecord> {
+  return loadRunFromContext(await context(cwd));
+}
+
+async function writeRun(ctx: RunContext, record: RunRecord): Promise<void> {
+  validateRunRecord(record, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, runId: record.runId });
+  await atomicWrite(join(ctx.runsDirectory, record.runId, "record.v1.json"), `${JSON.stringify(record, null, 2)}\n`);
+}
+
+function iso(now?: Date): string {
+  const value = now ?? new Date();
+  if (!Number.isFinite(value.getTime())) throw new Error("lifecycle timestamp is invalid");
+  return value.toISOString();
+}
+
+export async function dispatchTicket(options: { cwd?: string; workerName: string; model?: string; thinking?: string; now?: Date; launcher: TicketLauncher }): Promise<RunRecord> {
+  const cwd = options.cwd ?? process.cwd();
+  const ctx = await context(cwd);
+  const slug = workerSlug(options.workerName);
+  if (!options.workerName.trim()) throw new Error("ticket dispatch requires a worker name");
+  if (options.model !== undefined && !options.model) throw new Error("model must not be empty");
+  if (options.thinking !== undefined && !options.thinking) throw new Error("thinking level must not be empty");
+  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
+  await mkdir(ctx.runsDirectory, { recursive: true, mode: 0o700 });
+  await rejectSymlinks(ctx.root, ctx.runsDirectory, "run state path");
+  const lockPath = join(ctx.ticketDirectory, "dispatch.lock");
+  let lock;
+  try { lock = await open(lockPath, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("another ticket dispatch is in progress");
+    throw error;
+  }
+  try {
+    try {
+      const existing = await loadRunFromContext(ctx);
+      throw new Error(`ticket already has run ${existing.runId} (${existing.status}); automatic redispatch is refused`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("no run for the ready ticket")) throw error;
+    }
+    const runId = `run-${randomUUID().replaceAll("-", "")}`;
+    const createdAt = iso(options.now);
+    let record: RunRecord = {
+      schemaVersion: RUN_SCHEMA_VERSION, runId, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId,
+      baseRevision: ctx.ticket.baseRevision, worker: { name: options.workerName, slug }, backend: "herdr",
+      ...(options.model ? { requestedModel: options.model } : {}), ...(options.thinking ? { requestedThinking: options.thinking } : {}),
+      status: "dispatching", createdAt,
+    };
+    const runDirectory = join(ctx.runsDirectory, runId);
+    await mkdir(runDirectory, { mode: 0o700 });
+    await durableWrite(join(runDirectory, "record.v1.json"), `${JSON.stringify(record, null, 2)}\n`);
+    const pointer: ActiveRunPointer = {
+      schemaVersion: ACTIVE_RUN_POINTER_SCHEMA_VERSION, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, runId,
+      recordPath: `.pi-swarm/goals/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/runs/${runId}/record.v1.json`,
+    };
+    validateActiveRunPointer(pointer, { goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId });
+    await atomicWrite(join(ctx.ticketDirectory, "active-run.json"), `${JSON.stringify(pointer, null, 2)}\n`);
+    const workerPath = `/output/workflow/${ctx.goal.goalId}/tickets/${ctx.ticket.ticketId}/ticket.md`;
+    const task = `Implement durable ticket ${ctx.ticket.ticketId} from ${workerPath}. Follow every requirement, test and commit the work, and report verification, blockers, and risks.`;
+    try {
+      const launch = await options.launcher({ runId, goalId: ctx.goal.goalId, ticketId: ctx.ticket.ticketId, baseRevision: ctx.ticket.baseRevision, workerName: options.workerName, workerSlug: slug, task, model: options.model, thinking: options.thinking });
+      const current = await loadRunFromContext(ctx);
+      record = {
+        ...current, ...launch,
+        ...(!current.launchedAt ? { launchedAt: iso() } : {}),
+        ...(current.status === "dispatching" ? { status: "running" as const } : {}),
+      };
+      await writeRun(ctx, record);
+      return record;
+    } catch (error) {
+      const current = await loadRunFromContext(ctx);
+      record = { ...current, status: "launch_failed", finishedAt: iso(), launchError: cleanError(error), outcome: "failed", terminationKind: "unexpected" };
+      await writeRun(ctx, record);
+      throw new Error(`ticket run ${runId} launch failed: ${record.launchError}`);
+    }
+  } finally {
+    await lock.close();
+    await rm(lockPath, { force: true });
+  }
+}
+
+export function agentStatePath(stateDir: string, name: string): string {
+  return join(stateDir, "agents", `${workerSlug(name)}.json`);
+}
+
+export async function readAgentState(stateDir: string, name: string): Promise<AgentState | undefined> {
+  const slug = workerSlug(name);
+  try { return validateAgentState(await smallJson(agentStatePath(stateDir, slug), "agent state"), slug); }
+  catch (error) {
+    if (error instanceof Error && error.message === "agent state is missing") return undefined;
+    throw error;
+  }
+}
+
+export async function writeAgentState(stateDir: string, state: AgentState): Promise<void> {
+  validateAgentState(state, state.slug);
+  const path = agentStatePath(stateDir, state.slug);
+  await mkdir(join(stateDir, "agents"), { recursive: true, mode: 0o700 });
+  await atomicWrite(path, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function withAgentLock<T>(stateDir: string, slug: string, operation: () => Promise<T>, wait = false): Promise<T> {
+  const lockPath = join(stateDir, "agents", `${slug}.lifecycle.lock`);
+  await mkdir(join(stateDir, "agents"), { recursive: true, mode: 0o700 });
+  let lock;
+  const deadline = Date.now() + 30_000;
+  while (!lock) {
+    try { lock = await open(lockPath, "wx", 0o600); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!wait || Date.now() >= deadline) throw new Error(`another lifecycle operation for agent ${slug} is in progress`);
+      await Bun.sleep(50);
+    }
+  }
+  try { return await operation(); }
+  finally { await lock.close(); await rm(lockPath, { force: true }); }
+}
+
+export async function requestAgentStop(options: {
+  cwd?: string; name: string; requester?: string; reason?: string; now?: Date;
+  stopRuntime: (state: AgentState) => Promise<void>;
+}): Promise<AgentState> {
+  const active = await loadActiveGoal(options.cwd ?? process.cwd()).catch(() => undefined);
+  const root = active ? active.record.repositoryRoot : await gitRoot(options.cwd ?? process.cwd());
+  const stateDir = join(root, ".pi-swarm");
+  const slug = workerSlug(options.name);
+  return withAgentLock(stateDir, slug, async () => {
+    const state = await readAgentState(stateDir, slug);
+    if (!state) throw new Error(`unknown agent: ${options.name}`);
+    if (state.finishedAt) throw new Error(`agent ${slug} is already ${state.lifecycle}`);
+    if (state.lifecycle === "stopping") throw new Error(`agent ${slug} is already stopping`);
+    const requestedAt = iso(options.now);
+    const reason = options.reason?.trim() || "operator-requested";
+    let run: RunRecord | undefined;
+    if (state.runId) {
+      run = await loadActiveRun(options.cwd ?? process.cwd());
+      if (run.runId !== state.runId || run.goalId !== state.goalId || run.ticketId !== state.ticketId || run.worker.slug !== state.slug) {
+        throw new Error("agent/run identity mismatch; refusing to stop without correlated durable intent");
+      }
+      run = { ...run, status: "stopping", stopRequestedAt: requestedAt, ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason, stopRunId: run.runId };
+      await writeRun(await context(options.cwd ?? process.cwd()), run);
+    }
+    const stopping: AgentState = {
+      ...state, lifecycle: "stopping", stopRequestedAt: requestedAt,
+      ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason,
+      ...(state.runId ? { stopRunId: state.runId } : {}),
+    };
+    await writeAgentState(stateDir, stopping);
+    await options.stopRuntime(stopping);
+    return stopping;
+  });
+}
+
+async function gitRoot(cwd: string): Promise<string> {
+  const child = Bun.spawn(["git", "-C", resolve(cwd), "rev-parse", "--show-toplevel"], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+  if (code !== 0) throw new Error(`${cwd} is not a Git repository`);
+  return realpath(stdout.trim());
+}
+
+export async function recordAgentExit(options: { cwd?: string; state: AgentState; exitCode: number; now?: Date }): Promise<AgentState> {
+  const root = await gitRoot(options.cwd ?? process.cwd());
+  const stateDir = join(root, ".pi-swarm");
+  return withAgentLock(stateDir, options.state.slug, async () => {
+    const current = await readAgentState(stateDir, options.state.slug) ?? options.state;
+    if (current.startedAt !== options.state.startedAt || current.runId !== options.state.runId) throw new Error("agent identity changed before exit was recorded");
+    let run: RunRecord | undefined;
+    if (current.runId) run = await loadActiveRun(options.cwd ?? process.cwd());
+    const matchingIntent = Boolean(current.stopRequestedAt && current.stopRunId === current.runId &&
+      (!run || (run.stopRequestedAt && run.stopRunId === current.runId && run.runId === current.runId)));
+    const outcome = matchingIntent ? "stopped" : options.exitCode === 0 ? "completed" : "failed";
+    const finishedAt = iso(options.now);
+    const signal = options.exitCode === 143 ? "SIGTERM" : undefined;
+    const terminationKind = matchingIntent ? "requested" : "unexpected";
+    const final: AgentState = {
+      ...current, lifecycle: outcome, outcome, finishedAt, exitCode: options.exitCode, terminationKind,
+      ...(signal ? { signal } : {}), ...(matchingIntent ? { expectedSignal: "SIGTERM" } : {}),
+    };
+    await writeAgentState(stateDir, final);
+    if (run) {
+      const launchFailed = run.status === "launch_failed";
+      const finalRun: RunRecord = {
+        ...run, status: launchFailed ? "launch_failed" : outcome, outcome: launchFailed ? "failed" : outcome,
+        finishedAt, exitCode: options.exitCode, terminationKind,
+        ...(signal ? { signal } : {}), ...(matchingIntent ? { expectedSignal: "SIGTERM" } : {}),
+      };
+      await writeRun(await context(options.cwd ?? process.cwd()), finalRun);
+    }
+    return final;
+  }, true);
+}

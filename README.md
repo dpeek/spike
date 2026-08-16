@@ -158,9 +158,51 @@ snapshots, and worker copies fail closed.
 Before drafting another ticket, supervisors must inspect
 `spike ticket status --json` and `spike ticket show`. A ready ticket survives a
 supervisor restart: never redispatch work merely because the supervisor process
-restarted. Runs, dispatch association, completion reports, ticket transitions,
-operator decisions, and accepted-revision updates remain future workflow
-slices.
+restarted.
+
+## Dispatch and recover the durable ticket run
+
+Dispatch the one ready ticket to one persistent Herdr worker without copying the
+ticket text into a command:
+
+```bash
+spike ticket status --json
+spike run status --json       # reports clearly when no run exists
+spike ticket dispatch ticket-004-worker \
+  --model openai-codex/gpt-5.4 --thinking high
+```
+
+Spike briefs Pi with the existing worker-visible
+`/output/workflow/<goal-id>/tickets/<ticket-id>/ticket.md` path. Before launch it
+creates a distinct run ID, schema-versioned run record, and atomic active-run
+pointer under the ticket directory. The correlated agent record carries the
+goal, ticket, run, worker, backend, and exact base identities. Requested model
+and thinking overrides are provenance, not part of the ticket snapshot.
+
+Recover the association from any later CLI process, even when Herdr or the
+container is unavailable:
+
+```bash
+spike run status
+spike run status --json
+```
+
+Status validates the active goal, ready ticket, pointer, record, identities,
+paths, schema, and snapshot provenance before reporting launch/runtime IDs,
+timestamps, stop intent, and observed process termination. Redispatch is
+refused once an active-run pointer exists, including after launch failure; this
+slice provides no retry flag. Inspect and resolve the durable state rather than
+retrying because a supervisor restarted or a runtime disappeared.
+
+The supervisor tool exposes `spike_agents` action `dispatch_ticket`. It requires
+checking both `spike ticket status --json` and `spike run status --json` first.
+The existing `dispatch` action remains available only for free-form work not
+represented by a durable ready ticket.
+
+Current workflow limitations remain intentional: Spike does not parse a
+structured completion report, accept/remediate/cancel/complete the ticket,
+advance the goal's accepted revision, remove the active-ticket pointer, retry a
+failed launch, or associate detached one-shot work with runs.
 
 ## Build and start services
 
@@ -346,10 +388,22 @@ spike agent remove frontend --force
 spike down
 ```
 
+`spike agent stop` first atomically records `stopping` intent on the agent and,
+for ticket workers, its matching run. The CLI reason defaults to
+`operator-requested`; only then does Spike ask the runtime to send its stop
+signal and remove the Portless alias. When the foreground runtime observes the
+exit, it preserves the raw code and signal. A matching same-run stop followed by
+SIGTERM/143 is semantically `stopped`, while 143 without matching intent (or
+with stale intent from another run) is `failed`. Exit code 143 is never treated
+as success by itself. `spike agent list`, run status, and asynchronous supervisor
+notifications use that semantic outcome; a live persistent Pi session may still
+show Herdr's `done` after completing a turn because it remains available.
+
 `remove --force` deletes that agent's persistent clone and network. It does not
-delete `.pi-swarm/shared-pi-state/`. `spike down` stops this project's active agents and
-removes their aliases, but deliberately leaves the global Portless proxy running
-for other projects.
+delete `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,
+snapshots, publications, bundles, and artifacts. `spike down` stops this
+project's active agents and removes their aliases, but deliberately leaves the
+global Portless proxy running for other projects.
 
 State and exported work live under `.pi-swarm/`.
 

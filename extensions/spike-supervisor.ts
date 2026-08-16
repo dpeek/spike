@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { agentOutcomeDescription } from "../src/lifecycle.ts";
 
 const spikeBin = fileURLToPath(new URL("../bin/spike", import.meta.url));
 const NOTIFIED_ENTRY = "spike-worker-notified";
@@ -19,6 +20,12 @@ type WorkerState = {
   backend?: "headless" | "herdr";
   herdrName?: string;
   herdrPaneId?: string;
+  goalId?: string;
+  ticketId?: string;
+  runId?: string;
+  lifecycle?: "running" | "stopping" | "stopped" | "failed" | "completed";
+  outcome?: "stopped" | "failed" | "completed";
+  terminationKind?: "requested" | "unexpected";
   startedAt: string;
   finishedAt?: string;
   exitCode?: number;
@@ -139,7 +146,7 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
         notified.add(key);
         pi.appendEntry(NOTIFIED_ENTRY, { key });
         const reply = await finalReply(state);
-        const outcome = state.exitCode === 0 ? "completed" : `failed with exit code ${state.exitCode ?? "unknown"}`;
+        const outcome = agentOutcomeDescription(state);
         pi.sendMessage({
           customType: "spike-worker-report",
           display: true,
@@ -184,12 +191,13 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spike_agents",
     label: "Spike Agents",
-    description: "Dispatch and manage isolated containerized Pi workers. Inside Herdr, dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Publish imports a verified committed worker branch into a host review ref without merging it. Reports arrive asynchronously.",
-    promptSnippet: "Dispatch, message, read, publish, list, stop, or open isolated container workers",
+    description: "Dispatch and manage isolated containerized Pi workers. dispatch_ticket launches the one durable ready ticket through its durable run record; dispatch remains free-form. Inside Herdr, free-form dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Publish imports a verified committed worker branch into a host review ref without merging it. Reports arrive asynchronously.",
+    promptSnippet: "Dispatch durable tickets or free-form work, message, read, publish, list, stop, or open isolated container workers",
     promptGuidelines: [
       "Inspect existing durable goal state with spike goal status --json before drafting or activating a new goal, and never silently replace an active goal.",
-      "Before drafting a ticket, inspect spike ticket status --json and spike ticket show. A ready ticket survives supervisor restarts; never redispatch merely because the supervisor restarted.",
-      "Ticket issuance records planner intent but does not dispatch a worker.",
+      "Before dispatch_ticket, inspect both spike ticket status --json and spike run status --json. A ready ticket and its run survive supervisor restarts; never redispatch merely because the supervisor restarted or a live runtime cannot be found.",
+      "Before drafting a ticket, inspect spike ticket status --json and spike ticket show.",
+      "Ticket issuance records planner intent but does not dispatch a worker; use dispatch_ticket exactly once for the durable ready ticket.",
       "Never treat conversational intent, chat history, or terminal output as goal approval; activation requires an explicit operator approval statement at the CLI boundary.",
       "Use spike_agents to delegate independent coding, investigation, testing, and review tasks that can run concurrently.",
       "Give every spike_agents dispatch a unique stable agent name and a focused, self-contained task.",
@@ -199,16 +207,24 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
       "Publication creates a stable review target. Inspect or summarize it, but do not merge it.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["dispatch", "send", "read", "publish", "list", "stop", "open"] as const),
-      name: Type.Optional(Type.String({ description: "Worker name for dispatch, send, read, publish, stop, or open" })),
+      action: StringEnum(["dispatch_ticket", "dispatch", "send", "read", "publish", "list", "stop", "open"] as const),
+      name: Type.Optional(Type.String({ description: "Worker name for dispatch_ticket, dispatch, send, read, publish, stop, or open" })),
       task: Type.Optional(Type.String({ description: "Focused task for dispatch or follow-up text for send" })),
       model: Type.Optional(Type.String({ description: "Optional provider/model override" })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const commandAction = params.action === "dispatch" && process.env.HERDR_ENV === "1" ? "persistent" : params.action;
-      const args = ["agent", commandAction];
-      if (params.action === "dispatch") {
+      const args = params.action === "dispatch_ticket" ? ["ticket", "dispatch"] : ["agent", commandAction];
+      if (params.action === "dispatch_ticket") {
+        if (!params.name) throw new Error("dispatch_ticket requires name");
+        if (params.task) throw new Error("dispatch_ticket reads the durable ticket and does not accept free-form task text");
+        args.push(params.name);
+        const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+        if (model) args.push("--model", model);
+        const thinking = params.thinking ?? ctx.thinkingLevel;
+        if (thinking) args.push("--thinking", thinking);
+      } else if (params.action === "dispatch") {
         if (!params.name || !params.task) throw new Error("dispatch requires name and task");
         args.push(params.name, "--task", params.task, "--owner", ctx.sessionManager.getSessionId());
         const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
@@ -228,9 +244,14 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
         args.push(params.name);
       }
 
-      const result = await pi.exec(spikeBin, args, { signal, timeout: params.action === "publish" ? 120_000 : 45_000 });
+      const executable = params.action === "dispatch_ticket" ? "env" : spikeBin;
+      const commandArgs = params.action === "dispatch_ticket"
+        ? [`SPIKE_OWNER=${ctx.sessionManager.getSessionId()}`, spikeBin, ...args]
+        : args;
+      const longRunning = params.action === "publish" || params.action === "dispatch_ticket";
+      const result = await pi.exec(executable, commandArgs, { signal, timeout: longRunning ? 120_000 : 45_000 });
       if (result.code !== 0) throw new Error(result.stderr || result.stdout || `spike exited ${result.code}`);
-      if (params.action === "dispatch" || params.action === "send") {
+      if (params.action === "dispatch_ticket" || params.action === "dispatch" || params.action === "send") {
         setTimeout(() => void scan(ctx), 100).unref();
         setTimeout(() => void scan(ctx), 350).unref();
       }
