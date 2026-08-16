@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -197,7 +197,9 @@ describe("worker branch publication", () => {
     });
     expect(review.code).toBe(0);
     expect(review.stdout).toContain(`Reviewing: ${first.base}...${first.head}`);
-    expect(await readFile(hunkLog, "utf8")).toBe(`${item.root}\ndiff ${first.base}...${first.importedRef}\n`);
+    const [hunkCwd, hunkArguments] = (await readFile(hunkLog, "utf8")).trimEnd().split("\n");
+    expect(await realpath(hunkCwd)).toBe(await realpath(item.root));
+    expect(hunkArguments).toBe(`diff ${first.base}...${first.importedRef}`);
   });
 
   test("uses the Apple runtime boundary and advances only to a fast-forward worker head", async () => {
