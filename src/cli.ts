@@ -26,9 +26,11 @@ import {
   finalizedAgentMatchesState,
   listAgentFinalizations,
   loadActiveRun,
+  loadRunAttemptHistory,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
+  retryActiveRun,
   writeAgentFinalization,
   writeAgentState,
   type AgentFinalizationRecord,
@@ -74,6 +76,8 @@ Usage:
   spike workflow migrate-bootstrap [--apply]
   spike workflow doctor [--json]
   spike run status [--json]
+  spike run history [--json]
+  spike run retry <worker-name> --acknowledge <failed-run-id> [--model <model>] [--thinking <level>]
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -477,6 +481,7 @@ function printRunStatus(record: RunRecord) {
   console.log(`Ticket ID: ${record.ticketId}`);
   console.log(`Worker: ${record.worker.slug}`);
   console.log(`Base revision: ${record.baseRevision}`);
+  if (record.retryOfRunId) console.log(`Retry of run: ${record.retryOfRunId}`);
   console.log(`Status: ${record.status}`);
   console.log(`Created at: ${record.createdAt}`);
   if (record.launchedAt) console.log(`Launched at: ${record.launchedAt}`);
@@ -498,13 +503,68 @@ function printRunStatus(record: RunRecord) {
   if (record.launchError) console.log(`Launch error: ${record.launchError}`);
 }
 
+function parseRunRetryArgs(args: string[]): { workerName: string; acknowledgedRunId: string; model?: string; thinking?: string } {
+  let workerName: string | undefined;
+  let acknowledgedRunId: string | undefined;
+  let model: string | undefined;
+  let thinking: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index];
+    if (["--acknowledge", "--model", "--thinking"].includes(argument)) {
+      if (index + 1 >= args.length || args[index + 1].startsWith("-")) fail(`run retry requires ${argument} <value>`, 2);
+      const value = args[++index];
+      if (argument === "--acknowledge") {
+        if (acknowledgedRunId !== undefined) fail("run retry accepts --acknowledge only once", 2);
+        acknowledgedRunId = value;
+      } else if (argument === "--model") {
+        if (model !== undefined) fail("run retry accepts --model only once", 2);
+        model = value;
+      } else {
+        if (thinking !== undefined) fail("run retry accepts --thinking only once", 2);
+        thinking = value;
+      }
+    } else if (argument.startsWith("-")) fail(`unknown run retry option: ${argument}`, 2);
+    else if (workerName === undefined) workerName = argument;
+    else fail("run retry accepts exactly one worker name", 2);
+  }
+  if (!workerName) fail("run retry requires a worker name", 2);
+  if (!acknowledgedRunId) fail("run retry requires --acknowledge <failed-run-id>", 2);
+  return { workerName, acknowledgedRunId, model, thinking };
+}
+
+function printRunHistory(history: Awaited<ReturnType<typeof loadRunAttemptHistory>>) {
+  console.log(`Goal ID: ${history.goalId}`);
+  console.log(`Ticket ID: ${history.ticketId}`);
+  console.log(`Base revision: ${history.baseRevision}`);
+  console.log(`Active run: ${history.activeRunId ?? "none"}`);
+  for (const attempt of history.attempts) {
+    console.log(`${attempt.runId}${attempt.runId === history.activeRunId ? " *" : ""} ${attempt.status} worker=${attempt.worker.slug}${attempt.retryOfRunId ? ` retry-of=${attempt.retryOfRunId}` : ""} created=${attempt.createdAt}`);
+  }
+}
+
 async function runCommand(action: string | undefined, args: string[]) {
   try {
-    if (action !== "status") fail("expected run status", 2);
-    if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
-    const record = await loadActiveRun();
-    if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
-    else printRunStatus(record);
+    if (action === "status") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
+      const record = await loadActiveRun();
+      if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
+      else printRunStatus(record);
+      return;
+    }
+    if (action === "history") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run history accepts only --json", 2);
+      const history = await loadRunAttemptHistory();
+      if (args.includes("--json")) console.log(JSON.stringify(history, null, 2));
+      else printRunHistory(history);
+      return;
+    }
+    if (action === "retry") {
+      const retry = parseRunRetryArgs(args);
+      const record = await retryActiveRun({ ...retry, launcher: launchPersistentTicket });
+      printRunStatus(record);
+      return;
+    }
+    fail("expected run status, history, or retry", 2);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
@@ -824,7 +884,7 @@ async function supervisor(args: string[]) {
   const systemPrompt = [
     "You are the Spike supervisor for this repository.",
     "Before drafting or activating a goal, inspect durable state with spike goal status --json; never replace an existing active goal.",
-    "Before dispatching a durable ticket, inspect both spike ticket status --json and spike run status --json; durable ready tickets and runs survive restarts, and a supervisor restart or missing live runtime is never a reason to redispatch.",
+    "Before dispatching a durable ticket, inspect both spike ticket status --json and spike run status --json; durable ready tickets and runs survive restarts, and a supervisor restart or missing live runtime is never a reason to redispatch or infer a retry.",
     "Before drafting a ticket, inspect spike ticket status --json and spike ticket show.",
     "Issuing a ticket preserves planner state but does not dispatch a worker; dispatch it exactly once with the run-aware spike_agents dispatch_ticket action.",
     "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",
@@ -977,6 +1037,9 @@ async function runAgent(name: string | undefined, args: string[]) {
     "--env", `AGENT_BRANCH=${process.env.AGENT_BRANCH ?? `agent/${agent}`}`,
     "--env", `AGENT_BASE_REF=${baseEnvironment.AGENT_BASE_REF}`,
     ...(baseEnvironment.SPIKE_BASE_REVISION ? ["--env", `SPIKE_BASE_REVISION=${baseEnvironment.SPIKE_BASE_REVISION}`] : []),
+    ...(process.env.SPIKE_GOAL_ID ? ["--env", `SPIKE_GOAL_ID=${process.env.SPIKE_GOAL_ID}`] : []),
+    ...(process.env.SPIKE_TICKET_ID ? ["--env", `SPIKE_TICKET_ID=${process.env.SPIKE_TICKET_ID}`] : []),
+    ...(process.env.SPIKE_RUN_ID ? ["--env", `SPIKE_RUN_ID=${process.env.SPIKE_RUN_ID}`] : []),
     ...(launchEvidenceToken ? [
       "--env", `SPIKE_LAUNCH_EVIDENCE_TOKEN=${launchEvidenceToken}`,
       "--env", `SPIKE_LAUNCH_EVIDENCE_PATH=/output/launch/${launchEvidenceToken}.json`,

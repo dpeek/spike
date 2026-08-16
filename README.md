@@ -188,14 +188,26 @@ container is unavailable:
 ```bash
 spike run status
 spike run status --json
+spike run history
+spike run history --json
 ```
 
 Status validates the active goal, ready ticket, pointer, record, identities,
 paths, schema, and snapshot provenance before reporting launch/runtime IDs,
-timestamps, stop intent, and observed process termination. Redispatch is
-refused once an active-run pointer exists, including after launch failure; this
-slice provides no retry flag. Inspect and resolve the durable state rather than
-retrying because a supervisor restarted or a runtime disappeared.
+timestamps, stop intent, and observed process termination. Redispatch remains
+refused once an active-run pointer exists. After an active `launch_failed` run,
+retry only with an explicit acknowledgement of that exact failed run:
+
+```bash
+spike run retry ticket-004-worker \
+  --acknowledge <failed-run-id> \
+  --model openai-codex/gpt-5.4 --thinking high
+```
+
+Retry preserves the failed immutable run record, creates a distinct new run ID,
+and atomically advances the active-run pointer only through that explicit CLI
+transition. Supervisor restarts or missing live runtime are never implicit
+reasons to redispatch or infer a retry.
 
 The supervisor tool exposes `spike_agents` action `dispatch_ticket`. It requires
 checking both `spike ticket status --json` and `spike run status --json` first.
@@ -243,8 +255,8 @@ its accepted base. Unknown, missing, or conflicting evidence is retained and
 reported rather than guessed.
 
 Current workflow limitations remain intentional: Spike does not parse a
-structured completion report, remediate/cancel a ticket, retry a failed launch,
-or associate detached one-shot work with durable runs.
+structured completion report, remediate/cancel a ticket, or associate detached
+one-shot work with durable runs.
 
 ## Build and start services
 

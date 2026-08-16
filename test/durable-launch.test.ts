@@ -8,8 +8,11 @@ import {
   canonicalBaseEnvironment,
   readLaunchEvidence,
 } from "../src/durable-launch.ts";
+import { activateGoal, issueTicket } from "../src/goals.ts";
+import { dispatchTicket } from "../src/runs.ts";
 
 const temporaryDirectories: string[] = [];
+const cli = join(import.meta.dir, "..", "src", "cli.ts");
 const entrypoint = join(import.meta.dir, "..", "docker", "agent-entrypoint.sh");
 const goalId = `goal-${"1".repeat(32)}`;
 const ticketId = `ticket-${"2".repeat(32)}`;
@@ -77,6 +80,56 @@ async function runEntrypoint(
   });
 }
 
+async function installFakeDocker(root: string): Promise<{ capturePath: string; env: Record<string, string> }> {
+  const fakeBin = join(root, "fake-docker-bin");
+  const capturePath = join(root, "docker-run.txt");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "docker"), `#!/bin/sh
+if [ "$1" = "info" ]; then
+  exit 0
+fi
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "network" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "run" ]; then
+  printf '%s\n' "$*" > ${JSON.stringify(capturePath)}
+  exit 0
+fi
+exit 0
+`, { mode: 0o755 });
+  return {
+    capturePath,
+    env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, SPIKE_RUNTIME: "docker", SPIKE_PORTLESS: "0", REPO_SEED: root },
+  };
+}
+
+async function prepareDurableRun(root: string) {
+  await writeFile(join(root, ".gitignore"), ".pi-swarm/\n");
+  await writeFile(join(root, "goal.md"), "# Goal\n");
+  await must(["git", "add", ".gitignore", "goal.md"], root);
+  await must(["git", "commit", "-m", "workflow fixture"], root);
+  const goal = await activateGoal({ cwd: root, goalFile: "goal.md", approvalStatement: "approved" });
+  const ticketPath = join(root, ".pi-swarm", "drafts", "ticket.md");
+  await mkdir(join(root, ".pi-swarm", "drafts"), { recursive: true });
+  await writeFile(ticketPath, "# Ticket\n\nImplement this.\n");
+  const ticket = await issueTicket({ cwd: root, ticketFile: ticketPath });
+  const run = await dispatchTicket({
+    cwd: root,
+    workerName: "worker-one",
+    launcher: async () => ({ runtime: "docker", container: "durable-launch" }),
+  });
+  return { goalId: goal.record.goalId, ticketId: ticket.record.ticketId, runId: run.runId, baseRevision: ticket.record.baseRevision };
+}
+
 describe("Herdr launch script base propagation", () => {
   test("preserves canonical base variables and safely quotes paths and values", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "spike-launch-script-")));
@@ -116,6 +169,29 @@ describe("Herdr launch script base propagation", () => {
     expect(captured).toContain("ARG4=--model");
     expect(captured).toContain("ARG5=provider/model");
     expect(captured).toContain("ARG6=task with 'quotes' and $dollars");
+  });
+});
+
+describe("agent run durable identity propagation", () => {
+  test("forwards goal, ticket, and run identities into the container launch environment", async () => {
+    const item = await repoFixture();
+    const durable = await prepareDurableRun(item.seed);
+    const tooling = await installFakeDocker(item.seed);
+    const result = await execute([process.execPath, cli, "agent", "run", "worker-one", "--", "true"], item.seed, {
+      ...tooling.env,
+      SPIKE_GOAL_ID: durable.goalId,
+      SPIKE_TICKET_ID: durable.ticketId,
+      SPIKE_RUN_ID: durable.runId,
+      SPIKE_BASE_REVISION: durable.baseRevision,
+      AGENT_BASE_REF: durable.baseRevision,
+      SPIKE_BACKEND: "herdr",
+    });
+    expect(result.code).not.toBe(127);
+    const invocation = await readFile(tooling.capturePath, "utf8");
+    expect(invocation).toContain(`--env SPIKE_GOAL_ID=${durable.goalId}`);
+    expect(invocation).toContain(`--env SPIKE_TICKET_ID=${durable.ticketId}`);
+    expect(invocation).toContain(`--env SPIKE_RUN_ID=${durable.runId}`);
+    expect(invocation).toContain(`--env SPIKE_BASE_REVISION=${durable.baseRevision}`);
   });
 });
 

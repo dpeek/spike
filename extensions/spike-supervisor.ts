@@ -195,7 +195,7 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
     promptSnippet: "Dispatch durable tickets or free-form work, message, read, publish, list, stop, or open isolated container workers",
     promptGuidelines: [
       "Inspect existing durable goal state with spike goal status --json before drafting or activating a new goal, and never silently replace an active goal.",
-      "Before dispatch_ticket, inspect both spike ticket status --json and spike run status --json. A ready ticket and its run survive supervisor restarts; never redispatch merely because the supervisor restarted or a live runtime cannot be found.",
+      "Before dispatch_ticket, inspect both spike ticket status --json and spike run status --json. A ready ticket and its run survive supervisor restarts; never redispatch or infer a retry merely because the supervisor restarted or a live runtime cannot be found.",
       "Before drafting a ticket, inspect spike ticket status --json and spike ticket show.",
       "Ticket issuance records planner intent but does not dispatch a worker; use dispatch_ticket exactly once for the durable ready ticket.",
       "Never treat conversational intent, chat history, or terminal output as goal approval; activation requires an explicit operator approval statement at the CLI boundary.",
