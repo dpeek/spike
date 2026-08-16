@@ -588,6 +588,14 @@ function cleanupMissing(result: { stdout: string; stderr: string }): boolean {
   return ["not found", "no such", "does not exist", "not exist", "cannot find"].some((fragment) => message.includes(fragment));
 }
 
+function portlessAliasMissing(result: { stdout: string; stderr: string }): boolean {
+  return `${result.stderr}\n${result.stdout}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .some((line) => /^(?:error:\s*)?no alias found for\s+"[^"]+"\.?$/i.test(line));
+}
+
 function trimDetail(result: { stdout: string; stderr: string }): string | undefined {
   const text = (result.stderr || result.stdout).replace(/\s+/g, " ").trim();
   return text ? text.slice(0, 300) : undefined;
@@ -602,7 +610,7 @@ async function finalizeAlias(alias?: string): Promise<AgentFinalizationResourceR
   if (!await available("portless")) return cleanupOutcome("failed", alias, "Portless is unavailable");
   const result = await capture(["portless", "alias", "--remove", alias]);
   if (result.code === 0) return cleanupOutcome("removed", alias);
-  if (cleanupMissing(result)) return cleanupOutcome("absent", alias);
+  if (portlessAliasMissing(result) || cleanupMissing(result)) return cleanupOutcome("absent", alias);
   return cleanupOutcome("failed", alias, trimDetail(result));
 }
 
