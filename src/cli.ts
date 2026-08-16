@@ -5,6 +5,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { activateGoal, loadActiveGoal, type GoalRecord } from "./goals.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
 
 const VERSION = "0.3.1";
@@ -58,6 +59,9 @@ Usage:
   spike build
   spike supervisor [--herdr] [pi arguments...]
   spike herdr setup|status|attach
+  spike goal activate <goal-file> --approval <statement>
+  spike goal status [--json]
+  spike goal show
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
   spike agent dispatch <name> --task <task> [--model <model>]
@@ -211,6 +215,63 @@ async function loadContext() {
   const project = slug(process.env.SPIKE_PROJECT ?? root.split("/").at(-1) ?? "project");
   const stateDir = join(root, ".pi-swarm");
   return { root, project, stateDir, config };
+}
+
+function printGoalStatus(record: GoalRecord) {
+  console.log(`Goal ID: ${record.goalId}`);
+  console.log(`Status: ${record.status}`);
+  console.log(`Goal path: ${record.goalPath}`);
+  console.log(`Approved blob: ${record.approvedBlob}`);
+  console.log(`Approval statement: ${record.approvalStatement}`);
+  console.log(`Repository revision at approval: ${record.repositoryRevision}`);
+  console.log(`Accepted code revision: ${record.acceptedCodeRevision}`);
+}
+
+async function goalCommand(action: string | undefined, args: string[]) {
+  try {
+    if (action === "activate") {
+      let goalFile: string | undefined;
+      let approvalStatement: string | undefined;
+      for (let index = 0; index < args.length; index++) {
+        const argument = args[index];
+        if (argument === "--approval") {
+          if (approvalStatement !== undefined) fail("goal activate accepts --approval only once", 2);
+          if (index + 1 >= args.length) fail("goal activate requires --approval <statement>", 2);
+          approvalStatement = args[++index];
+        } else if (argument.startsWith("-")) {
+          fail(`unknown goal activate option: ${argument}`, 2);
+        } else if (goalFile === undefined) {
+          goalFile = argument;
+        } else {
+          fail("goal activate accepts exactly one goal file", 2);
+        }
+      }
+      if (!goalFile) fail("goal activate requires a Markdown goal file", 2);
+      if (approvalStatement === undefined) fail("goal activate requires --approval <statement>", 2);
+      const result = await activateGoal({ goalFile, approvalStatement });
+      console.log(`${result.idempotent ? "Already active" : "Activated"} goal ${result.record.goalId}`);
+      printGoalStatus(result.record);
+      return;
+    }
+    if (action === "status") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) {
+        fail("goal status accepts only --json", 2);
+      }
+      const active = await loadActiveGoal();
+      if (args.includes("--json")) console.log(JSON.stringify(active.record, null, 2));
+      else printGoalStatus(active.record);
+      return;
+    }
+    if (action === "show") {
+      if (args.length) fail("goal show accepts no arguments", 2);
+      const active = await loadActiveGoal();
+      process.stdout.write(active.snapshot);
+      return;
+    }
+    fail("expected goal activate, status, or show", 2);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
 }
 
 async function runtimeFor(config: Config): Promise<Runtime> {
@@ -400,6 +461,8 @@ async function supervisor(args: string[]) {
   const extension = join(setupRoot, "extensions", "spike-supervisor.ts");
   const systemPrompt = [
     "You are the Spike supervisor for this repository.",
+    "Before drafting or activating a goal, inspect durable state with spike goal status --json; never replace an existing active goal.",
+    "Never infer approval from conversational intent, chat history, or terminal output; activation requires an explicit operator approval statement at the CLI boundary.",
     "Delegate independent implementation, investigation, testing, and review tasks to isolated workers with spike_agents.",
     "Give each worker a focused task and a unique stable name. Workers have persistent clones and should commit completed work.",
     "Continue coordinating while workers run; their completion reports will arrive asynchronously.",
@@ -857,6 +920,7 @@ else if (command === "up") await up();
 else if (command === "build") await build();
 else if (command === "supervisor" || command === "start") await supervisor(args);
 else if (command === "herdr") await herdrCommand(args.shift());
+else if (command === "goal") await goalCommand(args.shift(), args);
 else if (command === "down") await down();
 else if (command === "agent") {
   const action = args.shift();

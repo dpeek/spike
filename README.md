@@ -82,6 +82,52 @@ When invoking this development checkout against another repository, use:
 REPO_SEED=/path/to/project /path/to/spike/bin/spike doctor
 ```
 
+## Activate and recover an approved goal
+
+Spike can preserve one operator-approved Markdown goal as durable project-local
+state. Commit the exact goal document first, then activate it from anywhere in
+that repository:
+
+```bash
+git add doc/goal.md
+git commit -m "Approve implementation goal"
+spike goal status                         # clearly reports that no goal is active
+spike goal activate doc/goal.md \
+  --approval "Approved by Casey for implementation"
+```
+
+Activation requires a tracked Markdown file whose index and working-tree form
+are unchanged from `HEAD`. It rejects symlinks, files outside the repository,
+untracked files, and a second active goal. Unrelated staged, unstaged, and
+untracked host changes are allowed and are not modified. Repeating the exact
+same file revision and approval statement is idempotent.
+
+Inspect or recover the active goal in any later Spike process:
+
+```bash
+spike goal status
+spike goal status --json
+spike goal show
+```
+
+`status` reports the stable goal ID, approval, approved Git blob, repository
+revision at approval, and current accepted code revision. `show` emits the
+preserved bytes from the approved Git blob, not the source path's current
+contents. Consequently both commands continue to work if the source file is
+later edited. The schema-versioned record, snapshot, and atomic active pointer
+live under the ignored `.pi-swarm/goals/` directory; malformed records, unknown
+schemas, path escapes, pointer mismatches, and snapshot tampering are rejected.
+Do not commit `.pi-swarm/`.
+
+Approval is currently supplied **only and explicitly at the CLI boundary** with
+`--approval`. Spike records that argument verbatim, but does not infer approval
+from conversation, chat logs, terminal output, or a goal document. Before
+planning a new goal, supervisors should run `spike goal status --json`; they
+must not draft or activate a replacement while another goal is active, and must
+not treat conversational intent as operator approval. Completion, cancellation,
+multiple active goals, tickets, runs, decisions, and accepted-revision updates
+remain future workflow slices.
+
 ## Build and start services
 
 ```bash

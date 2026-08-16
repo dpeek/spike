@@ -187,6 +187,8 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
     description: "Dispatch and manage isolated containerized Pi workers. Inside Herdr, dispatch creates persistent interactive workers that accept follow-ups; otherwise it creates one-shot workers. Publish imports a verified committed worker branch into a host review ref without merging it. Reports arrive asynchronously.",
     promptSnippet: "Dispatch, message, read, publish, list, stop, or open isolated container workers",
     promptGuidelines: [
+      "Inspect existing durable goal state with spike goal status --json before drafting or activating a new goal, and never silently replace an active goal.",
+      "Never treat conversational intent, chat history, or terminal output as goal approval; activation requires an explicit operator approval statement at the CLI boundary.",
       "Use spike_agents to delegate independent coding, investigation, testing, and review tasks that can run concurrently.",
       "Give every spike_agents dispatch a unique stable agent name and a focused, self-contained task.",
       "After dispatching with spike_agents, continue useful coordination rather than polling; completion reports arrive automatically.",
