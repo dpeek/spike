@@ -446,11 +446,28 @@ to the worker's start identity and optional run. This lets the stop caller repai
 a legacy launcher's terminal overwrite; the record is removed after terminal
 reconciliation and cannot apply to a replacement process or run.
 
-`remove --force` deletes that agent's persistent clone and network. It does not
-delete `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,
-snapshots, publications, bundles, and artifacts. `spike down` stops this
-project's active agents and removes their aliases, but deliberately leaves the
-global Portless proxy running for other projects.
+`stop` releases active execution while preserving the worker's persistent clone,
+network identity, shared Pi state, publications, artifacts, and durable
+workflow records for follow-up work.
+
+`remove --force` is a terminal-only finalization step. Stop the worker first,
+wait for `spike agent list` to show a terminal state (`stopped`, `failed`, or
+`completed`), then run `spike agent remove <name> --force`. Finalization
+atomically retains a validated retirement record under
+`.pi-swarm/finalized-agents/`, then releases the worker container (if still
+present), workspace volume, dedicated network, Portless alias, and Herdr tab.
+Accepted ticket/run/result history, publication manifests and bundles, imported
+refs, exported artifacts, and `.pi-swarm/shared-pi-state/` remain in place.
+Retries are safe: already-absent resources count as released, while any failed
+cleanup leaves the active record in place so the command can be rerun without
+losing provenance.
+
+After finalization the retired worker no longer appears in `spike agent list`,
+and its name can be reused for a later run without overwriting the preserved
+historical evidence.
+
+`spike down` stops this project's active agents and removes their aliases, but
+deliberately leaves the global Portless proxy running for other projects.
 
 State and exported work live under `.pi-swarm/`.
 
