@@ -7,6 +7,7 @@ import { loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } f
 export const RUN_SCHEMA_VERSION = 1;
 export const ACTIVE_RUN_POINTER_SCHEMA_VERSION = 1;
 export const AGENT_SCHEMA_VERSION = 1;
+export const AGENT_STOP_INTENT_SCHEMA_VERSION = 1;
 const MAX_RECORD_BYTES = 128 * 1024;
 const runIdPattern = /^run-[0-9a-f]{32}$/;
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
@@ -55,6 +56,18 @@ export type ActiveRunPointer = {
   ticketId: string;
   runId: string;
   recordPath: string;
+};
+
+export type AgentStopIntent = {
+  schemaVersion: 1;
+  slug: string;
+  startedAt: string;
+  pid: number;
+  container: string;
+  runId?: string;
+  stopRequestedAt: string;
+  stopRequester?: string;
+  stopReason: string;
 };
 
 export type AgentState = {
@@ -278,6 +291,20 @@ export function normalizeAgentState(value: unknown, expectedSlug?: string): { st
   return { state: validateAgentState(migrated, expectedSlug), migrated: true };
 }
 
+export function validateAgentStopIntent(value: unknown, expectedSlug?: string): AgentStopIntent {
+  const intent = requireObject(value, "agent stop intent");
+  if (intent.schemaVersion !== AGENT_STOP_INTENT_SCHEMA_VERSION) throw new Error(`unsupported agent stop intent schema: ${String(intent.schemaVersion)}`);
+  if (typeof intent.slug !== "string" || !workerPattern.test(intent.slug) || (expectedSlug && intent.slug !== expectedSlug)) throw new Error("agent stop intent has an invalid slug");
+  requireTimestamp(intent.startedAt, "agent stop intent startedAt");
+  requireTimestamp(intent.stopRequestedAt, "agent stop intent stopRequestedAt");
+  if (!Number.isSafeInteger(intent.pid) || (intent.pid as number) < 1) throw new Error("agent stop intent has an invalid pid");
+  if (typeof intent.container !== "string" || !intent.container) throw new Error("agent stop intent has an invalid container");
+  if (intent.runId !== undefined && (typeof intent.runId !== "string" || !runIdPattern.test(intent.runId))) throw new Error("agent stop intent has an invalid runId");
+  if (!validOptionalString(intent.stopRequester)) throw new Error("agent stop intent has an invalid stopRequester");
+  if (typeof intent.stopReason !== "string" || !intent.stopReason) throw new Error("agent stop intent has an invalid stopReason");
+  return intent as AgentStopIntent;
+}
+
 export function validateActiveRunPointer(value: unknown, expected: { goalId: string; ticketId: string }): ActiveRunPointer {
   const pointer = requireObject(value, "active run pointer");
   if (pointer.schemaVersion !== ACTIVE_RUN_POINTER_SCHEMA_VERSION) throw new Error(`unsupported active run pointer schema: ${String(pointer.schemaVersion)}`);
@@ -426,6 +453,72 @@ export function agentStatePath(stateDir: string, name: string): string {
   return join(stateDir, "agents", `${workerSlug(name)}.json`);
 }
 
+export function agentStopIntentPath(stateDir: string, name: string): string {
+  return join(stateDir, "agents", "stop-intents", `${workerSlug(name)}.v1.json`);
+}
+
+async function readAgentStopIntent(stateDir: string, name: string): Promise<AgentStopIntent | undefined> {
+  const slug = workerSlug(name);
+  const path = agentStopIntentPath(stateDir, slug);
+  try {
+    await rejectSymlinks(stateDir, path, "agent stop intent path");
+    return validateAgentStopIntent(await smallJson(path, "agent stop intent"), slug);
+  } catch (error) {
+    if (error instanceof Error && error.message === "agent stop intent is missing") return undefined;
+    throw error;
+  }
+}
+
+async function writeAgentStopIntent(stateDir: string, intent: AgentStopIntent): Promise<void> {
+  validateAgentStopIntent(intent, intent.slug);
+  const directory = join(stateDir, "agents", "stop-intents");
+  const path = agentStopIntentPath(stateDir, intent.slug);
+  await rejectSymlinks(stateDir, path, "agent stop intent path");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await rejectSymlinks(stateDir, path, "agent stop intent path");
+  await atomicWrite(path, `${JSON.stringify(intent, null, 2)}\n`);
+}
+
+async function removeAgentStopIntent(stateDir: string, name: string): Promise<void> {
+  const path = agentStopIntentPath(stateDir, name);
+  await rejectSymlinks(stateDir, path, "agent stop intent path");
+  await rm(path, { force: true });
+}
+
+function sameStopIntent(left: AgentStopIntent, right: AgentStopIntent): boolean {
+  return left.schemaVersion === right.schemaVersion && left.slug === right.slug && left.startedAt === right.startedAt &&
+    left.pid === right.pid && left.container === right.container && left.runId === right.runId &&
+    left.stopRequestedAt === right.stopRequestedAt && left.stopRequester === right.stopRequester && left.stopReason === right.stopReason;
+}
+
+function stopIntentMatchesAgent(intent: AgentStopIntent, state: AgentState): boolean {
+  return intent.slug === state.slug && intent.startedAt === state.startedAt && intent.pid === state.pid &&
+    intent.container === state.container && intent.runId === state.runId;
+}
+
+function runMatchesAgent(run: RunRecord, state: AgentState): boolean {
+  return run.runId === state.runId && run.goalId === state.goalId && run.ticketId === state.ticketId &&
+    run.baseRevision === state.baseRevision && run.worker.slug === state.slug;
+}
+
+function runMatchesStopIntent(run: RunRecord, intent: AgentStopIntent): boolean {
+  return run.runId === intent.runId && run.stopRunId === intent.runId && run.stopRequestedAt === intent.stopRequestedAt &&
+    run.stopRequester === intent.stopRequester && run.stopReason === intent.stopReason;
+}
+
+function applyStopIntent<T extends AgentState | RunRecord>(record: T, intent: AgentStopIntent): T {
+  const result = {
+    ...record,
+    stopRequestedAt: intent.stopRequestedAt,
+    stopReason: intent.stopReason,
+    ...(intent.stopRequester ? { stopRequester: intent.stopRequester } : {}),
+    ...(intent.runId ? { stopRunId: intent.runId } : {}),
+  } as T;
+  if (!intent.stopRequester) delete result.stopRequester;
+  if (!intent.runId) delete result.stopRunId;
+  return result;
+}
+
 export async function readAgentState(stateDir: string, name: string): Promise<AgentState | undefined> {
   const slug = workerSlug(name);
   try {
@@ -466,42 +559,107 @@ async function withAgentLock<T>(stateDir: string, slug: string, operation: () =>
   finally { await lock.close(); await rm(lockPath, { force: true }); }
 }
 
+async function reconcileAgentStop(options: {
+  cwd: string; stateDir: string; stopping: AgentState; intent: AgentStopIntent;
+}): Promise<AgentState> {
+  return withAgentLock(options.stateDir, options.stopping.slug, async () => {
+    const [current, persistedIntent] = await Promise.all([
+      readAgentState(options.stateDir, options.stopping.slug),
+      readAgentStopIntent(options.stateDir, options.stopping.slug),
+    ]);
+    // A current launcher can finalize and consume the intent while runtime stop
+    // is returning. In that case only report its result; never rewrite it.
+    if (!persistedIntent) return current && stopIntentMatchesAgent(options.intent, current) ? current : options.stopping;
+    if (!sameStopIntent(persistedIntent, options.intent) || !current || !stopIntentMatchesAgent(persistedIntent, current)) {
+      if (sameStopIntent(persistedIntent, options.intent)) await removeAgentStopIntent(options.stateDir, persistedIntent.slug);
+      return options.stopping;
+    }
+    if (!current.finishedAt) return current;
+
+    let run: RunRecord | undefined;
+    let runContext: RunContext | undefined;
+    if (persistedIntent.runId) {
+      run = await loadActiveRun(options.cwd);
+      if (!runMatchesAgent(run, current) || !runMatchesStopIntent(run, persistedIntent)) {
+        await removeAgentStopIntent(options.stateDir, persistedIntent.slug);
+        return current;
+      }
+      runContext = await context(options.cwd);
+    }
+
+    const requested = applyStopIntent(current, persistedIntent);
+    requested.lifecycle = "stopped";
+    requested.outcome = "stopped";
+    requested.terminationKind = "requested";
+    requested.expectedSignal = "SIGTERM";
+    if (requested.exitCode === 143) requested.signal = "SIGTERM";
+    await writeAgentState(options.stateDir, requested);
+    if (run && runContext) {
+      const requestedRun = applyStopIntent(run, persistedIntent);
+      requestedRun.status = "stopped";
+      requestedRun.outcome = "stopped";
+      requestedRun.finishedAt = requested.finishedAt;
+      requestedRun.exitCode = requested.exitCode;
+      requestedRun.terminationKind = "requested";
+      requestedRun.expectedSignal = "SIGTERM";
+      if (requested.exitCode === 143) requestedRun.signal = "SIGTERM";
+      await writeRun(runContext, requestedRun);
+    }
+    await removeAgentStopIntent(options.stateDir, persistedIntent.slug);
+    return requested;
+  }, true);
+}
+
 export async function requestAgentStop(options: {
   cwd?: string; name: string; requester?: string; reason?: string; now?: Date;
   stopRuntime: (state: AgentState) => Promise<void>;
 }): Promise<AgentState> {
-  const active = await loadActiveGoal(options.cwd ?? process.cwd()).catch(() => undefined);
-  const root = active ? active.record.repositoryRoot : await gitRoot(options.cwd ?? process.cwd());
+  const cwd = options.cwd ?? process.cwd();
+  const active = await loadActiveGoal(cwd).catch(() => undefined);
+  const root = active ? active.record.repositoryRoot : await gitRoot(cwd);
   const stateDir = join(root, ".pi-swarm");
   const slug = workerSlug(options.name);
-  const stopping = await withAgentLock(stateDir, slug, async () => {
+  const prepared = await withAgentLock(stateDir, slug, async () => {
     const state = await readAgentState(stateDir, slug);
     if (!state) throw new Error(`unknown agent: ${options.name}`);
     if (state.finishedAt) throw new Error(`agent ${slug} is already ${state.lifecycle}`);
     if (state.lifecycle === "stopping") throw new Error(`agent ${slug} is already stopping`);
     const requestedAt = iso(options.now);
     const reason = options.reason?.trim() || "operator-requested";
-    let run: RunRecord | undefined;
-    if (state.runId) {
-      run = await loadActiveRun(options.cwd ?? process.cwd());
-      if (run.runId !== state.runId || run.goalId !== state.goalId || run.ticketId !== state.ticketId || run.worker.slug !== state.slug) {
-        throw new Error("agent/run identity mismatch; refusing to stop without correlated durable intent");
-      }
-      run = { ...run, status: "stopping", stopRequestedAt: requestedAt, ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason, stopRunId: run.runId };
-      await writeRun(await context(options.cwd ?? process.cwd()), run);
-    }
-    const durableIntent: AgentState = {
-      ...state, lifecycle: "stopping", stopRequestedAt: requestedAt,
-      ...(options.requester ? { stopRequester: options.requester } : {}), stopReason: reason,
-      ...(state.runId ? { stopRunId: state.runId } : {}),
+    const intent: AgentStopIntent = {
+      schemaVersion: AGENT_STOP_INTENT_SCHEMA_VERSION,
+      slug: state.slug,
+      startedAt: state.startedAt,
+      pid: state.pid,
+      container: state.container,
+      ...(state.runId ? { runId: state.runId } : {}),
+      stopRequestedAt: requestedAt,
+      ...(options.requester ? { stopRequester: options.requester } : {}),
+      stopReason: reason,
     };
-    await writeAgentState(stateDir, durableIntent);
-    return durableIntent;
+    let originalRun: RunRecord | undefined;
+    let runContext: RunContext | undefined;
+    if (state.runId) {
+      originalRun = await loadActiveRun(cwd);
+      if (!runMatchesAgent(originalRun, state)) throw new Error("agent/run identity mismatch; refusing to stop without correlated durable intent");
+      runContext = await context(cwd);
+    }
+    const stopping = applyStopIntent({ ...state, lifecycle: "stopping" as const }, intent);
+    await writeAgentStopIntent(stateDir, intent);
+    try {
+      if (originalRun && runContext) await writeRun(runContext, applyStopIntent({ ...originalRun, status: "stopping" as const }, intent));
+      await writeAgentState(stateDir, stopping);
+    } catch (error) {
+      await removeAgentStopIntent(stateDir, slug);
+      if (originalRun && runContext) await writeRun(runContext, originalRun);
+      throw error;
+    }
+    return { stopping, intent };
   });
   // Runtime stop may wait for the foreground launcher to finish. Release the
   // lifecycle lock first so its finally block can record that exit.
-  await options.stopRuntime(stopping);
-  return stopping;
+  await options.stopRuntime(prepared.stopping);
+  return reconcileAgentStop({ cwd, stateDir, ...prepared });
 }
 
 async function gitRoot(cwd: string): Promise<string> {
@@ -512,33 +670,48 @@ async function gitRoot(cwd: string): Promise<string> {
 }
 
 export async function recordAgentExit(options: { cwd?: string; state: AgentState; exitCode: number; now?: Date }): Promise<AgentState> {
-  const root = await gitRoot(options.cwd ?? process.cwd());
+  const cwd = options.cwd ?? process.cwd();
+  const root = await gitRoot(cwd);
   const stateDir = join(root, ".pi-swarm");
   return withAgentLock(stateDir, options.state.slug, async () => {
     const current = await readAgentState(stateDir, options.state.slug) ?? options.state;
-    if (current.startedAt !== options.state.startedAt || current.runId !== options.state.runId) throw new Error("agent identity changed before exit was recorded");
+    if (current.startedAt !== options.state.startedAt || current.pid !== options.state.pid || current.container !== options.state.container || current.runId !== options.state.runId) {
+      throw new Error("agent identity changed before exit was recorded");
+    }
     let run: RunRecord | undefined;
-    if (current.runId) run = await loadActiveRun(options.cwd ?? process.cwd());
-    const matchingIntent = Boolean(current.stopRequestedAt && current.stopRunId === current.runId &&
-      (!run || (run.stopRequestedAt && run.stopRunId === current.runId && run.runId === current.runId)));
+    if (current.runId) {
+      run = await loadActiveRun(cwd);
+      if (!runMatchesAgent(run, current)) throw new Error("agent/run identity changed before exit was recorded");
+    }
+    const durableIntent = await readAgentStopIntent(stateDir, current.slug);
+    const durableMatch = Boolean(durableIntent && stopIntentMatchesAgent(durableIntent, current));
+    const mutableMatch = Boolean(!durableIntent && current.stopRequestedAt && current.stopRunId === current.runId);
+    const runIntentMatches = !run || Boolean(
+      durableMatch && durableIntent ? runMatchesStopIntent(run, durableIntent) :
+        mutableMatch && run.stopRequestedAt === current.stopRequestedAt && run.stopRunId === current.runId
+    );
+    const matchingIntent = (durableMatch || mutableMatch) && runIntentMatches;
     const outcome = matchingIntent ? "stopped" : options.exitCode === 0 ? "completed" : "failed";
     const finishedAt = iso(options.now);
     const signal = options.exitCode === 143 ? "SIGTERM" : undefined;
     const terminationKind = matchingIntent ? "requested" : "unexpected";
-    const final: AgentState = {
+    let final: AgentState = {
       ...current, lifecycle: outcome, outcome, finishedAt, exitCode: options.exitCode, terminationKind,
       ...(signal ? { signal } : {}), ...(matchingIntent ? { expectedSignal: "SIGTERM" } : {}),
     };
+    if (matchingIntent && durableIntent) final = applyStopIntent(final, durableIntent);
     await writeAgentState(stateDir, final);
     if (run) {
       const launchFailed = run.status === "launch_failed";
-      const finalRun: RunRecord = {
+      let finalRun: RunRecord = {
         ...run, status: launchFailed ? "launch_failed" : outcome, outcome: launchFailed ? "failed" : outcome,
         finishedAt, exitCode: options.exitCode, terminationKind,
         ...(signal ? { signal } : {}), ...(matchingIntent ? { expectedSignal: "SIGTERM" } : {}),
       };
-      await writeRun(await context(options.cwd ?? process.cwd()), finalRun);
+      if (matchingIntent && durableIntent) finalRun = applyStopIntent(finalRun, durableIntent);
+      await writeRun(await context(cwd), finalRun);
     }
+    if (durableIntent) await removeAgentStopIntent(stateDir, current.slug);
     return final;
   }, true);
 }

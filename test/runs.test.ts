@@ -6,6 +6,7 @@ import { activateGoal, issueTicket } from "../src/goals.ts";
 import { agentOutcomeDescription } from "../src/lifecycle.ts";
 import { publishBranch } from "../src/publication.ts";
 import {
+  agentStopIntentPath,
   dispatchTicket,
   loadActiveRun,
   normalizeAgentState,
@@ -13,6 +14,7 @@ import {
   recordAgentExit,
   requestAgentStop,
   validateActiveRunPointer,
+  validateAgentStopIntent,
   validateRunRecord,
   writeAgentState,
   type AgentState,
@@ -195,6 +197,24 @@ describe("legacy agent state compatibility", () => {
     expect(() => normalizeAgentState({ ...valid, schemaVersion: 2 }, "legacy")).toThrow("unsupported agent state schema: 2");
     expect(() => normalizeAgentState({ ...valid, finishedAt: "2026-08-17T10:12:12.000Z" }, "legacy")).toThrow("no exitCode");
   });
+
+  test("validates the narrow stop-intent schema and start identity", () => {
+    const valid = {
+      schemaVersion: 1 as const,
+      slug: "legacy",
+      startedAt: "2026-08-17T10:11:12.000Z",
+      pid: 1234,
+      container: "container-legacy",
+      stopRequestedAt: "2026-08-17T11:00:00.000Z",
+      stopRequester: "cli",
+      stopReason: "operator-requested",
+    };
+    expect(validateAgentStopIntent(valid, "legacy")).toEqual(valid);
+    expect(() => validateAgentStopIntent({ ...valid, schemaVersion: 2 }, "legacy")).toThrow("unsupported agent stop intent schema");
+    expect(() => validateAgentStopIntent({ ...valid, startedAt: "yesterday" }, "legacy")).toThrow("invalid timestamp");
+    expect(() => validateAgentStopIntent({ ...valid, pid: 0 }, "legacy")).toThrow("invalid pid");
+    expect(() => validateAgentStopIntent({ ...valid, runId: "other-run" }, "legacy")).toThrow("invalid runId");
+  });
 });
 
 describe("durable ticket dispatch and recovery", () => {
@@ -264,6 +284,123 @@ describe("durable ticket dispatch and recovery", () => {
 });
 
 describe("intentional shutdown classification", () => {
+  test("reconciles a live schema-less launcher's terminal overwrite after runtime stop", async () => {
+    const item = await fixture();
+    const original = legacyAgent(item, "legacy-worker");
+    await writeLegacyAgent(item, "legacy-worker");
+    const intentPath = agentStopIntentPath(item.stateDir, "legacy-worker");
+
+    const final = await requestAgentStop({
+      cwd: item.root,
+      name: "legacy-worker",
+      requester: "operator@example.test",
+      reason: "maintenance window",
+      now: new Date("2026-08-17T11:00:00.000Z"),
+      stopRuntime: async (stopping) => {
+        expect(stopping.schemaVersion).toBe(1);
+        expect(stopping.lifecycle).toBe("stopping");
+        const intent = JSON.parse(await readFile(intentPath, "utf8"));
+        expect(validateAgentStopIntent(intent, "legacy-worker").startedAt).toBe(original.startedAt);
+        // This is the real pre-lifecycle finally block: it still owns its
+        // schema-less launch snapshot and replaces all newly added stop fields.
+        await writeFile(join(item.stateDir, "agents", "legacy-worker.json"), `${JSON.stringify({
+          ...original,
+          finishedAt: "2026-08-17T11:00:01.000Z",
+          exitCode: 143,
+        }, null, 2)}\n`);
+      },
+    });
+
+    expect(final).toMatchObject({
+      schemaVersion: 1,
+      lifecycle: "stopped",
+      outcome: "stopped",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      stopRequestedAt: "2026-08-17T11:00:00.000Z",
+      stopRequester: "operator@example.test",
+      stopReason: "maintenance window",
+    });
+    expect(await readAgentState(item.stateDir, "legacy-worker")).toEqual(final);
+    expect(await Bun.file(intentPath).exists()).toBe(false);
+  });
+
+  test("reconciles correlated agent and run state after a terminal overwrite", async () => {
+    const item = await fixture();
+    const run = await successfulDispatch(item);
+    const original = (await readAgentState(item.stateDir, "worker-a"))!;
+    const final = await requestAgentStop({
+      cwd: item.root,
+      name: "worker-a",
+      requester: "cli",
+      reason: "operator-requested",
+      now: new Date("2026-08-17T11:00:00.000Z"),
+      stopRuntime: async () => {
+        await writeAgentState(item.stateDir, {
+          ...original,
+          lifecycle: "failed",
+          outcome: "failed",
+          finishedAt: "2026-08-17T11:00:01.000Z",
+          exitCode: 143,
+          signal: "SIGTERM",
+          terminationKind: "unexpected",
+        });
+      },
+    });
+    expect(final.lifecycle).toBe("stopped");
+    expect(final.runId).toBe(run.runId);
+    expect(final.stopRunId).toBe(run.runId);
+    const finalRun = await loadActiveRun(item.root);
+    expect(finalRun).toMatchObject({
+      status: "stopped",
+      outcome: "stopped",
+      exitCode: 143,
+      signal: "SIGTERM",
+      expectedSignal: "SIGTERM",
+      terminationKind: "requested",
+      stopRequestedAt: "2026-08-17T11:00:00.000Z",
+      stopRequester: "cli",
+      stopReason: "operator-requested",
+      stopRunId: run.runId,
+    });
+    expect(await Bun.file(agentStopIntentPath(item.stateDir, "worker-a")).exists()).toBe(false);
+  });
+
+  test("does not apply pending intent to changed starts, runs, or replacement processes", async () => {
+    for (const replacement of [
+      { startedAt: "2026-08-17T10:11:13.000Z" },
+      { pid: 5678 },
+      { runId: `run-${"a".repeat(32)}` },
+    ]) {
+      const item = await fixture();
+      await successfulDispatch(item);
+      const original = (await readAgentState(item.stateDir, "worker-a"))!;
+      await requestAgentStop({
+        cwd: item.root,
+        name: "worker-a",
+        stopRuntime: async () => {
+          await writeAgentState(item.stateDir, {
+            ...original,
+            ...replacement,
+            lifecycle: "failed",
+            outcome: "failed",
+            finishedAt: "2026-08-17T11:00:01.000Z",
+            exitCode: 143,
+            signal: "SIGTERM",
+            terminationKind: "unexpected",
+          });
+        },
+      });
+      const persisted = (await readAgentState(item.stateDir, "worker-a"))!;
+      expect(persisted.lifecycle).toBe("failed");
+      expect(persisted.terminationKind).toBe("unexpected");
+      expect(persisted.expectedSignal).toBeUndefined();
+      expect(await Bun.file(agentStopIntentPath(item.stateDir, "worker-a")).exists()).toBe(false);
+    }
+  });
+
   test("persists matching run and agent intent before stop and classifies 143 as requested stopped", async () => {
     const item = await fixture();
     const run = await successfulDispatch(item);
@@ -335,6 +472,19 @@ describe("intentional shutdown classification", () => {
   });
 
   test("classifies unexpected 143 and stale intent from another run as failed", async () => {
+    const legacyNoIntent = await fixture();
+    await writeLegacyAgent(legacyNoIntent, "legacy-unexpected");
+    await writeFile(join(legacyNoIntent.stateDir, "agents", "legacy-unexpected.json"), `${JSON.stringify({
+      ...legacyAgent(legacyNoIntent, "legacy-unexpected"),
+      finishedAt: "2026-08-17T11:00:01.000Z",
+      exitCode: 143,
+    }, null, 2)}\n`);
+    const legacyFailed = (await readAgentState(legacyNoIntent.stateDir, "legacy-unexpected"))!;
+    expect(legacyFailed.lifecycle).toBe("failed");
+    expect(legacyFailed.terminationKind).toBe("unexpected");
+    expect(legacyFailed.signal).toBe("SIGTERM");
+    expect(legacyFailed.expectedSignal).toBeUndefined();
+
     const noIntent = await fixture();
     await successfulDispatch(noIntent);
     const first = (await readAgentState(noIntent.stateDir, "worker-a"))!;

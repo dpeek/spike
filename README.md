@@ -401,7 +401,11 @@ show Herdr's `done` after completing a turn because it remains available.
 Schema-less agent records created by earlier Spike versions are validated and
 normalized on read (terminal records are migrated eagerly), so existing
 one-shot and Herdr workers remain manageable; unknown schemas and malformed
-legacy records still fail closed.
+legacy records still fail closed. While a stop is in flight, Spike also retains
+a narrow schema-versioned record under `.pi-swarm/agents/stop-intents/`, scoped
+to the worker's start identity and optional run. This lets the stop caller repair
+a legacy launcher's terminal overwrite; the record is removed after terminal
+reconciliation and cannot apply to a replacement process or run.
 
 `remove --force` deletes that agent's persistent clone and network. It does not
 delete `.pi-swarm/shared-pi-state/`. Stop preserves durable runs, tickets,
