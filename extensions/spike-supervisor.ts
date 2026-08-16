@@ -205,6 +205,7 @@ export default function spikeSupervisor(pi: ExtensionAPI) {
       "Use spike_agents send for follow-up work when the supervisor is running inside Herdr.",
       "Publish only after a persistent worker reports that it committed its intended changes and completed verification.",
       "Publication creates a stable review target. Inspect or summarize it, but do not merge it.",
+      "After review, inspect spike ticket history and use spike ticket accept with the exact validated publication head; never edit goal or ticket JSON to advance acceptance.",
     ],
     parameters: Type.Object({
       action: StringEnum(["dispatch_ticket", "dispatch", "send", "read", "publish", "list", "stop", "open"] as const),

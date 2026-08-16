@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import {
+  atomicWrite as atomicWorkflowWrite,
+  durableWrite as durableWorkflowWrite,
+  readJson as readWorkflowJson,
+  ticketResultPath,
+  validateTicketResult,
+  validateWorkflowState,
+  workflowStatePath,
+  type WorkflowState,
+} from "./workflow-state.ts";
 
 export const GOAL_SCHEMA_VERSION = 1;
 export const ACTIVE_GOAL_POINTER_SCHEMA_VERSION = 1;
@@ -73,6 +83,7 @@ export type ReadyTicket = {
 };
 
 export type TicketIssueResult = ReadyTicket & { idempotent: boolean };
+export type { WorkflowState } from "./workflow-state.ts";
 
 type GitResult = { code: number; stdout: Buffer; stderr: string };
 
@@ -318,14 +329,15 @@ export function validateActiveTicketPointer(
 
 export function validateTicketRecord(
   value: unknown,
-  expected: { root: string; goalId: string; goalDirectory: string; acceptedCodeRevision: string },
+  expected: { root: string; goalId: string; goalDirectory: string; acceptedCodeRevision?: string; baseRevision?: string },
 ): TicketRecord {
   const record = requireObject(value, "ticket record");
   if (record.schemaVersion !== TICKET_SCHEMA_VERSION) throw new Error(`unsupported ticket record schema: ${String(record.schemaVersion)}`);
   if (record.goalId !== expected.goalId) throw new Error("ticket record does not match the active goal");
   if (typeof record.ticketId !== "string" || !ticketIdPattern.test(record.ticketId)) throw new Error("ticket record has an invalid ticketId");
   if (record.status !== "ready") throw new Error("ticket record has an invalid status");
-  if (record.baseRevision !== expected.acceptedCodeRevision || typeof record.baseRevision !== "string" || !objectIdPattern.test(record.baseRevision)) {
+  const expectedBase = expected.baseRevision ?? expected.acceptedCodeRevision;
+  if ((expectedBase !== undefined && record.baseRevision !== expectedBase) || typeof record.baseRevision !== "string" || !objectIdPattern.test(record.baseRevision)) {
     throw new Error("ticket record base revision does not match the active goal");
   }
   requireTicketString(record.snapshotSha256, "snapshotSha256", { pattern: /^[0-9a-f]{64}$/ });
@@ -355,7 +367,106 @@ export function validateTicketRecord(
   return record as TicketRecord;
 }
 
-async function loadActiveFromContext(context: GoalContext, allowMissing: boolean): Promise<ActiveGoal | undefined> {
+async function commitIsDescendant(context: GoalContext, base: string, revision: string): Promise<boolean> {
+  const commit = await runGit(context.root, ["cat-file", "-t", revision]);
+  if (commit.code !== 0 || output(commit) !== "commit") return false;
+  return (await runGit(context.root, ["merge-base", "--is-ancestor", base, revision])).code === 0;
+}
+
+async function initialWorkflowState(context: GoalContext, record: GoalRecord): Promise<WorkflowState> {
+  const goalDirectory = join(context.goalsDir, record.goalId);
+  const pointerValue = await readWorkflowJson(join(goalDirectory, "active-ticket.json"), "active ticket pointer", true);
+  let activeTicketId: string | null = null;
+  let transitionedAt = record.activatedAt;
+  if (pointerValue !== undefined) {
+    const pointer = validateActiveTicketPointer(pointerValue, { root: context.root, goalId: record.goalId, goalDirectory });
+    const ticketValue = await readWorkflowJson(join(goalDirectory, "tickets", pointer.ticketId, "record.v1.json"), "active ticket record");
+    const ticket = validateTicketRecord(ticketValue, { root: context.root, goalId: record.goalId, goalDirectory, baseRevision: record.acceptedCodeRevision });
+    activeTicketId = ticket.ticketId;
+    transitionedAt = ticket.issuedAt;
+  }
+  return validateWorkflowState({
+    schemaVersion: 1,
+    goalId: record.goalId,
+    acceptedCodeRevision: record.acceptedCodeRevision,
+    activeTicketId,
+    stateRevision: 1,
+    lastTransitionAt: transitionedAt,
+    ticketOrder: activeTicketId ? [activeTicketId] : [],
+  }, record.goalId);
+}
+
+async function loadWorkflowFromContext(context: GoalContext, record: GoalRecord, readOnly = false): Promise<WorkflowState> {
+  const path = workflowStatePath(context.root, record.goalId);
+  await rejectSymlinkComponents(context.root, path, "workflow state path");
+  let value = await readWorkflowJson(path, "workflow state", true);
+  if (value === undefined) {
+    const initial = await initialWorkflowState(context, record);
+    if (readOnly) value = initial;
+    else {
+      try { await durableWorkflowWrite(path, `${JSON.stringify(initial, null, 2)}\n`); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      value = await readWorkflowJson(path, "workflow state");
+    }
+  }
+  let state = validateWorkflowState(value, record.goalId);
+  if (state.activeTicketId) {
+    const resultPath = ticketResultPath(context.root, record.goalId, state.activeTicketId);
+    const prepared = await readWorkflowJson(resultPath, "prepared ticket result", true);
+    if (prepared !== undefined) {
+      const goalDirectory = join(context.goalsDir, record.goalId);
+      const ticket = validateTicketRecord(
+        await readWorkflowJson(join(goalDirectory, "tickets", state.activeTicketId, "record.v1.json"), "ticket record"),
+        { root: context.root, goalId: record.goalId, goalDirectory, baseRevision: state.acceptedCodeRevision },
+      );
+      const result = validateTicketResult(prepared, { goalId: record.goalId, ticketId: ticket.ticketId, baseRevision: ticket.baseRevision });
+      if (!await commitIsDescendant(context, result.baseRevision, result.acceptedRevision)) {
+        throw new Error(`recoverable acceptance for ${ticket.ticketId} cannot be completed: accepted revision is unavailable or not a descendant of its base`);
+      }
+      // A prepared result cannot bypass run/publication validation merely by
+      // surviving a crash. Revalidate any durable run correlation before the
+      // normal state load completes the transition.
+      const runPointerValue = await readWorkflowJson(join(goalDirectory, "tickets", ticket.ticketId, "active-run.json"), "active run pointer", true);
+      if (runPointerValue !== undefined) {
+        const { validateActiveRunPointer, validateRunRecord } = await import("./runs.ts");
+        const runPointer = validateActiveRunPointer(runPointerValue, { goalId: record.goalId, ticketId: ticket.ticketId });
+        const run = validateRunRecord(await readWorkflowJson(resolveRecordedPath(context.root, runPointer.recordPath, "active run record path"), "active run record"), {
+          goalId: record.goalId, ticketId: ticket.ticketId, baseRevision: ticket.baseRevision, runId: runPointer.runId,
+        });
+        if (!["launch_failed", "stopped", "failed", "completed"].includes(run.status) || result.runId !== run.runId || result.worker?.slug !== run.worker.slug || !result.publication) {
+          throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid run/publication provenance`);
+        }
+        const publicationManifest = await readWorkflowJson(resolveRecordedPath(context.root, result.publication.manifestPath, "result publication manifest path"), "result publication manifest") as Record<string, unknown>;
+        if (publicationManifest.head !== result.acceptedRevision || publicationManifest.base !== ticket.baseRevision || publicationManifest.agent !== run.worker.slug) {
+          throw new Error(`recoverable acceptance for ${ticket.ticketId} has conflicting publication provenance`);
+        }
+        const publicationRef = await runGit(context.root, ["rev-parse", "--verify", `${result.publication.importedRef}^{commit}`]);
+        if (publicationRef.code !== 0 || output(publicationRef) !== result.acceptedRevision) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication ref`);
+        const bundle = resolveRecordedPath(context.root, result.publication.bundlePath, "result publication bundle path");
+        if ((await runGit(context.root, ["bundle", "verify", bundle])).code !== 0) throw new Error(`recoverable acceptance for ${ticket.ticketId} has invalid publication bundle`);
+      } else if (result.runId) throw new Error(`recoverable acceptance for ${ticket.ticketId} references a missing durable run`);
+      if (readOnly) throw new Error(`recoverable acceptance for ${ticket.ticketId} is prepared and requires a normal state load or ticket accept retry`);
+      state = validateWorkflowState({
+        ...state,
+        acceptedCodeRevision: result.acceptedRevision,
+        activeTicketId: null,
+        stateRevision: state.stateRevision + 1,
+        lastTransitionAt: result.acceptedAt,
+      }, record.goalId);
+      await atomicWorkflowWrite(path, `${JSON.stringify(state, null, 2)}\n`);
+      await rm(join(goalDirectory, "active-ticket.json"), { force: true });
+    }
+  }
+  return state;
+}
+
+export async function loadWorkflowState(cwd = process.cwd(), options: { readOnly?: boolean } = {}): Promise<WorkflowState> {
+  const context = await discoverContext(cwd);
+  const active = (await loadActiveFromContext(context, false, options.readOnly))!;
+  return loadWorkflowFromContext(context, active.record, options.readOnly);
+}
+
+async function loadActiveFromContext(context: GoalContext, allowMissing: boolean, readOnly = false): Promise<ActiveGoal | undefined> {
   await rejectSymlinkComponents(context.root, context.stateDir, "Spike state path");
   await rejectSymlinkComponents(context.root, context.goalsDir, "goal state path");
   const pointerPath = join(context.goalsDir, "active.json");
@@ -392,12 +503,18 @@ async function loadActiveFromContext(context: GoalContext, allowMissing: boolean
   if (snapshot.byteLength !== record.snapshotBytes || sha256(snapshot) !== record.snapshotSha256 || gitBlobId(snapshot, record.approvedBlob) !== record.approvedBlob) {
     throw new Error("approved goal snapshot integrity check failed");
   }
-  return { record, snapshot };
+  // The legacy goal record may carry the last pre-workflow accepted revision;
+  // it remains provenance and must still name a real commit even though current
+  // acceptance is now owned by workflow state.
+  await verifyCommitAvailable(context, record.acceptedCodeRevision);
+  const workflow = await loadWorkflowFromContext(context, record, readOnly);
+  await verifyCommitAvailable(context, workflow.acceptedCodeRevision);
+  return { record: { ...record, acceptedCodeRevision: workflow.acceptedCodeRevision }, snapshot };
 }
 
-export async function loadActiveGoal(cwd = process.cwd()): Promise<ActiveGoal> {
+export async function loadActiveGoal(cwd = process.cwd(), options: { readOnly?: boolean } = {}): Promise<ActiveGoal> {
   const context = await discoverContext(cwd);
-  return (await loadActiveFromContext(context, false))!;
+  return (await loadActiveFromContext(context, false, options.readOnly))!;
 }
 
 async function ensureStateDirectories(context: GoalContext): Promise<void> {
@@ -577,20 +694,28 @@ async function loadReadyFromContext(
   allowMissing: boolean,
 ): Promise<ReadyTicket | undefined> {
   const goalDirectory = join(context.goalsDir, active.record.goalId);
+  const workflow = await loadWorkflowFromContext(context, active.record);
   const pointerPath = join(goalDirectory, "active-ticket.json");
   await rejectSymlinkComponents(context.root, pointerPath, "active ticket pointer path");
-  try {
-    await access(pointerPath, constants.F_OK);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" && allowMissing) return undefined;
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("no ready ticket; issue one with spike ticket issue <ticket-file>");
-    throw error;
+  const pointerValue = await readWorkflowJson(pointerPath, "active ticket pointer", true);
+  // A stale compatibility pointer is never authoritative, but malformed state
+  // still fails closed rather than being hidden by the workflow record.
+  if (!workflow.activeTicketId) {
+    if (pointerValue !== undefined) validateActiveTicketPointer(pointerValue, { root: context.root, goalId: active.record.goalId, goalDirectory });
+    if (allowMissing) return undefined;
+    throw new Error("no ready ticket; issue one with spike ticket issue <ticket-file>");
   }
-  const pointer = validateActiveTicketPointer(await readSmallJson(pointerPath, "active ticket pointer", MAX_RECORD_BYTES), {
+  const pointer = pointerValue === undefined ? {
+    schemaVersion: ACTIVE_TICKET_POINTER_SCHEMA_VERSION,
+    goalId: active.record.goalId,
+    ticketId: workflow.activeTicketId,
+    recordPath: `.pi-swarm/goals/${active.record.goalId}/tickets/${workflow.activeTicketId}/record.v1.json`,
+  } as ActiveTicketPointer : validateActiveTicketPointer(pointerValue, {
     root: context.root,
     goalId: active.record.goalId,
     goalDirectory,
   });
+  if (pointer.ticketId !== workflow.activeTicketId) throw new Error("active ticket pointer is inconsistent with workflow state");
   const ticketDirectory = join(goalDirectory, "tickets", pointer.ticketId);
   const recordPath = resolveRecordedPath(context.root, pointer.recordPath, "active ticket record path", ticketDirectory);
   await rejectSymlinkComponents(context.root, ticketDirectory, "active ticket directory");
@@ -885,6 +1010,18 @@ export async function issueTicket(options: { ticketFile: string; cwd?: string; n
     const { ticketsDirectory, workerTicketsDirectory } = await ensureTicketStateDirectories(context, active.record.goalId);
     await installWorkerCopy(context, candidate, input.snapshot, workerTicketsDirectory);
     const installedRecord = await installTicketRecord(context, currentActive, candidate, input.snapshot, ticketsDirectory);
+    const workflow = await loadWorkflowFromContext(context, currentActive.record);
+    if (workflow.acceptedCodeRevision !== installedRecord.baseRevision || workflow.activeTicketId !== null) {
+      throw new Error("workflow state changed during ticket issuance; retry");
+    }
+    const transitioned = validateWorkflowState({
+      ...workflow,
+      activeTicketId: installedRecord.ticketId,
+      stateRevision: workflow.stateRevision + 1,
+      lastTransitionAt: installedRecord.issuedAt,
+      ticketOrder: [...workflow.ticketOrder, installedRecord.ticketId],
+    }, currentActive.record.goalId);
+    await atomicWorkflowWrite(workflowStatePath(context.root, currentActive.record.goalId), `${JSON.stringify(transitioned, null, 2)}\n`);
     const pointer: ActiveTicketPointer = {
       schemaVersion: ACTIVE_TICKET_POINTER_SCHEMA_VERSION,
       goalId: currentActive.record.goalId,

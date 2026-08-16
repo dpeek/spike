@@ -199,10 +199,44 @@ checking both `spike ticket status --json` and `spike run status --json` first.
 The existing `dispatch` action remains available only for free-form work not
 represented by a durable ready ticket.
 
+## Accept and inspect ticket history
+
+After the worker run is terminal and its latest publication has been reviewed,
+accept the exact published commit:
+
+```bash
+spike ticket accept --revision <commit> --review planner \
+  --statement "Reviewed the published implementation"
+spike ticket history
+spike ticket history --json
+spike goal status
+```
+
+Acceptance verifies ancestry, rejects nonterminal runs, and requires a
+correlated worker's latest validated publication head. It writes an immutable
+result before atomically advancing per-goal workflow state. An interrupted
+transition is completed by a retry or normal state load. Repeating the exact
+acceptance is idempotent; conflicting terminal results fail closed. Ticket
+snapshots and issuance records are never rewritten.
+
+Workflow state owns the accepted revision, active ticket, monotonic state
+revision, transition time, and explicit issuance order. Existing pre-workflow
+goal records are upgraded on normal load. Inspect state and local evidence with:
+
+```bash
+spike workflow doctor
+spike workflow doctor --json
+spike workflow migrate-bootstrap          # deterministic, read-only plan
+spike workflow migrate-bootstrap --apply  # only after reviewing the plan
+```
+
+Bootstrap migration imports only independently verifiable records and writes a
+versioned receipt before legacy evidence is considered migrated. Unknown or
+conflicting layouts are retained and reported rather than guessed.
+
 Current workflow limitations remain intentional: Spike does not parse a
-structured completion report, accept/remediate/cancel/complete the ticket,
-advance the goal's accepted revision, remove the active-ticket pointer, retry a
-failed launch, or associate detached one-shot work with runs.
+structured completion report, remediate/cancel a ticket, retry a failed launch,
+or associate detached one-shot work with durable runs.
 
 ## Build and start services
 

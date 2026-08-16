@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { activateGoal, issueTicket, loadActiveGoal, loadReadyTicket, type GoalRecord, type TicketRecord } from "./goals.ts";
+import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor, type TicketHistoryEntry } from "./workflow.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
 import {
   agentStatePath,
@@ -51,6 +52,10 @@ Usage:
   spike ticket status [--json]
   spike ticket show
   spike ticket dispatch <worker-name> [--model <model>] [--thinking <level>]
+  spike ticket accept --revision <commit> --review <planner|hunk> [--statement <text>]
+  spike ticket history [--json]
+  spike workflow migrate-bootstrap [--apply]
+  spike workflow doctor [--json]
   spike run status [--json]
   spike agent run <name> [pi arguments...]
   spike agent run <name> -- <command> [arguments...]
@@ -274,6 +279,29 @@ function printTicketStatus(record: TicketRecord) {
   console.log(`Worker-visible path: ${record.workerPath}`);
 }
 
+function printHistoryEntry(entry: TicketHistoryEntry) {
+  const provenance = entry.result?.runId ? ` run=${entry.result.runId}` : entry.result?.publication ? ` publication=${entry.result.publication.head}` : "";
+  console.log(`${entry.issuance}. ${entry.ticket.ticketId} ${entry.status} base=${entry.ticket.baseRevision}${entry.result ? ` accepted=${entry.result.acceptedRevision}` : ""}${provenance}`);
+}
+
+function parseAcceptOptions(args: string[]): { revision: string; review: "planner" | "hunk"; statement?: string } {
+  let revision: string | undefined;
+  let review: string | undefined;
+  let statement: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    if (!["--revision", "--review", "--statement"].includes(flag)) fail(`unknown ticket accept option: ${flag}`, 2);
+    if (index + 1 >= args.length) fail(`ticket accept requires ${flag} <value>`, 2);
+    const value = args[++index];
+    if (flag === "--revision") { if (revision !== undefined) fail("ticket accept accepts --revision only once", 2); revision = value; }
+    if (flag === "--review") { if (review !== undefined) fail("ticket accept accepts --review only once", 2); review = value; }
+    if (flag === "--statement") { if (statement !== undefined) fail("ticket accept accepts --statement only once", 2); statement = value; }
+  }
+  if (!revision) fail("ticket accept requires --revision <commit>", 2);
+  if (review !== "planner" && review !== "hunk") fail("ticket accept requires --review <planner|hunk>", 2);
+  return { revision, review, ...(statement !== undefined ? { statement } : {}) };
+}
+
 function parseDispatchOptions(args: string[]): { workerName: string; model?: string; thinking?: string } {
   let workerName: string | undefined;
   let model: string | undefined;
@@ -380,7 +408,19 @@ async function ticketCommand(action: string | undefined, args: string[]) {
       console.log(JSON.stringify(record, null, 2));
       return;
     }
-    fail("expected ticket issue, status, show, or dispatch", 2);
+    if (action === "accept") {
+      const result = await acceptTicket(parseAcceptOptions(args));
+      console.log(`${result.idempotent ? "Already accepted" : "Accepted"} ticket ${result.result.ticketId} at ${result.result.acceptedRevision}`);
+      return;
+    }
+    if (action === "history") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("ticket history accepts only --json", 2);
+      const history = await ticketHistory();
+      if (args.includes("--json")) console.log(JSON.stringify(history, null, 2));
+      else history.forEach(printHistoryEntry);
+      return;
+    }
+    fail("expected ticket issue, status, show, dispatch, accept, or history", 2);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
@@ -423,6 +463,34 @@ async function runCommand(action: string | undefined, args: string[]) {
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
+}
+
+async function workflowCommand(action: string | undefined, args: string[]) {
+  try {
+    if (action === "migrate-bootstrap") {
+      if (args.some((argument) => argument !== "--apply") || args.filter((argument) => argument === "--apply").length > 1) fail("workflow migrate-bootstrap accepts only --apply", 2);
+      const plan = await migrateBootstrap({ apply: args.includes("--apply") });
+      console.log(JSON.stringify(plan, null, 2));
+      if (plan.errors.length) process.exitCode = 1;
+      return;
+    }
+    if (action === "doctor") {
+      if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("workflow doctor accepts only --json", 2);
+      const report = await workflowDoctor();
+      if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
+      else {
+        console.log(`Workflow: ${report.ok ? "ok" : "errors"}`);
+        if (report.summary.goalId) console.log(`Goal: ${report.summary.goalId}`);
+        if (report.summary.acceptedCodeRevision) console.log(`Accepted revision: ${report.summary.acceptedCodeRevision}`);
+        console.log(`Tickets: ${report.summary.tickets}; results: ${report.summary.results}`);
+        report.warnings.forEach((warning) => console.log(`WARNING: ${warning}`));
+        report.errors.forEach((error) => console.log(`ERROR: ${error}`));
+      }
+      if (!report.ok) process.exitCode = 1;
+      return;
+    }
+    fail("expected workflow migrate-bootstrap or doctor", 2);
+  } catch (error) { fail(error instanceof Error ? error.message : String(error)); }
 }
 
 async function runtimeFor(config: Config): Promise<Runtime> {
@@ -872,7 +940,21 @@ async function persistentAgent(name: string | undefined, args: string[]) {
     ...(process.env.SPIKE_BASE_REVISION ? { SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION } : {}),
   };
   const assignments = Object.entries(environment).map(([key, value]) => `${key}=${shellQuote(value)}`);
-  const command = ["env", ...assignments, shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))), "agent", "run", shellQuote(agent), ...piArgs.map(shellQuote)].join(" ");
+  // Herdr transports pane commands through a bounded command field. Durable
+  // ticket IDs plus the worker-visible path can push an inline invocation over
+  // that boundary and silently truncate the final prompt. Keep the pane command
+  // short and put the exact, shell-quoted invocation in a durable launch file.
+  const launchDirectory = join(context.stateDir, "launch");
+  await mkdir(launchDirectory, { recursive: true });
+  const launchIdentity = process.env.SPIKE_RUN_ID ?? crypto.randomUUID();
+  const launchPath = join(launchDirectory, `${launchIdentity}.sh`);
+  const invocation = ["exec", "env", ...assignments, shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))), "agent", "run", shellQuote(agent), ...piArgs.map(shellQuote)].join(" ");
+  const script = `#!/bin/sh\n${invocation}\n`;
+  try { await writeFile(launchPath, script, { flag: "wx", mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readFile(launchPath, "utf8") !== script) throw error;
+  }
+  const command = `sh ${shellQuote(launchPath)}`;
   const launched = await capture(["herdr", "pane", "run", placement.paneId, command]);
   if (launched.code !== 0) fail(`Herdr could not launch ${agent}: ${launched.stderr || launched.stdout}`);
   await waitForHerdrAgent(placement.paneId);
@@ -1096,6 +1178,7 @@ else if (command === "supervisor" || command === "start") await supervisor(args)
 else if (command === "herdr") await herdrCommand(args.shift());
 else if (command === "goal") await goalCommand(args.shift(), args);
 else if (command === "ticket") await ticketCommand(args.shift(), args);
+else if (command === "workflow") await workflowCommand(args.shift(), args);
 else if (command === "run") await runCommand(args.shift(), args);
 else if (command === "down") await down();
 else if (command === "agent") {
