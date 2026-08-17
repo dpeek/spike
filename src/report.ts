@@ -13,7 +13,12 @@ import {
 import { normalizeCandidate, retainCandidate, withImportedWorkerRevision } from "./git-change.ts";
 import { discoverRepository } from "./git.ts";
 import { loadTicket, reportPath } from "./ticket.ts";
-import { ticketOutputPath, type LocalCloneExecution, type TicketIdentity } from "./worker.ts";
+import {
+  forgetFinalizedWorker,
+  ticketOutputPath,
+  type LocalCloneExecution,
+  type TicketIdentity,
+} from "./worker.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -177,6 +182,14 @@ export type PublishReviewReportInput = TicketIdentity & {
 };
 
 export type PublishFailedReportInput = TicketIdentity & {
+  cwd: string;
+  role: "implement" | "review";
+  reason: string;
+  execution: LocalCloneExecution;
+  now?: Date;
+};
+
+export type PublishInterruptedReportInput = TicketIdentity & {
   cwd: string;
   role: "implement" | "review";
   reason: string;
@@ -430,9 +443,9 @@ function executionMetadata(execution: LocalCloneExecution): z.infer<typeof execu
   return metadata;
 }
 
-function requireFailureReason(reason: string): string {
+function requireTerminalReason(reason: string, outcome: "Failure" | "Interruption"): string {
   const normalized = reason.trim();
-  if (!normalized) throw new Error("Failure reason must not be blank");
+  if (!normalized) throw new Error(`${outcome} reason must not be blank`);
   return normalized;
 }
 
@@ -617,7 +630,7 @@ export async function publishFailedReport(
   }
   matchingExecution(input.execution, identity, false);
   const execution = executionMetadata(input.execution);
-  const reason = requireFailureReason(input.reason);
+  const reason = requireTerminalReason(input.reason, "Failure");
   const metadata = terminalReportSchema.parse({
     kind: "report",
     goalId: input.goalId,
@@ -632,6 +645,44 @@ export async function publishFailedReport(
   const body = `# Ticket failed\n\n${reason}\n`;
   const report = { metadata, body };
 
+  await installImmutable(repository.root, path, serializeDocument(metadata, body));
+  await forgetFinalizedWorker(repository.root, identity);
+  return { root: repository.root, report };
+}
+
+export async function publishInterruptedReport(
+  input: PublishInterruptedReportInput,
+): Promise<{ root: string; report: TerminalReport }> {
+  const repository = await discoverRepository(input.cwd);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.root, path)) {
+    throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
+  }
+
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (input.role !== ticket.metadata.role) {
+    throw new Error(`interrupted Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
+  }
+  matchingExecution(input.execution, identity, false);
+  if (input.execution.isolation !== ticket.metadata.executionPolicy.isolation) {
+    throw new Error("interrupted Report execution isolation does not match its Ticket execution policy");
+  }
+  const execution = executionMetadata(input.execution);
+  const reason = requireTerminalReason(input.reason, "Interruption");
+  const metadata = terminalReportSchema.parse({
+    kind: "report",
+    goalId: input.goalId,
+    changeId: input.changeId,
+    ticketId: input.ticketId,
+    role: input.role,
+    outcome: "interrupted",
+    publishedAt: (input.now ?? new Date()).toISOString(),
+    artifacts: [],
+    execution,
+  });
+  const body = `# Ticket interrupted\n\n${reason}\n`;
+  const report = { metadata, body };
   await installImmutable(repository.root, path, serializeDocument(metadata, body));
   return { root: repository.root, report };
 }
@@ -704,6 +755,7 @@ export async function publishImplementationReport(
 
       await retainCandidate(repository.root, input.goalId, input.changeId, input.ticketId, candidateRevision);
       await installImmutable(repository.root, path, serializeDocument(metadata, submission.body));
+      await forgetFinalizedWorker(repository.root, identity);
       return { root: repository.root, report };
     },
   );
@@ -772,5 +824,6 @@ export async function publishReviewReport(
   });
   const report = { metadata, body: submission.body };
   await installImmutable(repository.root, path, serializeDocument(metadata, submission.body));
+  await forgetFinalizedWorker(repository.root, identity);
   return { root: repository.root, report };
 }

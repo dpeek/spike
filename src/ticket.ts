@@ -31,6 +31,7 @@ const commonTicketSchema = z.object({
   ticketId: z.string().regex(sequenceIdPattern),
   issuedAt: timestamp,
   inputRevision: z.string().regex(revisionPattern),
+  replacesTicketId: z.string().regex(sequenceIdPattern).optional(),
   executionPolicy: executionPolicySchema,
 });
 const ticketSchema = z.discriminatedUnion("role", [
@@ -73,6 +74,14 @@ export type IssueTicketInput = {
 export type IssuedTicket = {
   root: string;
   ticket: Ticket;
+};
+
+export type IssueReplacementTicketInput = {
+  cwd: string;
+  goalId: string;
+  changeId: string;
+  interruptedTicketId: string;
+  now?: Date;
 };
 
 function ticketsPath(root: string, goalId: string, changeId: string): string {
@@ -168,6 +177,122 @@ export async function ticketStatus(
 ): Promise<TicketStatus> {
   await loadTicket(root, goalId, changeId, ticketId);
   return (await loadReportIfPresent(root, goalId, changeId, ticketId)) === undefined ? "open" : "reported";
+}
+
+export async function loadReplacementTicketIfPresent(
+  root: string,
+  goalId: string,
+  changeId: string,
+  interruptedTicketId: string,
+): Promise<Ticket | undefined> {
+  let replacement: Ticket | undefined;
+  for (const ticketId of await allocatedTicketIds(root, goalId, changeId)) {
+    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    const ticket = await loadTicket(root, goalId, changeId, ticketId);
+    if (ticket.metadata.replacesTicketId !== interruptedTicketId) continue;
+    if (replacement !== undefined) {
+      throw new Error(`Ticket ${goalId}/${changeId}/${interruptedTicketId} has more than one replacement`);
+    }
+    replacement = ticket;
+  }
+  return replacement;
+}
+
+export async function issueReplacementTicket(input: IssueReplacementTicketInput): Promise<IssuedTicket> {
+  const repository = await discoverRepository(input.cwd);
+  const [change, interrupted] = await Promise.all([
+    loadChange(repository.root, input.goalId, input.changeId),
+    loadTicket(repository.root, input.goalId, input.changeId, input.interruptedTicketId),
+  ]);
+  if ((await changeStatus(repository.root, input.goalId, input.changeId)) === "resolved") {
+    throw new Error(`Change ${input.goalId}/${input.changeId} is resolved`);
+  }
+  const interruptedReport = await loadReportIfPresent(
+    repository.root,
+    input.goalId,
+    input.changeId,
+    input.interruptedTicketId,
+  );
+  if (interruptedReport === undefined) {
+    throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.interruptedTicketId} is still open`);
+  }
+  if (interruptedReport.metadata.outcome !== "interrupted") {
+    throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.interruptedTicketId} was not interrupted`);
+  }
+
+  const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  const inputRevision = candidate?.candidateRevision ?? change.metadata.baseRevision;
+  if (interrupted.metadata.inputRevision !== inputRevision) {
+    throw new Error("interrupted Ticket does not start from the latest committed Candidate or Change base");
+  }
+  if (interrupted.metadata.role === "review") {
+    if (
+      candidate === undefined ||
+      interrupted.metadata.producingImplementationTicketId !== candidate.producingImplementationTicketId
+    ) {
+      throw new Error("interrupted review Ticket does not select the latest committed Candidate");
+    }
+  } else if (candidate !== undefined) {
+    const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
+    if (
+      remediation === undefined ||
+      interrupted.metadata.remediationReviewTicketId !== remediation.reviewTicketId ||
+      remediation.candidateRevision !== inputRevision
+    ) {
+      throw new Error("interrupted implementation Ticket does not select the latest committed remediation context");
+    }
+  }
+
+  const existing = await loadReplacementTicketIfPresent(
+    repository.root,
+    input.goalId,
+    input.changeId,
+    input.interruptedTicketId,
+  );
+  if (existing !== undefined) {
+    if (
+      existing.metadata.role !== interrupted.metadata.role ||
+      existing.metadata.inputRevision !== inputRevision ||
+      JSON.stringify(existing.metadata.executionPolicy) !== JSON.stringify(interrupted.metadata.executionPolicy) ||
+      existing.body !== interrupted.body
+    ) {
+      throw new Error("existing replacement Ticket does not reproduce the interrupted assignment");
+    }
+    if (
+      existing.metadata.role === "review" &&
+      (interrupted.metadata.role !== "review" ||
+        existing.metadata.producingImplementationTicketId !== interrupted.metadata.producingImplementationTicketId)
+    ) {
+      throw new Error("existing replacement review Ticket selects different implementation provenance");
+    }
+    if (
+      existing.metadata.role === "implement" &&
+      (interrupted.metadata.role !== "implement" ||
+        existing.metadata.remediationReviewTicketId !== interrupted.metadata.remediationReviewTicketId)
+    ) {
+      throw new Error("existing replacement implementation Ticket selects different remediation provenance");
+    }
+    return { root: repository.root, ticket: existing };
+  }
+
+  const currentOpenTicket = await openTicketId(repository.root, input.goalId, input.changeId);
+  if (currentOpenTicket !== undefined) {
+    throw new Error(`Change ${input.goalId}/${input.changeId} already has open Ticket ${currentOpenTicket}`);
+  }
+  const ticketId = nextTicketId(await allocatedTicketIds(repository.root, input.goalId, input.changeId));
+  const metadata = ticketSchema.parse({
+    ...interrupted.metadata,
+    ticketId,
+    issuedAt: (input.now ?? new Date()).toISOString(),
+    inputRevision,
+    replacesTicketId: input.interruptedTicketId,
+  });
+  await installImmutable(
+    repository.root,
+    ticketPath(repository.root, input.goalId, input.changeId, ticketId),
+    serializeDocument(metadata, interrupted.body),
+  );
+  return { root: repository.root, ticket: { metadata, body: interrupted.body } };
 }
 
 export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket> {
