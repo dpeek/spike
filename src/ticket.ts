@@ -11,7 +11,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { loadGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
-import { deriveCurrentCandidate } from "./report.ts";
+import { deriveCurrentCandidate, deriveCurrentRemediation } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -34,7 +34,12 @@ const commonTicketSchema = z.object({
   executionPolicy: executionPolicySchema,
 });
 const ticketSchema = z.discriminatedUnion("role", [
-  commonTicketSchema.extend({ role: z.literal("implement") }).strict(),
+  commonTicketSchema
+    .extend({
+      role: z.literal("implement"),
+      remediationReviewTicketId: z.string().regex(sequenceIdPattern).optional(),
+    })
+    .strict(),
   commonTicketSchema
     .extend({
       role: z.literal("review"),
@@ -59,6 +64,7 @@ export type IssueTicketInput = {
   role?: "implement" | "review";
   inputRevision?: string;
   producingImplementationTicketId?: string;
+  remediationReviewTicketId?: string;
   instruction: string;
   curatedContext?: string;
   executionPolicy: ExecutionPolicy;
@@ -116,7 +122,7 @@ function ticketBody(
   changeBody: string,
   planBody: string,
   context?: string,
-  producingReport?: string,
+  relevantReport?: { heading: string; document: string },
 ): string {
   return `# ${role === "implement" ? "Implement Change" : "Review Candidate"}
 
@@ -142,7 +148,7 @@ ${planBody.trimEnd()}
 
 ${context === undefined || !context.trim() ? "None." : context.trim()}
 
-${producingReport === undefined ? "" : `### Producing implementation Report\n\n${producingReport.trimEnd()}\n`}`;
+${relevantReport === undefined ? "" : `### ${relevantReport.heading}\n\n${relevantReport.document.trimEnd()}\n`}`;
 }
 
 export async function loadTicket(root: string, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
@@ -190,7 +196,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   const role = input.role ?? "implement";
   let requestedRevision: string;
   let producingImplementationTicketId: string | undefined;
-  let producingReport: string | undefined;
+  let remediationReviewTicketId: string | undefined;
+  let relevantReport: { heading: string; document: string } | undefined;
   if (role === "review") {
     const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
     if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
@@ -206,13 +213,45 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
       );
     }
     requestedRevision = candidate.candidateRevision;
+    if (input.remediationReviewTicketId !== undefined) {
+      throw new Error("review Ticket must not reference a remediation review Ticket");
+    }
     producingImplementationTicketId = candidate.producingImplementationTicketId;
-    producingReport = serializeDocument(candidate.report.metadata, candidate.report.body);
+    relevantReport = {
+      heading: "Producing implementation Report",
+      document: serializeDocument(candidate.report.metadata, candidate.report.body),
+    };
   } else {
     if (input.producingImplementationTicketId !== undefined) {
       throw new Error("implement Ticket must not reference a producing implementation Ticket");
     }
-    requestedRevision = input.inputRevision ?? change.metadata.baseRevision;
+    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    if (candidate === undefined) {
+      if (input.remediationReviewTicketId !== undefined) {
+        throw new Error("initial implement Ticket must not reference a remediation review Ticket");
+      }
+      requestedRevision = input.inputRevision ?? change.metadata.baseRevision;
+    } else {
+      if (input.inputRevision !== undefined && input.inputRevision !== candidate.candidateRevision) {
+        throw new Error(`remediation implement Ticket must use current Candidate ${candidate.candidateRevision}`);
+      }
+      const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
+      if (remediation === undefined) {
+        throw new Error(`current Candidate ${candidate.candidateRevision} has no exact remediate review Report`);
+      }
+      if (
+        input.remediationReviewTicketId !== undefined &&
+        input.remediationReviewTicketId !== remediation.reviewTicketId
+      ) {
+        throw new Error(`remediation implement Ticket must use remediate review Ticket ${remediation.reviewTicketId}`);
+      }
+      requestedRevision = remediation.candidateRevision;
+      remediationReviewTicketId = remediation.reviewTicketId;
+      relevantReport = {
+        heading: "Remediation review Report",
+        document: serializeDocument(remediation.reviewReport.metadata, remediation.reviewReport.body),
+      };
+    }
   }
   if (!revisionPattern.test(requestedRevision)) throw new Error("Ticket input revision must be an exact commit hash");
   const inputRevision = await git(repository.root, ["rev-parse", "--verify", `${requestedRevision}^{commit}`]);
@@ -229,8 +268,9 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     inputRevision,
     executionPolicy: policy,
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
+    ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),
   });
-  const body = ticketBody(role, instruction, goal.body, change.body, plan.body, input.curatedContext, producingReport);
+  const body = ticketBody(role, instruction, goal.body, change.body, plan.body, input.curatedContext, relevantReport);
 
   await installImmutable(
     repository.root,

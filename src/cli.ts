@@ -31,6 +31,7 @@ Ticket issuance options:
   --role <role>                  implement (default) or review
   --input-revision <commit>       Exact commit; review must use the current Candidate
   --implementation-ticket <id>   Producing Ticket; derived for review when omitted
+  --remediation-review <id>       Remediate review Ticket; derived for implementation
   --context <context>             Additional planner-curated context
   --isolation <level>             workspace (default) or container
   --network-access <access>       none (default), restricted, or unrestricted
@@ -152,6 +153,7 @@ function parseTicketIssue(args: string[]): {
   role: "implement" | "review";
   inputRevision?: string;
   producingImplementationTicketId?: string;
+  remediationReviewTicketId?: string;
   executionPolicy: ExecutionPolicy;
 } {
   let goalId: string | undefined;
@@ -160,6 +162,7 @@ function parseTicketIssue(args: string[]): {
   let curatedContext: string | undefined;
   let inputRevision: string | undefined;
   let producingImplementationTicketId: string | undefined;
+  let remediationReviewTicketId: string | undefined;
   let role: "implement" | "review" = "implement";
   let isolation: ExecutionPolicy["isolation"] = "workspace";
   let networkAccess: ExecutionPolicy["networkAccess"] = "none";
@@ -191,6 +194,9 @@ function parseTicketIssue(args: string[]): {
       case "--implementation-ticket":
         producingImplementationTicketId = value;
         break;
+      case "--remediation-review":
+        remediationReviewTicketId = value;
+        break;
       case "--isolation":
         if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
         isolation = value;
@@ -221,6 +227,7 @@ function parseTicketIssue(args: string[]): {
     ...(curatedContext === undefined ? {} : { curatedContext }),
     ...(inputRevision === undefined ? {} : { inputRevision }),
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
+    ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),
   };
 }
 

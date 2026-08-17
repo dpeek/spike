@@ -132,6 +132,11 @@ export type CurrentCandidate = {
   report: ImplementationReport;
 };
 
+export type CurrentRemediation = CurrentCandidate & {
+  reviewTicketId: string;
+  reviewReport: ReviewReport;
+};
+
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
   execution: LocalCloneExecution;
@@ -436,6 +441,61 @@ export async function deriveCurrentCandidate(
   return undefined;
 }
 
+export async function deriveCurrentRemediation(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<CurrentRemediation | undefined> {
+  const candidate = await deriveCurrentCandidate(root, goalId, changeId);
+  if (candidate === undefined) return undefined;
+
+  const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
+  const ticketIds = (await listDirectoryNames(root, ticketsDirectory))
+    .filter((name) => sequenceIdPattern.test(name))
+    .sort()
+    .reverse();
+  for (const ticketId of ticketIds) {
+    const path = reportPath(root, goalId, changeId, ticketId);
+    if (!(await documentExists(root, path))) continue;
+    const document = await readDocument(root, path);
+    const metadata = document.metadata as Record<string, unknown>;
+    if (metadata["role"] !== "review" || metadata["outcome"] !== "completed") continue;
+
+    const [reviewReport, reviewTicket] = await Promise.all([
+      loadReviewReport(root, goalId, changeId, ticketId),
+      loadTicket(root, goalId, changeId, ticketId),
+    ]);
+    if (
+      reviewTicket.metadata.role !== "review" ||
+      reviewTicket.metadata.inputRevision !== reviewReport.metadata.reviewedRevision ||
+      reviewTicket.metadata.producingImplementationTicketId !==
+        reviewReport.metadata.producingImplementationTicketId
+    ) {
+      throw new Error(`review Report ${goalId}/${changeId}/${ticketId} does not match its Ticket Candidate selection`);
+    }
+
+    const producingReport = await loadImplementationReport(
+      root,
+      goalId,
+      changeId,
+      reviewReport.metadata.producingImplementationTicketId,
+    );
+    if (producingReport.metadata.candidateRevision !== reviewReport.metadata.reviewedRevision) {
+      throw new Error(
+        `review Report ${goalId}/${changeId}/${ticketId} Candidate does not match its producing implementation Report`,
+      );
+    }
+    if (
+      reviewReport.metadata.verdict === "remediate" &&
+      reviewReport.metadata.reviewedRevision === candidate.candidateRevision &&
+      reviewReport.metadata.producingImplementationTicketId === candidate.producingImplementationTicketId
+    ) {
+      return { ...candidate, reviewTicketId: ticketId, reviewReport };
+    }
+  }
+  return undefined;
+}
+
 export async function publishImplementationReport(
   input: PublishImplementationReportInput,
 ): Promise<{ root: string; report: ImplementationReport }> {
@@ -452,6 +512,23 @@ export async function publishImplementationReport(
     loadChange(repository.root, input.goalId, input.changeId),
   ]);
   if (ticket.metadata.role !== "implement") throw new Error("implementation Report requires an implement Ticket");
+
+  const currentCandidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  if (ticket.metadata.remediationReviewTicketId === undefined) {
+    if (currentCandidate !== undefined) {
+      throw new Error("implementation Ticket omits the current Candidate's remediate review Report");
+    }
+  } else {
+    const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
+    if (
+      remediation === undefined ||
+      ticket.metadata.inputRevision !== remediation.candidateRevision ||
+      ticket.metadata.remediationReviewTicketId !== remediation.reviewTicketId
+    ) {
+      throw new Error("implementation Ticket does not select the current Candidate and its exact remediate review Report");
+    }
+  }
+
   const outputDirectory = ticketOutputPath(repository.root, identity);
   const submission = await validateImplementationSubmission(repository.root, outputDirectory, identity);
   const message = requireCommitMessage(input.commitMessage, identity);
