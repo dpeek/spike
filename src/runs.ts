@@ -1063,12 +1063,6 @@ async function validateWorkerReportEvidence(stateDir: string, run: RunRecord, re
 }
 
 export async function validateCompletionReportGitEvidence(root: string, run: RunRecord, report: CompletionReport): Promise<void> {
-  const published = await spawnEvidence(["git", "-C", root, "rev-parse", "--verify", `refs/spike/agents/${run.worker.slug}^{commit}`]);
-  const retainedByPublication = published.code === 0 && (await spawnEvidence(["git", "-C", root, "merge-base", "--is-ancestor", report.resultingRevision, published.stdout])).code === 0;
-  if (!retainedByPublication) {
-    await validateWorkerReportEvidence(join(root, ".pi-swarm"), run, report);
-    return;
-  }
   const hostGit: GitEvidenceRunner = async (args) => await spawnEvidence(["git", "-C", root, ...args]);
   try { await validateGitReportEvidence(report, hostGit, "host"); }
   catch (error) {
@@ -1176,7 +1170,11 @@ export async function importCompletionReport(cwd = process.cwd()): Promise<{ rep
     const current = validateCompletionReport(parseCompletionReport(storedBytes, "completion report"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
     if (canonicalCompletionReport(current) !== canonicalCompletionReport(report)) {
       const active = await loadRunFromContext(ctx);
-      if (active.report?.schemaVersion !== 1 || active.report.path !== `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json` || current.outcome !== report.outcome) throw new Error("completion report already exists with conflicting content");
+      if (!active.report || (active.report.schemaVersion !== 1 && active.report.schemaVersion !== 2) || active.report.path !== `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json` || current.outcome !== report.outcome) throw new Error("completion report already exists with conflicting content");
+      if (active.report.schemaVersion === 2) {
+        if (active.report.sha256 !== completionReportDigest(storedBytes) || active.report.byteLength !== storedBytes.byteLength) throw new Error("completion report integrity provenance does not match stored bytes");
+        if (current.resultingRevision === report.resultingRevision) throw new Error("completion report already exists with conflicting content");
+      }
       await validateReportEvidence(ctx.root, run, current);
       await validateSupersedingRevision(ctx.root, run, current.resultingRevision, report.resultingRevision);
       const supersedes = { path: active.report.path, sha256: completionReportDigest(storedBytes), byteLength: storedBytes.byteLength, resultingRevision: current.resultingRevision };

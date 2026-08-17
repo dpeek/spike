@@ -1157,14 +1157,14 @@ describe("intentional shutdown classification", () => {
 });
 
 describe("durable completion reports", () => {
-  test("imports immutable validated evidence and rejects conflicting replacement", async () => {
+  test("validates host-reachable evidence without a publication ref or live worker and rejects conflicting replacement", async () => {
     const item = await fixture();
     const run = await successfulDispatch(item);
     await writeFile(join(item.root, "implementation.txt"), "done\n");
     await must(["git", "add", "implementation.txt"], item.root);
     await must(["git", "commit", "-m", "implementation"], item.root);
     const head = await must(["git", "rev-parse", "HEAD"], item.root);
-    await must(["git", "update-ref", "refs/spike/agents/worker-a", head], item.root);
+    expect((await execute(["git", "rev-parse", "--verify", "refs/spike/agents/worker-a"], item.root)).code).not.toBe(0);
     const artifactPath = `.pi-swarm/output/artifacts/${run.runId}/verification.txt`;
     await writeFile(join(item.root, artifactPath), "verified\n");
     const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
@@ -1194,7 +1194,40 @@ describe("durable completion reports", () => {
     expect(await must(["git", "status", "--porcelain=v1"], item.root)).toBe(before);
     report.summary = "conflicting replacement";
     await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
-    await expect(importCompletionReport(item.root)).rejects.toThrow("conflicting");
+    await expect(importCompletionReport(item.root)).rejects.toThrow("integrity provenance");
+  });
+
+  test("supersedes an integrity-provenanced imported report append-only at a descendant head", async () => {
+    const item = await fixture();
+    const run = await successfulDispatch(item);
+    await writeFile(join(item.root, "first.txt"), "first\n");
+    await must(["git", "add", "first.txt"], item.root);
+    await must(["git", "commit", "-m", "first report result"], item.root);
+    const first = await must(["git", "rev-parse", "HEAD"], item.root);
+    const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
+    const initial = {
+      schemaVersion: 1, goalId: item.goalId, ticketId: item.ticketId, runId: run.runId, worker: run.worker,
+      baseRevision: item.base, resultingRevision: first, producedCommitIds: [first], dirtyWorktree: false,
+      outcome: "completed", summary: "Initial imported report.", verification: [], services: [], artifacts: [], assumptions: [], limitations: [], risks: [],
+      followUp: { state: "ready" }, createdAt: "2026-08-18T12:00:00.000Z",
+    };
+    await writeFile(staging, `${JSON.stringify(initial, null, 2)}\n`);
+    await importCompletionReport(item.root);
+    const immutablePath = join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.ticketId}/runs/${run.runId}/report.v1.json`);
+    const immutable = await readFile(immutablePath);
+
+    await writeFile(join(item.root, "second.txt"), "second\n");
+    await must(["git", "add", "second.txt"], item.root);
+    await must(["git", "commit", "-m", "superseding report result"], item.root);
+    const second = await must(["git", "rev-parse", "HEAD"], item.root);
+    await writeFile(staging, `${JSON.stringify({ ...initial, resultingRevision: second, producedCommitIds: [first, second], summary: "Superseding imported report.", createdAt: "2026-08-18T12:05:00.000Z" }, null, 2)}\n`);
+    const superseded = await importCompletionReport(item.root);
+    expect(superseded.idempotent).toBe(false);
+    expect(superseded.report.schemaVersion).toBe(2);
+    expect(superseded.report.resultingRevision).toBe(second);
+    expect(await readFile(immutablePath)).toEqual(immutable);
+    expect((await loadActiveRun(item.root)).report?.schemaVersion).toBe(3);
+    expect((await loadCompletionReport(item.root)).resultingRevision).toBe(second);
   });
 
   test("imports and shows worker-only Git evidence before publication and rejects HEAD or dirty-state mismatch", async () => {
@@ -1235,7 +1268,11 @@ describe("durable completion reports", () => {
     await must(["git", "config", "user.email", "dirty@example.test"], dirtyWorker);
     await writeFile(join(dirtyWorker, "committed.txt"), "committed\n");
     await must(["git", "add", "committed.txt"], dirtyWorker);
-    await must(["git", "commit", "-m", "dirty result"], dirtyWorker);
+    await must(["git", "commit", "-m", "stale report result"], dirtyWorker);
+    const staleHead = await must(["git", "rev-parse", "HEAD"], dirtyWorker);
+    await writeFile(join(dirtyWorker, "current.txt"), "current\n");
+    await must(["git", "add", "current.txt"], dirtyWorker);
+    await must(["git", "commit", "-m", "current dirty result"], dirtyWorker);
     const dirtyHead = await must(["git", "rev-parse", "HEAD"], dirtyWorker);
     await writeFile(join(dirtyWorker, "untracked.txt"), "dirty\n");
     const dirtyRun = await successfulDispatch(dirtyItem);
@@ -1243,7 +1280,7 @@ describe("durable completion reports", () => {
     const dirtyTooling = await installWorkerGitRuntime(dirtyItem.root, dirtyWorker, dirtyState);
     const dirtyStaging = completionReportStagingPath(dirtyItem.root, dirtyItem.goalId, dirtyItem.ticketId, dirtyRun.runId);
     const correlated = { ...report, goalId: dirtyItem.goalId, ticketId: dirtyItem.ticketId, runId: dirtyRun.runId, worker: dirtyRun.worker, baseRevision: dirtyItem.base };
-    await writeFile(dirtyStaging, `${JSON.stringify({ ...correlated, resultingRevision: dirtyItem.base, producedCommitIds: [] }, null, 2)}\n`);
+    await writeFile(dirtyStaging, `${JSON.stringify({ ...correlated, resultingRevision: staleHead, producedCommitIds: [staleHead] }, null, 2)}\n`);
     const rejectedHead = await execute([process.execPath, cli, "run", "report", "import"], dirtyItem.root, dirtyTooling.env);
     expect(rejectedHead.code).not.toBe(0);
     expect(rejectedHead.stderr).toContain("does not match live worker HEAD");

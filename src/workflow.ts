@@ -348,7 +348,7 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
                 completion.resultingRevision !== entry.result.publication?.head || completion.baseRevision !== entry.result.publication?.base) {
                 throw new Error(`completion report/publication/result provenance for ${entry.ticket.ticketId} is inconsistent`);
               }
-            } else if (!entry.result.provenanceMigrated) throw new Error(`accepted durable run for ${entry.ticket.ticketId} has no completion report`);
+            }
             const agent = await readAgentReadonly(join(root, ".pi-swarm"), runRecord.worker.slug);
             const activeMatches = Boolean(agent && agent.runId === runRecord.runId && agent.goalId === runRecord.goalId && agent.ticketId === runRecord.ticketId &&
               agent.baseRevision === runRecord.baseRevision && agent.finishedAt);

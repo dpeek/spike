@@ -309,6 +309,19 @@ describe("agent finalization and provenance", () => {
     expect(diagnosis.errors.join(" ")).toContain("completion report/publication/result provenance");
   });
 
+  test("keeps historical accepted durable runs without completion reports doctor-compatible", async () => {
+    const item = await fixture();
+    const accepted = await acceptedWorker(item, "pre-report-feature");
+    const runDirectory = join(item.stateDir, "goals", item.goalId, "tickets", item.ticketId, "runs", accepted.run.runId);
+    const recordPath = join(runDirectory, "record.v1.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8"));
+    delete record.report;
+    await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+    await rm(join(runDirectory, "report.v1.json"));
+    const diagnosis = await workflowDoctor(item.root);
+    expect(diagnosis.ok).toBe(true);
+  });
+
   test("doctor fails closed on tampered finalization evidence", async () => {
     const item = await fixture();
     const accepted = await acceptedWorker(item, "tampered");
