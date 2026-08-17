@@ -17,3 +17,13 @@ bun run test
 bun run check
 bin/spike --help
 ```
+
+The Phase 1 prototype can create an approved Goal and its initial Plan in any
+Git repository with at least one commit:
+
+```bash
+spike goal create \
+  --title "Ship the workflow" \
+  --outcome "Land reviewed Changes as one commit each" \
+  --approval "Approved to proceed"
+```
