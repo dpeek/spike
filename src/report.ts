@@ -12,7 +12,7 @@ import {
 } from "./durable-state.ts";
 import { normalizeCandidate, retainCandidate, withImportedWorkerRevision } from "./git-change.ts";
 import { discoverRepository } from "./git.ts";
-import { loadTicket, reportPath } from "./ticket.ts";
+import { loadTicket, reportPath, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
   ticketOutputPath,
@@ -142,6 +142,17 @@ export type TerminalReport = {
 };
 
 export type Report = ImplementationReport | ReviewReport | TerminalReport;
+
+export type ChangeReportHistory = {
+  ticketCount: number;
+  reports: Array<{
+    ticketId: string;
+    role: Report["metadata"]["role"];
+    outcome: Report["metadata"]["outcome"];
+    verdict?: ReviewReport["metadata"]["verdict"];
+    findingIds: string[];
+  }>;
+};
 
 function isImplementationReport(report: Report): report is ImplementationReport {
   return report.metadata.outcome === "completed" && report.metadata.role === "implement";
@@ -484,6 +495,36 @@ export async function loadReportIfPresent(
 ): Promise<Report | undefined> {
   if (!(await documentExists(root, reportPath(root, goalId, changeId, ticketId)))) return undefined;
   return loadReportDocument(root, goalId, changeId, ticketId);
+}
+
+export async function loadChangeReportHistory(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<ChangeReportHistory> {
+  const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
+  const ticketIds = (await listDirectoryNames(root, ticketsDirectory))
+    .filter((name) => sequenceIdPattern.test(name))
+    .sort();
+  const reports: ChangeReportHistory["reports"] = [];
+  let ticketCount = 0;
+
+  for (const ticketId of ticketIds) {
+    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    await loadTicket(root, goalId, changeId, ticketId);
+    ticketCount++;
+    const report = await loadReportIfPresent(root, goalId, changeId, ticketId);
+    if (report === undefined) continue;
+    reports.push({
+      ticketId,
+      role: report.metadata.role,
+      outcome: report.metadata.outcome,
+      ...(isReviewReport(report) ? { verdict: report.metadata.verdict } : {}),
+      findingIds: isReviewReport(report) ? report.metadata.findings.map((finding) => finding.id) : [],
+    });
+  }
+
+  return { ticketCount, reports };
 }
 
 export async function loadImplementationReport(

@@ -39,7 +39,12 @@ describe("Goal planning", () => {
     expect((await loadGoal(repository.root, goalId)).body).toContain("## Operator approval\n\nApproved by the operator.");
 
     const plan = await loadPlan(repository.root, goalId);
-    expect(plan.metadata).toEqual({ kind: "plan", goalId, updatedAt: "2026-03-19T10:00:00.000Z" });
+    expect(plan.metadata).toEqual({
+      kind: "plan",
+      goalId,
+      updatedAt: "2026-03-19T10:00:00.000Z",
+      changePlans: [],
+    });
     expect(plan.body).toContain("## Planned Changes\n\nNo Changes planned yet.");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
     expect(await readFile(join(repository.root, "operator-notes.txt"), "utf8")).toBe("leave me dirty\n");
