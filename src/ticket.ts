@@ -11,6 +11,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { loadGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
+import { deriveCurrentCandidate } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -23,18 +24,24 @@ const executionPolicySchema = z
     credentialGrants: z.array(z.string().min(1)),
   })
   .strict();
-const ticketSchema = z
-  .object({
-    kind: z.literal("ticket"),
-    goalId: z.string().regex(goalIdPattern),
-    changeId: z.string().regex(sequenceIdPattern),
-    ticketId: z.string().regex(sequenceIdPattern),
-    issuedAt: timestamp,
-    role: z.literal("implement"),
-    inputRevision: z.string().regex(revisionPattern),
-    executionPolicy: executionPolicySchema,
-  })
-  .strict();
+const commonTicketSchema = z.object({
+  kind: z.literal("ticket"),
+  goalId: z.string().regex(goalIdPattern),
+  changeId: z.string().regex(sequenceIdPattern),
+  ticketId: z.string().regex(sequenceIdPattern),
+  issuedAt: timestamp,
+  inputRevision: z.string().regex(revisionPattern),
+  executionPolicy: executionPolicySchema,
+});
+const ticketSchema = z.discriminatedUnion("role", [
+  commonTicketSchema.extend({ role: z.literal("implement") }).strict(),
+  commonTicketSchema
+    .extend({
+      role: z.literal("review"),
+      producingImplementationTicketId: z.string().regex(sequenceIdPattern),
+    })
+    .strict(),
+]);
 
 export type ExecutionPolicy = z.infer<typeof executionPolicySchema>;
 
@@ -49,8 +56,9 @@ export type IssueTicketInput = {
   cwd: string;
   goalId: string;
   changeId: string;
-  role?: "implement";
+  role?: "implement" | "review";
   inputRevision?: string;
+  producingImplementationTicketId?: string;
   instruction: string;
   curatedContext?: string;
   executionPolicy: ExecutionPolicy;
@@ -101,8 +109,16 @@ async function openTicketId(root: string, goalId: string, changeId: string): Pro
   return undefined;
 }
 
-function ticketBody(instruction: string, goalBody: string, changeBody: string, planBody: string, context?: string): string {
-  return `# Implement Change
+function ticketBody(
+  role: "implement" | "review",
+  instruction: string,
+  goalBody: string,
+  changeBody: string,
+  planBody: string,
+  context?: string,
+  producingReport?: string,
+): string {
+  return `# ${role === "implement" ? "Implement Change" : "Review Candidate"}
 
 ## Instruction
 
@@ -125,7 +141,8 @@ ${planBody.trimEnd()}
 ### Planner-selected context
 
 ${context === undefined || !context.trim() ? "None." : context.trim()}
-`;
+
+${producingReport === undefined ? "" : `### Producing implementation Report\n\n${producingReport.trimEnd()}\n`}`;
 }
 
 export async function loadTicket(root: string, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
@@ -170,7 +187,33 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     ...input.executionPolicy,
     credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")),
   });
-  const requestedRevision = input.inputRevision ?? change.metadata.baseRevision;
+  const role = input.role ?? "implement";
+  let requestedRevision: string;
+  let producingImplementationTicketId: string | undefined;
+  let producingReport: string | undefined;
+  if (role === "review") {
+    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
+    if (input.inputRevision !== undefined && input.inputRevision !== candidate.candidateRevision) {
+      throw new Error(`review Ticket must use current Candidate ${candidate.candidateRevision}`);
+    }
+    if (
+      input.producingImplementationTicketId !== undefined &&
+      input.producingImplementationTicketId !== candidate.producingImplementationTicketId
+    ) {
+      throw new Error(
+        `review Ticket must reference producing implementation Ticket ${candidate.producingImplementationTicketId}`,
+      );
+    }
+    requestedRevision = candidate.candidateRevision;
+    producingImplementationTicketId = candidate.producingImplementationTicketId;
+    producingReport = serializeDocument(candidate.report.metadata, candidate.report.body);
+  } else {
+    if (input.producingImplementationTicketId !== undefined) {
+      throw new Error("implement Ticket must not reference a producing implementation Ticket");
+    }
+    requestedRevision = input.inputRevision ?? change.metadata.baseRevision;
+  }
   if (!revisionPattern.test(requestedRevision)) throw new Error("Ticket input revision must be an exact commit hash");
   const inputRevision = await git(repository.root, ["rev-parse", "--verify", `${requestedRevision}^{commit}`]);
   if (inputRevision !== requestedRevision) throw new Error("Ticket input revision must identify a commit exactly");
@@ -182,11 +225,12 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     changeId: input.changeId,
     ticketId,
     issuedAt: (input.now ?? new Date()).toISOString(),
-    role: input.role ?? "implement",
+    role,
     inputRevision,
     executionPolicy: policy,
+    ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
   });
-  const body = ticketBody(instruction, goal.body, change.body, plan.body, input.curatedContext);
+  const body = ticketBody(role, instruction, goal.body, change.body, plan.body, input.curatedContext, producingReport);
 
   await installImmutable(
     repository.root,

@@ -30,7 +30,7 @@ export type LocalCloneExecution = TicketIdentity & {
   stderr: string;
 };
 
-export type DispatchLocalImplementationInput = TicketIdentity & {
+export type DispatchLocalTicketInput = TicketIdentity & {
   cwd: string;
   command: string[];
   worker: string;
@@ -53,7 +53,7 @@ export function exchangePath(root: string, identity: TicketIdentity): string {
   );
 }
 
-export function implementationOutputPath(root: string, identity: TicketIdentity): string {
+export function ticketOutputPath(root: string, identity: TicketIdentity): string {
   return join(exchangePath(root, identity), "output");
 }
 
@@ -73,7 +73,22 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function contextBody(inputRevision: string): string {
+function contextBody(role: "implement" | "review", inputRevision: string): string {
+  if (role === "review") {
+    return `# Review worker context
+
+The private checkout starts at the exact Candidate \`${inputRevision}\`.
+
+## Declared output
+
+Write only to \`SPIKE_OUTPUT_DIR\`:
+
+- \`submission.md\` — JSON-frontmatter Markdown with kind \`submission\`, the full Ticket identity, outcome \`completed\`, \`reviewedRevision\`, \`producingImplementationTicketId\`, \`findings\`, \`acceptanceAssessment\`, verdict \`remediate\`, and declared \`artifacts\`;
+- files below \`artifacts/\` that are declared by path and SHA-256 digest in the Submission.
+
+Each finding requires a stable kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and a non-blank \`statement\`. Assess every acceptance criterion exactly once as \`met\`, \`not-met\`, or \`unclear\`, with evidence. Do not write an output Git bundle. The completed Submission body must contain a non-blank Review statement section.
+`;
+  }
   return `# Implementation worker context
 
 The private checkout starts at exact revision \`${inputRevision}\`.
@@ -90,9 +105,8 @@ The completed Submission body must contain Summary, Verification, Assumptions, L
 `;
 }
 
-export async function prepareImplementationExchange(root: string, identity: TicketIdentity): Promise<TicketExchange> {
+export async function prepareTicketExchange(root: string, identity: TicketIdentity): Promise<TicketExchange> {
   const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
-  if (ticket.metadata.role !== "implement") throw new Error("local implementation dispatch requires an implement Ticket");
   if (await pathExists(reportPath(root, identity.goalId, identity.changeId, identity.ticketId))) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} is already reported`);
   }
@@ -118,7 +132,7 @@ export async function prepareImplementationExchange(root: string, identity: Tick
         ticketId: identity.ticketId,
         inputRevision: ticket.metadata.inputRevision,
       },
-      contextBody(ticket.metadata.inputRevision),
+      contextBody(ticket.metadata.role, ticket.metadata.inputRevision),
     ),
   );
   await createInputBundle(root, ticket.metadata.inputRevision, join(inputDirectory, "repository.bundle"), identity);
@@ -131,8 +145,8 @@ export async function prepareImplementationExchange(root: string, identity: Tick
   return { ...identity, inputDirectory, outputDirectory };
 }
 
-export async function dispatchLocalImplementation(
-  input: DispatchLocalImplementationInput,
+export async function dispatchLocalTicket(
+  input: DispatchLocalTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
@@ -150,7 +164,7 @@ export async function dispatchLocalImplementation(
   }
 
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const exchange = await prepareImplementationExchange(repository.root, identity);
+  const exchange = await prepareTicketExchange(repository.root, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const checkout = join(workspace, "repository");
   const clock = input.clock ?? (() => new Date());
@@ -212,4 +226,26 @@ export async function dispatchLocalImplementation(
       stderr,
     },
   };
+}
+
+async function dispatchLocalRole(
+  input: DispatchLocalTicketInput,
+  role: "implement" | "review",
+): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+  const repository = await discoverRepository(input.cwd);
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (ticket.metadata.role !== role) throw new Error(`local ${role} dispatch requires a ${role} Ticket`);
+  return dispatchLocalTicket(input);
+}
+
+export function dispatchLocalImplementation(
+  input: DispatchLocalTicketInput,
+): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+  return dispatchLocalRole(input, "implement");
+}
+
+export function dispatchLocalReview(
+  input: DispatchLocalTicketInput,
+): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+  return dispatchLocalRole(input, "review");
 }

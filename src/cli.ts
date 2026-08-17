@@ -28,8 +28,9 @@ Change creation options:
   --dependency <dependency>       Repeat for each dependency
 
 Ticket issuance options:
-  --role implement               Only implement is currently supported
-  --input-revision <commit>       Exact commit hash; defaults to the Change base
+  --role <role>                  implement (default) or review
+  --input-revision <commit>       Exact commit; review must use the current Candidate
+  --implementation-ticket <id>   Producing Ticket; derived for review when omitted
   --context <context>             Additional planner-curated context
   --isolation <level>             workspace (default) or container
   --network-access <access>       none (default), restricted, or unrestricted
@@ -148,7 +149,9 @@ function parseTicketIssue(args: string[]): {
   changeId: string;
   instruction: string;
   curatedContext?: string;
+  role: "implement" | "review";
   inputRevision?: string;
+  producingImplementationTicketId?: string;
   executionPolicy: ExecutionPolicy;
 } {
   let goalId: string | undefined;
@@ -156,7 +159,8 @@ function parseTicketIssue(args: string[]): {
   let instruction: string | undefined;
   let curatedContext: string | undefined;
   let inputRevision: string | undefined;
-  let role = "implement";
+  let producingImplementationTicketId: string | undefined;
+  let role: "implement" | "review" = "implement";
   let isolation: ExecutionPolicy["isolation"] = "workspace";
   let networkAccess: ExecutionPolicy["networkAccess"] = "none";
   const credentialGrants: string[] = [];
@@ -181,7 +185,11 @@ function parseTicketIssue(args: string[]): {
         inputRevision = value;
         break;
       case "--role":
+        if (value !== "implement" && value !== "review") throw new UsageError(`unsupported Ticket role: ${value}`);
         role = value;
+        break;
+      case "--implementation-ticket":
+        producingImplementationTicketId = value;
         break;
       case "--isolation":
         if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
@@ -204,14 +212,15 @@ function parseTicketIssue(args: string[]): {
   if (goalId === undefined) throw new UsageError("--goal is required");
   if (changeId === undefined) throw new UsageError("--change is required");
   if (instruction === undefined) throw new UsageError("--instruction is required");
-  if (role !== "implement") throw new UsageError(`unsupported Ticket role: ${role}`);
   return {
     goalId,
     changeId,
     instruction,
+    role,
     executionPolicy: { isolation, networkAccess, credentialGrants },
     ...(curatedContext === undefined ? {} : { curatedContext }),
     ...(inputRevision === undefined ? {} : { inputRevision }),
+    ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
   };
 }
 
