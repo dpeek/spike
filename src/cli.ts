@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 
 import { relative } from "node:path";
+import { changePath, createChange } from "./change.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { planPath } from "./plan.ts";
+import { issueTicket, ticketPath, type ExecutionPolicy } from "./ticket.ts";
 
 export const version = "2.0.0-dev";
 
@@ -11,12 +13,27 @@ export function usage(): string {
 
 Usage:
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
+  spike change create --goal <goal-id> --title <title> --intent <intent> --rationale <rationale> --acceptance <criterion> [options]
+  spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
   spike --help
   spike --version
 
 Goal creation options:
   --constraint <constraint>       Repeat for each constraint
   --repository-id <identity>      Override the inferred repository identity
+
+Change creation options:
+  --acceptance <criterion>        Repeat for each acceptance criterion
+  --non-goal <non-goal>           Repeat for each non-goal
+  --dependency <dependency>       Repeat for each dependency
+
+Ticket issuance options:
+  --role implement               Only implement is currently supported
+  --input-revision <commit>       Exact commit hash; defaults to the Change base
+  --context <context>             Additional planner-curated context
+  --isolation <level>             workspace (default) or container
+  --network-access <access>       none (default), restricted, or unrestricted
+  --credential <grant-id>         Repeat for each credential grant identifier
 `;
 }
 
@@ -71,6 +88,133 @@ function parseGoalCreate(args: string[]): {
   return { title, outcome, approval, constraints, ...(repositoryIdentity === undefined ? {} : { repositoryIdentity }) };
 }
 
+function parseChangeCreate(args: string[]): {
+  goalId: string;
+  title: string;
+  intent: string;
+  rationale: string;
+  acceptanceCriteria: string[];
+  nonGoals: string[];
+  dependencies: string[];
+} {
+  let goalId: string | undefined;
+  let title: string | undefined;
+  let intent: string | undefined;
+  let rationale: string | undefined;
+  const acceptanceCriteria: string[] = [];
+  const nonGoals: string[] = [];
+  const dependencies: string[] = [];
+
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    switch (option) {
+      case "--goal":
+        goalId = value;
+        break;
+      case "--title":
+        title = value;
+        break;
+      case "--intent":
+        intent = value;
+        break;
+      case "--rationale":
+        rationale = value;
+        break;
+      case "--acceptance":
+        acceptanceCriteria.push(value);
+        break;
+      case "--non-goal":
+        nonGoals.push(value);
+        break;
+      case "--dependency":
+        dependencies.push(value);
+        break;
+      default:
+        throw new UsageError(`unknown option: ${option}`);
+    }
+  }
+
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (title === undefined) throw new UsageError("--title is required");
+  if (intent === undefined) throw new UsageError("--intent is required");
+  if (rationale === undefined) throw new UsageError("--rationale is required");
+  if (acceptanceCriteria.length === 0) throw new UsageError("--acceptance is required");
+  return { goalId, title, intent, rationale, acceptanceCriteria, nonGoals, dependencies };
+}
+
+function parseTicketIssue(args: string[]): {
+  goalId: string;
+  changeId: string;
+  instruction: string;
+  curatedContext?: string;
+  inputRevision?: string;
+  executionPolicy: ExecutionPolicy;
+} {
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let instruction: string | undefined;
+  let curatedContext: string | undefined;
+  let inputRevision: string | undefined;
+  let role = "implement";
+  let isolation: ExecutionPolicy["isolation"] = "workspace";
+  let networkAccess: ExecutionPolicy["networkAccess"] = "none";
+  const credentialGrants: string[] = [];
+
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    switch (option) {
+      case "--goal":
+        goalId = value;
+        break;
+      case "--change":
+        changeId = value;
+        break;
+      case "--instruction":
+        instruction = value;
+        break;
+      case "--context":
+        curatedContext = value;
+        break;
+      case "--input-revision":
+        inputRevision = value;
+        break;
+      case "--role":
+        role = value;
+        break;
+      case "--isolation":
+        if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
+        isolation = value;
+        break;
+      case "--network-access":
+        if (value !== "none" && value !== "restricted" && value !== "unrestricted") {
+          throw new UsageError(`invalid network access: ${value}`);
+        }
+        networkAccess = value;
+        break;
+      case "--credential":
+        credentialGrants.push(value);
+        break;
+      default:
+        throw new UsageError(`unknown option: ${option}`);
+    }
+  }
+
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (instruction === undefined) throw new UsageError("--instruction is required");
+  if (role !== "implement") throw new UsageError(`unsupported Ticket role: ${role}`);
+  return {
+    goalId,
+    changeId,
+    instruction,
+    executionPolicy: { isolation, networkAccess, credentialGrants },
+    ...(curatedContext === undefined ? {} : { curatedContext }),
+    ...(inputRevision === undefined ? {} : { inputRevision }),
+  };
+}
+
 export async function run(args = process.argv.slice(2), cwd = process.cwd()): Promise<number> {
   if (args.length === 0 || (args.length === 1 && ["--help", "-h"].includes(args[0]!))) {
     process.stdout.write(usage());
@@ -82,8 +226,8 @@ export async function run(args = process.argv.slice(2), cwd = process.cwd()): Pr
     return 0;
   }
 
-  if (args[0] === "goal" && args[1] === "create") {
-    try {
+  try {
+    if (args[0] === "goal" && args[1] === "create") {
       const input = parseGoalCreate(args.slice(2));
       const created = await createGoal({ cwd, ...input });
       const goalId = created.goal.metadata.goalId;
@@ -93,10 +237,32 @@ export async function run(args = process.argv.slice(2), cwd = process.cwd()): Pr
           `  ${relative(created.root, planPath(created.root, goalId))}\n`,
       );
       return 0;
-    } catch (error) {
-      process.stderr.write(`spike: ${error instanceof Error ? error.message : String(error)}\n`);
-      return error instanceof UsageError ? 2 : 1;
     }
+
+    if (args[0] === "change" && args[1] === "create") {
+      const input = parseChangeCreate(args.slice(2));
+      const created = await createChange({ cwd, ...input });
+      const { goalId, changeId } = created.change.metadata;
+      process.stdout.write(
+        `Created Change ${goalId}/${changeId}\n` +
+          `  ${relative(created.root, changePath(created.root, goalId, changeId))}\n`,
+      );
+      return 0;
+    }
+
+    if (args[0] === "ticket" && args[1] === "issue") {
+      const input = parseTicketIssue(args.slice(2));
+      const issued = await issueTicket({ cwd, ...input });
+      const { goalId, changeId, ticketId } = issued.ticket.metadata;
+      process.stdout.write(
+        `Issued Ticket ${goalId}/${changeId}/${ticketId}\n` +
+          `  ${relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId))}\n`,
+      );
+      return 0;
+    }
+  } catch (error) {
+    process.stderr.write(`spike: ${error instanceof Error ? error.message : String(error)}\n`);
+    return error instanceof UsageError ? 2 : 1;
   }
 
   process.stderr.write(`spike: unknown command: ${args.join(" ")}\n`);

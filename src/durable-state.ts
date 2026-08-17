@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { open, lstat, mkdir, readFile, rename, realpath, rm } from "node:fs/promises";
+import { open, lstat, mkdir, readFile, readdir, rename, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const defaultMaximumBytes = 128 * 1024;
@@ -111,6 +111,30 @@ export async function replaceAtomic(root: string, path: string, contents: string
     await syncDirectory(dirname(path));
   } finally {
     await rm(temporary, { force: true });
+  }
+}
+
+export async function documentExists(root: string, path: string): Promise<boolean> {
+  await rejectSymlinkComponents(root, path);
+  try {
+    const stat = await lstat(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`workflow document is not a regular file: ${path}`);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export async function listDirectoryNames(root: string, path: string): Promise<string[]> {
+  await rejectSymlinkComponents(root, path);
+  try {
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`workflow path is not a directory: ${path}`);
+    return await readdir(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
   }
 }
 
