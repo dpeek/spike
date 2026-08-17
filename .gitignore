@@ -1,4 +1,5 @@
 .env
 .pi/
 .pi-swarm/
+.spike/
 .DS_Store

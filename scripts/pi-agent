@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ $# -lt 1 ]]; then
-    echo "Usage: scripts/pi-agent <name> [pi arguments...]" >&2
-    echo "       scripts/pi-agent <name> -- <command> [arguments...]" >&2
-    exit 2
-fi
-exec "$root/bin/spike" agent run "$@"
