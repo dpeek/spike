@@ -21,6 +21,7 @@ const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const ticketIdPattern = /^ticket-[0-9a-f]{32}$/;
 const objectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const workerPattern = /^[a-z0-9_.-]+$/;
+const digestPattern = /^[0-9a-f]{64}$/;
 
 export type RunStatus = "dispatching" | "running" | "launch_failed" | "stopping" | "stopped" | "failed" | "completed";
 export type AgentLifecycle = "running" | "stopping" | "stopped" | "failed" | "completed";
@@ -57,7 +58,7 @@ export type RunRecord = {
   terminationKind?: "requested" | "unexpected";
   outcome?: "stopped" | "failed" | "completed";
   launchError?: string;
-  report?: { schemaVersion: 1; path: string; outcome: CompletionOutcome; createdAt: string };
+  report?: { schemaVersion: 1 | 2; path: string; outcome: CompletionOutcome; createdAt: string; sha256?: string; byteLength?: number };
 };
 
 export type CompletionOutcome = "completed" | "partial" | "blocked";
@@ -668,10 +669,12 @@ export function validateRunRecord(value: unknown, expected: { goalId: string; ti
   if (record.retryReason !== undefined && record.retryOfRunId === undefined) throw new Error("run record retryReason has no retryOfRunId");
   if (record.report !== undefined) {
     const report = requireObject(record.report, "run report pointer");
-    if (report.schemaVersion !== COMPLETION_REPORT_SCHEMA_VERSION || typeof report.path !== "string" ||
+    if ((report.schemaVersion !== 1 && report.schemaVersion !== 2) || typeof report.path !== "string" ||
       report.path !== `.pi-swarm/goals/${expected.goalId}/tickets/${expected.ticketId}/runs/${expected.runId}/report.v1.json` ||
       !["completed", "partial", "blocked"].includes(String(report.outcome))) throw new Error("run record has an invalid report pointer");
     requireTimestamp(report.createdAt, "run report pointer createdAt");
+    if (report.schemaVersion === 2 && (typeof report.sha256 !== "string" || !digestPattern.test(report.sha256) || !Number.isSafeInteger(report.byteLength) || (report.byteLength as number) < 1 || (report.byteLength as number) > MAX_REPORT_BYTES)) throw new Error("run record has invalid report integrity provenance");
+    if (report.schemaVersion === 1 && (report.sha256 !== undefined || report.byteLength !== undefined)) throw new Error("legacy run report pointer has unexpected integrity provenance");
   }
   if (record.runtime !== undefined && record.runtime !== "apple" && record.runtime !== "docker") throw new Error("run record has an invalid runtime");
   if (record.stopRunId !== undefined && record.stopRunId !== record.runId) throw new Error("run record stop intent belongs to another run");
@@ -1011,6 +1014,23 @@ async function validateReportEvidence(root: string, report: CompletionReport): P
   }
 }
 
+async function completionReportBytes(path: string, label: string): Promise<Buffer> {
+  let bytes: Buffer;
+  try { bytes = await readFile(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`${label} is missing`); throw error; }
+  if (bytes.byteLength > MAX_REPORT_BYTES) throw new Error(`${label} is unexpectedly large`);
+  return bytes;
+}
+
+function parseCompletionReport(bytes: Buffer, label: string): unknown {
+  try { return JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error(`${label} is invalid JSON`); }
+}
+
+function completionReportDigest(bytes: Uint8Array): string {
+  return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+}
+
 function canonicalCompletionReport(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalCompletionReport).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${canonicalCompletionReport(child)}`).join(",")}}`;
@@ -1021,10 +1041,12 @@ export async function validateStoredCompletionReport(root: string, run: RunRecor
   const path = join(root, `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json`);
   try {
     await rejectSymlinks(root, path, "completion report path");
-    const value = await smallJson(path, "completion report");
-    const report = validateCompletionReport(value, { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+    const bytes = await completionReportBytes(path, "completion report");
+    const report = validateCompletionReport(parseCompletionReport(bytes, "completion report"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
     await validateReportEvidence(root, report);
     if (!run.report || run.report.path !== `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json` || run.report.outcome !== report.outcome || run.report.createdAt !== report.createdAt) throw new Error("completion report pointer is missing or inconsistent");
+    if (run.report.schemaVersion !== 2) throw new Error("completion report pointer lacks integrity provenance; re-import the immutable staging report to upgrade it");
+    if (run.report.byteLength !== bytes.byteLength || run.report.sha256 !== completionReportDigest(bytes)) throw new Error("completion report integrity provenance does not match stored bytes");
     return report;
   } catch (error) {
     if (error instanceof Error && error.message === "completion report is missing" && !run.report) return undefined;
@@ -1041,7 +1063,8 @@ export async function importCompletionReport(cwd = process.cwd()): Promise<{ rep
   let info;
   try { info = await lstat(staging); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`completion report staging file is missing: ${relative(ctx.root, staging).split(sep).join("/")}`); throw error; }
   if (!info.isFile()) throw new Error("completion report staging path is not a regular file");
-  const report = validateCompletionReport(await smallJson(staging, "completion report staging file"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+  const stagingBytes = await completionReportBytes(staging, "completion report staging file");
+  const report = validateCompletionReport(parseCompletionReport(stagingBytes, "completion report staging file"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
   await validateReportEvidence(ctx.root, report);
   const destination = completionReportPath(ctx, run.runId);
   await rejectSymlinks(ctx.root, destination, "completion report destination path");
@@ -1051,14 +1074,16 @@ export async function importCompletionReport(cwd = process.cwd()): Promise<{ rep
     await durableWrite(destination, serialized);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const current = validateCompletionReport(await smallJson(destination, "completion report"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
+    const storedBytes = await completionReportBytes(destination, "completion report");
+    const current = validateCompletionReport(parseCompletionReport(storedBytes, "completion report"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
     if (canonicalCompletionReport(current) !== canonicalCompletionReport(report)) throw new Error("completion report already exists with conflicting content");
     idempotent = true;
   }
+  const storedBytes = await completionReportBytes(destination, "completion report");
   const current = await loadRunFromContext(ctx);
-  const pointer = { schemaVersion: COMPLETION_REPORT_SCHEMA_VERSION as const, path: `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json`, outcome: report.outcome, createdAt: report.createdAt };
+  const pointer = { schemaVersion: 2 as const, path: `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json`, outcome: report.outcome, createdAt: report.createdAt, sha256: completionReportDigest(storedBytes), byteLength: storedBytes.byteLength };
   if (current.report && (current.report.path !== pointer.path || current.report.outcome !== pointer.outcome || current.report.createdAt !== pointer.createdAt)) throw new Error("run already has a conflicting completion report pointer");
-  if (!current.report) await writeRun(ctx, { ...current, report: pointer });
+  if (!current.report || current.report.schemaVersion !== 2 || current.report.sha256 !== pointer.sha256 || current.report.byteLength !== pointer.byteLength) await writeRun(ctx, { ...current, report: pointer });
   return { report, idempotent };
 }
 

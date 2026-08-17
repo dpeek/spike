@@ -11,6 +11,7 @@ import {
   dispatchTicket,
   importCompletionReport,
   loadCompletionReport,
+  validateCompletionReport,
   listAgentFinalizations,
   loadActiveRun,
   loadRunAttemptHistory,
@@ -1165,9 +1166,28 @@ describe("durable completion reports", () => {
     const shown = await execute([process.execPath, cli, "run", "report", "show", "--json"], item.root);
     expect(shown.code).toBe(0);
     expect(JSON.parse(shown.stdout).resultingRevision).toBe(head);
+    const importedPath = join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.ticketId}/runs/${run.runId}/report.v1.json`);
+    const tampered = JSON.parse(await readFile(importedPath, "utf8"));
+    tampered.summary = "valid JSON, but tampered";
+    await writeFile(importedPath, `${JSON.stringify(tampered, null, 2)}\n`);
+    await expect(loadCompletionReport(item.root)).rejects.toThrow("integrity provenance");
     expect(await must(["git", "status", "--porcelain=v1"], item.root)).toBe(before);
     report.summary = "conflicting replacement";
     await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
     await expect(importCompletionReport(item.root)).rejects.toThrow("conflicting");
+  });
+
+  test("rejects traversal, oversized, and mismatched report evidence", () => {
+    const expected = {
+      goalId: `goal-${"1".repeat(32)}`, ticketId: `ticket-${"2".repeat(32)}`, runId: `run-${"3".repeat(32)}`,
+      baseRevision: "a".repeat(40), worker: { name: "worker", slug: "worker" },
+    };
+    const report = {
+      schemaVersion: 1, ...expected, resultingRevision: "b".repeat(40), producedCommitIds: [], dirtyWorktree: false,
+      outcome: "completed", summary: "valid", verification: [], services: [], artifacts: [], assumptions: [], limitations: [], risks: [], followUp: { state: "ready" }, createdAt: "2026-08-18T12:00:00.000Z",
+    };
+    expect(() => validateCompletionReport({ ...report, artifacts: [{ kind: "file", description: "bad", path: `.pi-swarm/output/artifacts/${expected.runId}/../escape` }] }, expected)).toThrow("artifact path");
+    expect(() => validateCompletionReport({ ...report, summary: "x".repeat(2_001) }, expected)).toThrow("bounded");
+    expect(() => validateCompletionReport({ ...report, goalId: `goal-${"4".repeat(32)}` }, expected)).toThrow("correlation");
   });
 });
