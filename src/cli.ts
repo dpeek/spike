@@ -571,6 +571,7 @@ async function runCommand(action: string | undefined, args: string[]) {
     if (action === "status") {
       if (args.some((argument) => argument !== "--json") || args.filter((argument) => argument === "--json").length > 1) fail("run status accepts only --json", 2);
       const record = await loadActiveRun();
+      if (record.report) await loadCompletionReport();
       if (args.includes("--json")) console.log(JSON.stringify(record, null, 2));
       else printRunStatus(record);
       return;
