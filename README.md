@@ -335,9 +335,20 @@ spike supervisor --herdr
 Homebrew service when needed. `spike herdr status` shows server and integration
 state, while `spike herdr attach` opens the full workspace UI.
 
-The Herdr supervisor is placed in a project workspace and attached directly to
-your terminal. Detach with `ctrl+b q`; its terminal and workers keep running.
-Running `spike supervisor --herdr` again reattaches to the existing supervisor.
+The Herdr supervisor is placed in the repository's canonical project space and
+attached directly to your terminal. Every persistent worker gets its own labelled
+tab in that same space; workspace labels are display names and are not used as
+project identity. Spike revalidates the recorded Herdr workspace against the
+repository on each launch and safely creates a replacement if it is missing.
+Detach with `ctrl+b q`; its terminal and workers keep running. Running
+`spike supervisor --herdr` again reattaches to the existing supervisor.
+
+Upgrades may leave an older `spike:<project>` worker space visible. Spike never
+moves or closes that space automatically. Inspect every tab with `spike herdr
+attach` (and `herdr pane process-info <pane-id>` when its status is unclear).
+Only after confirming that no supervisor, worker, or unknown process is live,
+close the inactive legacy space explicitly with `herdr workspace close
+<workspace-id>`. If anything is live or uncertain, leave the space intact.
 
 The supervisor loads the repo-local `spike_agents` extension tool. It can
 dispatch focused tasks, send persistent workers follow-ups, read their terminals,

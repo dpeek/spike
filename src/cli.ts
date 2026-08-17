@@ -18,6 +18,7 @@ import {
 } from "./durable-launch.ts";
 import { acceptTicket, migrateBootstrap, ticketHistory, workflowDoctor, type TicketHistoryEntry } from "./workflow.ts";
 import { loadLatestPublication, publishBranch, type CommandRunner } from "./publication.ts";
+import { herdrPlacementEnvironment, herdrPlacementMetadata, placeHerdrTab, type HerdrCommand } from "./herdr-placement.ts";
 import {
   agentStatePath,
   dispatchTicket as dispatchReadyTicket,
@@ -176,26 +177,13 @@ function herdrAgentName(value: string): string {
   return result.slice(0, 32).replace(/-+$/g, "") || "spike-agent";
 }
 
-async function createHerdrPane(root: string, project: string, label: string) {
+const runHerdrPlacementCommand: HerdrCommand = async (args) => {
   await requireHerdr();
-  const workspaceLabel = `spike:${project}`;
-  const listed = await herdrJson(["workspace", "list"]);
-  const workspaces = listed?.result?.workspaces ?? [];
-  let workspace = workspaces.find((candidate: any) => candidate.label === workspaceLabel);
-  if (!workspace) {
-    const created = await herdrJson(["workspace", "create", "--cwd", root, "--label", workspaceLabel, "--no-focus"]);
-    workspace = created.result.workspace;
-    const tabId = created.result.tab.tab_id as string;
-    await herdrJson(["tab", "rename", tabId, label]);
-    return { workspaceId: workspace.workspace_id as string, tabId, paneId: created.result.root_pane.pane_id as string };
-  }
-  const created = await herdrJson(["tab", "create", "--workspace", workspace.workspace_id, "--cwd", root, "--label", label, "--no-focus"]);
-  return {
-    workspaceId: workspace.workspace_id as string,
-    tabId: created.result.tab.tab_id as string,
-    paneId: created.result.root_pane.pane_id as string,
-  };
-}
+  const command = await capture(["herdr", ...args]);
+  if (command.code !== 0) throw new Error(`Herdr placement: ${command.stderr || command.stdout || `${args.join(" ")} failed`}`);
+  try { return JSON.parse(command.stdout); }
+  catch { throw new Error(`Herdr placement: invalid response to ${args.slice(0, 2).join(" ")}`); }
+};
 
 async function waitForHerdrAgent(paneId: string, timeoutMs = 30_000): Promise<any> {
   const deadline = Date.now() + timeoutMs;
@@ -408,6 +396,9 @@ async function launchPersistentTicket(request: DispatchLaunchRequest): Promise<P
     if (!state || state.runId !== request.runId || state.goalId !== request.goalId || state.ticketId !== request.ticketId || state.baseRevision !== request.baseRevision) {
       throw new Error("persistent launcher did not persist matching agent/run/base state");
     }
+    if (!state.herdrWorkspaceId || !state.herdrTabId || !state.herdrPaneId) {
+      throw new Error("persistent launcher did not persist complete Herdr placement");
+    }
     const evidence = await waitForLaunchEvidence(evidencePath, launchToken);
     assertDurableLaunchEvidence(evidence, {
       token: launchToken,
@@ -424,9 +415,11 @@ async function launchPersistentTicket(request: DispatchLaunchRequest): Promise<P
       runtime: state.runtime,
       container: state.container,
       ...(state.herdrName ? { herdrName: state.herdrName } : {}),
-      ...(state.herdrWorkspaceId ? { herdrWorkspaceId: state.herdrWorkspaceId } : {}),
-      ...(state.herdrTabId ? { herdrTabId: state.herdrTabId } : {}),
-      ...(state.herdrPaneId ? { herdrPaneId: state.herdrPaneId } : {}),
+      ...herdrPlacementMetadata({
+        workspaceId: state.herdrWorkspaceId,
+        tabId: state.herdrTabId,
+        paneId: state.herdrPaneId,
+      }),
     };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -952,7 +945,14 @@ async function supervisor(args: string[]) {
     return;
   }
 
-  const placement = await createHerdrPane(context.root, context.project, "supervisor");
+  const placement = await placeHerdrTab({
+    root: context.root,
+    stateDir: context.stateDir,
+    project: context.project,
+    label: "supervisor",
+    environment: process.env,
+    command: runHerdrPlacementCommand,
+  });
   const command = [
     "env", "HERDR_AGENT=pi",
     shellQuote(fileURLToPath(new URL("../bin/spike", import.meta.url))),
@@ -1199,7 +1199,14 @@ async function persistentAgent(name: string | undefined, args: string[]) {
   await rm(statePath(context.stateDir, agent), { force: true });
 
   const herdrName = herdrAgentName(`${context.project}-${agent}`);
-  const placement = await createHerdrPane(context.root, context.project, agent);
+  const placement = await placeHerdrTab({
+    root: context.root,
+    stateDir: context.stateDir,
+    project: context.project,
+    label: agent,
+    environment: process.env,
+    command: runHerdrPlacementCommand,
+  });
   const baseEnvironment = (() => {
     try { return canonicalBaseEnvironment({ SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION, AGENT_BASE_REF: process.env.AGENT_BASE_REF }); }
     catch (error) { fail(error instanceof Error ? error.message : String(error)); }
@@ -1212,10 +1219,7 @@ async function persistentAgent(name: string | undefined, args: string[]) {
     HERDR_AGENT: "pi",
     SPIKE_BACKEND: "herdr",
     SPIKE_TASK: task,
-    SPIKE_HERDR_NAME: herdrName,
-    SPIKE_HERDR_WORKSPACE_ID: placement.workspaceId,
-    SPIKE_HERDR_TAB_ID: placement.tabId,
-    SPIKE_HERDR_PANE_ID: placement.paneId,
+    ...herdrPlacementEnvironment(herdrName, placement),
     ...baseEnvironment,
     ...(owner ? { SPIKE_OWNER: owner } : process.env.SPIKE_OWNER ? { SPIKE_OWNER: process.env.SPIKE_OWNER } : {}),
     ...(process.env.SPIKE_GOAL_ID ? { SPIKE_GOAL_ID: process.env.SPIKE_GOAL_ID } : {}),
