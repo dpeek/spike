@@ -66,7 +66,11 @@ ENV HOME=/home/node \
     PI_SKIP_VERSION_CHECK=1 \
     PI_TELEMETRY=0
 
-USER node
+# The entrypoint uses a narrowly scoped root phase for mounted-directory
+# ownership and portable auth/integration links, then execs every agent command
+# as node. Launchers also request root explicitly so older local images repair
+# shared state instead of skipping setup.
+USER root
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agent-entrypoint"]

@@ -1039,8 +1039,10 @@ async function runAgent(name: string | undefined, args: string[]) {
     ].join(" "));
   }
   const cli = runtimeCommand(runtime);
-  const run = [cli, "run"];
-  if (runtime === "apple") run.push("--user", "root");
+  // Both runtimes need a short root setup phase to repair portable links in
+  // shared state. The entrypoint drops to node before Git, Pi, or the requested
+  // command starts.
+  const run = [cli, "run", "--user", "root"];
   const startedAt = new Date().toISOString();
   const baseEnvironment = (() => {
     try { return canonicalBaseEnvironment({ SPIKE_BASE_REVISION: process.env.SPIKE_BASE_REVISION, AGENT_BASE_REF: process.env.AGENT_BASE_REF }); }
@@ -1062,17 +1064,14 @@ async function runAgent(name: string | undefined, args: string[]) {
     "--mount", `type=bind,source=${sharedState},target=/home/node/.pi/agent`,
   );
   // Apple container only supports directory bind sources. Mount the narrowly
-  // scoped host Pi directory at a neutral path, then the entrypoint links only
-  // auth.json into the worker state. OAuth refreshes stay consistent without
-  // exposing the rest of the host home as worker configuration.
-  if (hostPiState && existsSync(join(hostPiState, "auth.json"))) {
-    run.push(
-      "--mount", `type=bind,source=${hostPiState},target=/host-pi-agent`,
-      "--env", "HOST_PI_AUTH_FILE=/host-pi-agent/auth.json",
-    );
-    if (existsSync(join(hostPiState, "extensions", "herdr-agent-state.ts"))) {
-      run.push("--env", "HOST_HERDR_PI_EXTENSION=/host-pi-agent/extensions/herdr-agent-state.ts");
-    }
+  // scoped host Pi agent directory at a neutral path when either supported
+  // integration exists, then link only those files into worker state.
+  const hostAuthAvailable = Boolean(hostPiState && existsSync(join(hostPiState, "auth.json")));
+  const hostHerdrAvailable = Boolean(hostPiState && existsSync(join(hostPiState, "extensions", "herdr-agent-state.ts")));
+  if (hostAuthAvailable || hostHerdrAvailable) {
+    run.push("--mount", `type=bind,source=${hostPiState},target=/host-pi-agent`);
+    if (hostAuthAvailable) run.push("--env", "HOST_PI_AUTH_FILE=/host-pi-agent/auth.json");
+    if (hostHerdrAvailable) run.push("--env", "HOST_HERDR_PI_EXTENSION=/host-pi-agent/extensions/herdr-agent-state.ts");
   }
   run.push(
     "--env", `AGENT_NAME=${agent}`,

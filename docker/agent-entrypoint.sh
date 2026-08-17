@@ -7,25 +7,67 @@ agent_name=${AGENT_NAME:-default}
 agent_branch=${AGENT_BRANCH:-agent/${agent_name}}
 agent_dir=${AGENT_STATE_DIR:-/home/node/.pi/agent}
 
-# Apple container volumes are fresh ext4 filesystems owned by root. Its launcher
-# starts this entrypoint as root so it can hand only the mounted directories to
-# the unprivileged runtime user, then immediately drops privileges.
+startup_error() {
+    echo "agent startup: $1" >&2
+    exit 1
+}
+
+node_can_read() {
+    if [[ $(id -u) -eq 0 ]]; then
+        runuser -u node -- test -r "$1"
+    else
+        test -r "$1"
+    fi
+}
+
+prepare_runtime_link() {
+    local label=$1
+    local source=$2
+    local destination=$3
+
+    if [[ -z "$source" ]]; then
+        # Shared state can outlive its creating machine. Remove only an
+        # unavailable symlink here; preserve ordinary worker-owned files.
+        if [[ -L "$destination" && ! -e "$destination" ]]; then
+            rm -f "$destination" || startup_error "could not remove stale $label link at $destination"
+        fi
+        return 0
+    fi
+    if [[ ! -f "$source" ]]; then
+        [[ ! -L "$destination" ]] || rm -f "$destination" || true
+        startup_error "configured $label source is unavailable: $source"
+    fi
+
+    mkdir -p "$(dirname "$destination")" || startup_error "could not create the $label state directory"
+    if [[ -L "$destination" && "$(readlink "$destination")" == "$source" ]] && node_can_read "$destination"; then
+        return 0
+    fi
+    rm -rf "$destination" || startup_error "could not replace conflicting $label state at $destination"
+    ln -s "$source" "$destination" || startup_error "could not link $label from $source"
+
+    if ! node_can_read "$destination"; then
+        rm -f "$destination" || true
+        startup_error "configured $label source is not readable by node: $source"
+    fi
+}
+
+mkdir -p "$workspace" "$agent_dir"
+
+# Both launchers enter as root. Apple volumes need ownership initialization;
+# Docker also needs root to repair state containing host-absolute Apple links.
+# Drop privileges before repository setup or the requested command starts.
 if [[ $(id -u) -eq 0 ]]; then
-    mkdir -p "$workspace" "$agent_dir"
-    if [[ -n "${HOST_PI_AUTH_FILE:-}" && -f "$HOST_PI_AUTH_FILE" ]]; then
-        rm -f "$agent_dir/auth.json"
-        ln -s "$HOST_PI_AUTH_FILE" "$agent_dir/auth.json"
-    fi
-    if [[ -n "${HOST_HERDR_PI_EXTENSION:-}" && -f "$HOST_HERDR_PI_EXTENSION" ]]; then
-        mkdir -p "$agent_dir/extensions"
-        rm -f "$agent_dir/extensions/herdr-agent-state.ts"
-        ln -s "$HOST_HERDR_PI_EXTENSION" "$agent_dir/extensions/herdr-agent-state.ts"
-    fi
     chown node:node "$workspace"
     # Apple virtiofs bind mounts map writes to the host owner and reject chown,
     # while named workspace volumes require it. The bind remains writable by
     # the unprivileged process despite reporting root ownership in the guest.
     chown node:node "$agent_dir" 2>/dev/null || true
+fi
+
+prepare_runtime_link "Pi auth" "${HOST_PI_AUTH_FILE:-}" "$agent_dir/auth.json"
+prepare_runtime_link "Herdr Pi extension" "${HOST_HERDR_PI_EXTENSION:-}" "$agent_dir/extensions/herdr-agent-state.ts"
+
+if [[ $(id -u) -eq 0 ]]; then
     exec runuser -u node --preserve-environment -- "$0" "$@"
 fi
 

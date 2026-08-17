@@ -6,9 +6,9 @@ without Compose.
 
 Each named agent gets its own persistent clone, branch, network, container, and
 resource limits. Agents share settings, packages, and sessions through the
-project's narrowly mounted `.pi-swarm/shared-pi-state/` directory. Workers link
-only Pi's `auth.json` from the host supervisor's Pi state, keeping OAuth refreshes
-consistent without mounting the host home.
+project's narrowly mounted `.pi-swarm/shared-pi-state/` directory. From the host
+Pi agent directory, workers link only `auth.json` and Herdr's Pi integration
+when present, keeping OAuth refreshes consistent without mounting the host home.
 
 ## What is included
 
@@ -608,12 +608,16 @@ unit tests use temporary Git repositories and a fake runtime boundary instead.
 ## Authentication and browser testing
 
 Workers use the host supervisor's `~/.pi/agent/auth.json` through a targeted
-bind and keep other worker state in `.pi-swarm/shared-pi-state/`. This shares
-Codex login and token refreshes without exposing the rest of the host home. A
-bind directory is used for worker state because Apple container cannot attach
-one writable block volume to multiple VMs. Provider keys exported in the host
-environment are also
-forwarded when present; `.env` files are not loaded automatically.
+bind and keep other worker state in `.pi-swarm/shared-pi-state/`. The same bind
+supplies `extensions/herdr-agent-state.ts` when installed; no other host Pi
+files are linked into worker state. At startup, both Docker and Apple Container
+repair stale machine-absolute links before dropping from the setup user to
+unprivileged `node`. Missing optional files remove dangling managed links rather
+than fabricating replacements. This shares Codex login and token refreshes
+without exposing the rest of the host home. A bind directory is used for worker
+state because Apple container cannot attach one writable block volume to
+multiple VMs. Provider keys exported in the host environment are also forwarded
+when present; `.env` files are not loaded automatically.
 
 Inside an agent:
 

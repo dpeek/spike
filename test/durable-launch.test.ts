@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -76,8 +76,44 @@ async function runEntrypoint(
     AGENT_NAME: "worker-one",
     AGENT_BRANCH: "agent/worker-one",
     REPOSITORY_URL: item.seed,
+    SPIKE_BASE_REVISION: undefined,
+    AGENT_BASE_REF: undefined,
+    SPIKE_LAUNCH_EVIDENCE_TOKEN: undefined,
+    SPIKE_LAUNCH_EVIDENCE_PATH: undefined,
+    HOST_PI_AUTH_FILE: undefined,
+    HOST_HERDR_PI_EXTENSION: undefined,
     ...env,
   });
+}
+
+async function installFakePrivilegeTools(root: string): Promise<string> {
+  const fakeBin = join(root, "fake-privilege-bin");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, "id"), `#!/bin/sh
+if [ "\${SPIKE_TEST_DROPPED:-}" = 1 ]; then
+  case "\${1:-}" in
+    -u) printf '1000\\n' ;;
+    -un) printf 'node\\n' ;;
+    *) printf 'uid=1000(node) gid=1000(node) groups=1000(node)\\n' ;;
+  esac
+else
+  case "\${1:-}" in
+    -u) printf '0\\n' ;;
+    -un) printf 'root\\n' ;;
+    *) printf 'uid=0(root) gid=0(root) groups=0(root)\\n' ;;
+  esac
+fi
+`, { mode: 0o755 });
+  await writeFile(join(fakeBin, "chown"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  await writeFile(join(fakeBin, "runuser"), `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; break; fi
+  shift
+done
+export SPIKE_TEST_DROPPED=1
+exec "$@"
+`, { mode: 0o755 });
+  return `${fakeBin}:${process.env.PATH}`;
 }
 
 async function installFakeDocker(root: string): Promise<{ capturePath: string; env: Record<string, string> }> {
@@ -177,8 +213,13 @@ describe("agent run durable identity propagation", () => {
     const item = await repoFixture();
     const durable = await prepareDurableRun(item.seed);
     const tooling = await installFakeDocker(item.seed);
+    const hostPiState = join(item.root, "host-pi-agent");
+    await mkdir(join(hostPiState, "extensions"), { recursive: true });
+    await writeFile(join(hostPiState, "auth.json"), "test credential placeholder\n");
+    await writeFile(join(hostPiState, "extensions", "herdr-agent-state.ts"), "// test integration\n");
     const result = await execute([process.execPath, cli, "agent", "run", "worker-one", "--", "true"], item.seed, {
       ...tooling.env,
+      SPIKE_HOST_PI_STATE: hostPiState,
       SPIKE_GOAL_ID: durable.goalId,
       SPIKE_TICKET_ID: durable.ticketId,
       SPIKE_RUN_ID: durable.runId,
@@ -186,12 +227,41 @@ describe("agent run durable identity propagation", () => {
       AGENT_BASE_REF: durable.baseRevision,
       SPIKE_BACKEND: "herdr",
     });
-    expect(result.code).not.toBe(127);
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
     const invocation = await readFile(tooling.capturePath, "utf8");
+    expect(invocation).toContain("run --user root");
+    expect(invocation).toContain(`--mount type=bind,source=${hostPiState},target=/host-pi-agent`);
+    expect(invocation).toContain("--env HOST_PI_AUTH_FILE=/host-pi-agent/auth.json");
+    expect(invocation).toContain("--env HOST_HERDR_PI_EXTENSION=/host-pi-agent/extensions/herdr-agent-state.ts");
     expect(invocation).toContain(`--env SPIKE_GOAL_ID=${durable.goalId}`);
     expect(invocation).toContain(`--env SPIKE_TICKET_ID=${durable.ticketId}`);
     expect(invocation).toContain(`--env SPIKE_RUN_ID=${durable.runId}`);
     expect(invocation).toContain(`--env SPIKE_BASE_REVISION=${durable.baseRevision}`);
+  });
+
+  test("mounts the narrow host agent directory for Herdr even when auth is absent", async () => {
+    const item = await repoFixture();
+    const tooling = await installFakeDocker(item.seed);
+    const hostPiState = join(item.root, "host-pi-agent");
+    await mkdir(join(hostPiState, "extensions"), { recursive: true });
+    await writeFile(join(hostPiState, "extensions", "herdr-agent-state.ts"), "// test integration\n");
+    const result = await execute([process.execPath, cli, "agent", "run", "worker-one", "--", "true"], item.seed, {
+      ...tooling.env,
+      SPIKE_HOST_PI_STATE: hostPiState,
+      SPIKE_BASE_REVISION: undefined,
+      AGENT_BASE_REF: undefined,
+      SPIKE_GOAL_ID: undefined,
+      SPIKE_TICKET_ID: undefined,
+      SPIKE_RUN_ID: undefined,
+      SPIKE_REPORT_PATH: undefined,
+      SPIKE_ARTIFACT_ROOT: undefined,
+      SPIKE_LAUNCH_EVIDENCE_TOKEN: undefined,
+    });
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    const invocation = await readFile(tooling.capturePath, "utf8");
+    expect(invocation).toContain(`--mount type=bind,source=${hostPiState},target=/host-pi-agent`);
+    expect(invocation).toContain("--env HOST_HERDR_PI_EXTENSION=/host-pi-agent/extensions/herdr-agent-state.ts");
+    expect(invocation).not.toContain("HOST_PI_AUTH_FILE");
   });
 });
 
@@ -249,6 +319,55 @@ describe("durable launch evidence verification", () => {
       startedAt,
       pid,
     })).toThrow("missing commit");
+  });
+});
+
+describe("runtime auth and Herdr entrypoint portability", () => {
+  test("repairs stale host-absolute links during root setup and runs the command as node", async () => {
+    const item = await repoFixture();
+    const hostPiState = join(item.root, "host-pi-agent");
+    const extension = join(hostPiState, "extensions", "herdr-agent-state.ts");
+    const auth = join(hostPiState, "auth.json");
+    await mkdir(join(hostPiState, "extensions"), { recursive: true });
+    await mkdir(join(item.stateDir, "extensions"), { recursive: true });
+    await writeFile(auth, "test credential placeholder\n");
+    await writeFile(extension, "// test integration\n");
+    await symlink("/Users/old-host/.pi/agent/auth.json", join(item.stateDir, "auth.json"));
+    await symlink("/Users/old-host/.pi/agent/extensions/herdr-agent-state.ts", join(item.stateDir, "extensions", "herdr-agent-state.ts"));
+    const path = await installFakePrivilegeTools(item.root);
+
+    const result = await runEntrypoint(item, {
+      PATH: path,
+      HOST_PI_AUTH_FILE: auth,
+      HOST_HERDR_PI_EXTENSION: extension,
+    }, `id -un > "$AGENT_WORKSPACE/requested-user.txt"
+test -r "$AGENT_STATE_DIR/auth.json"
+test -r "$AGENT_STATE_DIR/extensions/herdr-agent-state.ts"
+`);
+
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    expect(await readFile(join(item.workspace, "requested-user.txt"), "utf8")).toBe("node\n");
+    expect(await readlink(join(item.stateDir, "auth.json"))).toBe(auth);
+    expect(await readlink(join(item.stateDir, "extensions", "herdr-agent-state.ts"))).toBe(extension);
+  });
+
+  test("removes dangling optional links when host integrations are absent", async () => {
+    const item = await repoFixture();
+    await mkdir(join(item.stateDir, "extensions"), { recursive: true });
+    await symlink("/Users/old-host/.pi/agent/auth.json", join(item.stateDir, "auth.json"));
+    await symlink("/Users/old-host/.pi/agent/extensions/herdr-agent-state.ts", join(item.stateDir, "extensions", "herdr-agent-state.ts"));
+    const result = await runEntrypoint(item, {}, `test ! -L "$AGENT_STATE_DIR/auth.json"
+test ! -L "$AGENT_STATE_DIR/extensions/herdr-agent-state.ts"
+`);
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+  });
+
+  test("fails clearly before repository work when a configured source is unavailable", async () => {
+    const item = await repoFixture();
+    const result = await runEntrypoint(item, { HOST_PI_AUTH_FILE: join(item.root, "missing-auth.json") }, "true\n");
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("agent startup: configured Pi auth source is unavailable");
+    expect(await Bun.file(join(item.workspace, "project", ".git")).exists()).toBe(false);
   });
 });
 
@@ -333,7 +452,7 @@ describe("agent entrypoint exact-base bootstrap", () => {
   test("retains HEAD fallback for free-form workers without a durable base", async () => {
     const item = await repoFixture();
     const result = await runEntrypoint(item, {});
-    expect(result.code).toBe(0);
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout);
     expect(await readFile(join(item.workspace, "head.txt"), "utf8")).toBe(`${item.head}\n`);
     expect(await readFile(join(item.workspace, "agent-base.txt"), "utf8")).toBe(`${item.head}\n`);
   });
