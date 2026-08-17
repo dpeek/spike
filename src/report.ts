@@ -21,6 +21,7 @@ const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const findingIdPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
+const nonBlankString = z.string().refine((value) => value.trim().length > 0, "must not be blank");
 const artifactPath = z.string().refine(
   (value) =>
     value.startsWith("artifacts/") &&
@@ -72,13 +73,13 @@ const reviewSubmissionSchema = commonSubmissionSchema
 const reportArtifactSchema = submittedArtifactSchema.extend({ bytes: z.number().int().nonnegative() }).strict();
 const executionSchema = z
   .object({
-    adapter: z.string().min(1),
+    adapter: nonBlankString,
     isolation: z.enum(["workspace", "container"]),
-    worker: z.string().min(1),
-    model: z.string().min(1),
+    worker: nonBlankString,
+    model: nonBlankString,
     startedAt: timestamp,
     finishedAt: timestamp,
-    environmentDigest: z.string().min(1).optional(),
+    environmentDigest: nonBlankString.optional(),
   })
   .strict();
 const reportIdentitySchema = z.object({
@@ -171,6 +172,14 @@ export type PublishImplementationReportInput = TicketIdentity & {
 
 export type PublishReviewReportInput = TicketIdentity & {
   cwd: string;
+  execution: LocalCloneExecution;
+  now?: Date;
+};
+
+export type PublishFailedReportInput = TicketIdentity & {
+  cwd: string;
+  role: "implement" | "review";
+  reason: string;
   execution: LocalCloneExecution;
   now?: Date;
 };
@@ -385,7 +394,11 @@ async function validateReviewSubmission(
   return { metadata, body: document.body, reviewStatement: reviewStatement(document.body), artifacts };
 }
 
-function matchingExecution(execution: LocalCloneExecution, identity: TicketIdentity): void {
+function matchingExecution(
+  execution: LocalCloneExecution,
+  identity: TicketIdentity,
+  requireSuccessfulExit = true,
+): void {
   if (
     execution.goalId !== identity.goalId ||
     execution.changeId !== identity.changeId ||
@@ -393,12 +406,16 @@ function matchingExecution(execution: LocalCloneExecution, identity: TicketIdent
   ) {
     throw new Error("local-clone execution belongs to a different Ticket");
   }
-  if (execution.exitCode !== 0) throw new Error(`worker exited with code ${execution.exitCode}`);
+  if (execution.adapter !== "local-clone" || execution.isolation !== "workspace") {
+    throw new Error("local-clone execution has mismatched adapter provenance");
+  }
+  if (!Number.isInteger(execution.exitCode)) throw new Error("local-clone execution has an invalid exit code");
+  if (requireSuccessfulExit && execution.exitCode !== 0) throw new Error(`worker exited with code ${execution.exitCode}`);
   if (!execution.startedAt || !execution.finishedAt) throw new Error("local-clone execution is missing timestamps");
 }
 
 function executionMetadata(execution: LocalCloneExecution): z.infer<typeof executionSchema> {
-  return executionSchema.parse({
+  const metadata = executionSchema.parse({
     adapter: execution.adapter,
     isolation: execution.isolation,
     worker: execution.worker,
@@ -407,6 +424,16 @@ function executionMetadata(execution: LocalCloneExecution): z.infer<typeof execu
     finishedAt: execution.finishedAt,
     ...(execution.environmentDigest === undefined ? {} : { environmentDigest: execution.environmentDigest }),
   });
+  if (Date.parse(metadata.finishedAt) < Date.parse(metadata.startedAt)) {
+    throw new Error("execution finishedAt must not precede startedAt");
+  }
+  return metadata;
+}
+
+function requireFailureReason(reason: string): string {
+  const normalized = reason.trim();
+  if (!normalized) throw new Error("Failure reason must not be blank");
+  return normalized;
 }
 
 async function loadReportDocument(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
@@ -572,6 +599,41 @@ export function deriveCurrentApproval(
   changeId: string,
 ): Promise<CurrentApproval | undefined> {
   return deriveCurrentReview(root, goalId, changeId, "approve");
+}
+
+export async function publishFailedReport(
+  input: PublishFailedReportInput,
+): Promise<{ root: string; report: TerminalReport }> {
+  const repository = await discoverRepository(input.cwd);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.root, path)) {
+    throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
+  }
+
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (input.role !== ticket.metadata.role) {
+    throw new Error(`failed Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
+  }
+  matchingExecution(input.execution, identity, false);
+  const execution = executionMetadata(input.execution);
+  const reason = requireFailureReason(input.reason);
+  const metadata = terminalReportSchema.parse({
+    kind: "report",
+    goalId: input.goalId,
+    changeId: input.changeId,
+    ticketId: input.ticketId,
+    role: input.role,
+    outcome: "failed",
+    publishedAt: (input.now ?? new Date()).toISOString(),
+    artifacts: [],
+    execution,
+  });
+  const body = `# Ticket failed\n\n${reason}\n`;
+  const report = { metadata, body };
+
+  await installImmutable(repository.root, path, serializeDocument(metadata, body));
+  return { root: repository.root, report };
 }
 
 export async function publishImplementationReport(
