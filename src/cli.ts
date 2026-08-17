@@ -29,7 +29,6 @@ Change creation options:
 
 Ticket issuance options:
   --role <role>                  implement (default) or review
-  --input-revision <commit>       Exact commit; review must use the current Candidate
   --implementation-ticket <id>   Producing Ticket; derived for review when omitted
   --remediation-review <id>       Remediate review Ticket; derived for implementation
   --context <context>             Additional planner-curated context
@@ -151,7 +150,6 @@ function parseTicketIssue(args: string[]): {
   instruction: string;
   curatedContext?: string;
   role: "implement" | "review";
-  inputRevision?: string;
   producingImplementationTicketId?: string;
   remediationReviewTicketId?: string;
   executionPolicy: ExecutionPolicy;
@@ -160,7 +158,6 @@ function parseTicketIssue(args: string[]): {
   let changeId: string | undefined;
   let instruction: string | undefined;
   let curatedContext: string | undefined;
-  let inputRevision: string | undefined;
   let producingImplementationTicketId: string | undefined;
   let remediationReviewTicketId: string | undefined;
   let role: "implement" | "review" = "implement";
@@ -183,9 +180,6 @@ function parseTicketIssue(args: string[]): {
         break;
       case "--context":
         curatedContext = value;
-        break;
-      case "--input-revision":
-        inputRevision = value;
         break;
       case "--role":
         if (value !== "implement" && value !== "review") throw new UsageError(`unsupported Ticket role: ${value}`);
@@ -225,7 +219,6 @@ function parseTicketIssue(args: string[]): {
     role,
     executionPolicy: { isolation, networkAccess, credentialGrants },
     ...(curatedContext === undefined ? {} : { curatedContext }),
-    ...(inputRevision === undefined ? {} : { inputRevision }),
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
     ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),
   };

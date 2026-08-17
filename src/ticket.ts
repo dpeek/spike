@@ -11,7 +11,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { loadGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
-import { deriveCurrentCandidate, deriveCurrentRemediation } from "./report.ts";
+import { deriveCurrentCandidate, deriveCurrentRemediation, loadReportIfPresent } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -62,7 +62,6 @@ export type IssueTicketInput = {
   goalId: string;
   changeId: string;
   role?: "implement" | "review";
-  inputRevision?: string;
   producingImplementationTicketId?: string;
   remediationReviewTicketId?: string;
   instruction: string;
@@ -109,8 +108,7 @@ function nextTicketId(ids: string[]): string {
 async function openTicketId(root: string, goalId: string, changeId: string): Promise<string | undefined> {
   for (const ticketId of await allocatedTicketIds(root, goalId, changeId)) {
     if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
-    await loadTicket(root, goalId, changeId, ticketId);
-    if (!(await documentExists(root, reportPath(root, goalId, changeId, ticketId)))) return ticketId;
+    if ((await ticketStatus(root, goalId, changeId, ticketId)) === "open") return ticketId;
   }
   return undefined;
 }
@@ -169,7 +167,7 @@ export async function ticketStatus(
   ticketId: string,
 ): Promise<TicketStatus> {
   await loadTicket(root, goalId, changeId, ticketId);
-  return (await documentExists(root, reportPath(root, goalId, changeId, ticketId))) ? "reported" : "open";
+  return (await loadReportIfPresent(root, goalId, changeId, ticketId)) === undefined ? "open" : "reported";
 }
 
 export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket> {
@@ -194,16 +192,13 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")),
   });
   const role = input.role ?? "implement";
-  let requestedRevision: string;
+  let derivedRevision: string;
   let producingImplementationTicketId: string | undefined;
   let remediationReviewTicketId: string | undefined;
   let relevantReport: { heading: string; document: string } | undefined;
   if (role === "review") {
     const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
     if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
-    if (input.inputRevision !== undefined && input.inputRevision !== candidate.candidateRevision) {
-      throw new Error(`review Ticket must use current Candidate ${candidate.candidateRevision}`);
-    }
     if (
       input.producingImplementationTicketId !== undefined &&
       input.producingImplementationTicketId !== candidate.producingImplementationTicketId
@@ -212,7 +207,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
         `review Ticket must reference producing implementation Ticket ${candidate.producingImplementationTicketId}`,
       );
     }
-    requestedRevision = candidate.candidateRevision;
+    derivedRevision = candidate.candidateRevision;
     if (input.remediationReviewTicketId !== undefined) {
       throw new Error("review Ticket must not reference a remediation review Ticket");
     }
@@ -230,11 +225,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
       if (input.remediationReviewTicketId !== undefined) {
         throw new Error("initial implement Ticket must not reference a remediation review Ticket");
       }
-      requestedRevision = input.inputRevision ?? change.metadata.baseRevision;
+      derivedRevision = change.metadata.baseRevision;
     } else {
-      if (input.inputRevision !== undefined && input.inputRevision !== candidate.candidateRevision) {
-        throw new Error(`remediation implement Ticket must use current Candidate ${candidate.candidateRevision}`);
-      }
       const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
       if (remediation === undefined) {
         throw new Error(`current Candidate ${candidate.candidateRevision} has no exact remediate review Report`);
@@ -245,7 +237,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
       ) {
         throw new Error(`remediation implement Ticket must use remediate review Ticket ${remediation.reviewTicketId}`);
       }
-      requestedRevision = remediation.candidateRevision;
+      derivedRevision = remediation.candidateRevision;
       remediationReviewTicketId = remediation.reviewTicketId;
       relevantReport = {
         heading: "Remediation review Report",
@@ -253,9 +245,9 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
       };
     }
   }
-  if (!revisionPattern.test(requestedRevision)) throw new Error("Ticket input revision must be an exact commit hash");
-  const inputRevision = await git(repository.root, ["rev-parse", "--verify", `${requestedRevision}^{commit}`]);
-  if (inputRevision !== requestedRevision) throw new Error("Ticket input revision must identify a commit exactly");
+  if (!revisionPattern.test(derivedRevision)) throw new Error("Ticket input revision must be an exact commit hash");
+  const inputRevision = await git(repository.root, ["rev-parse", "--verify", `${derivedRevision}^{commit}`]);
+  if (inputRevision !== derivedRevision) throw new Error("Ticket input revision must identify a commit exactly");
 
   const ticketId = nextTicketId(await allocatedTicketIds(repository.root, input.goalId, input.changeId));
   const metadata = ticketSchema.parse({

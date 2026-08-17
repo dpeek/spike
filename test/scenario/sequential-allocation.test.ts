@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changeDecisionPath, changeStatus, createChange } from "../../src/change.ts";
 import { installImmutable, serializeDocument } from "../../src/durable-state.ts";
@@ -66,10 +66,28 @@ describe("sequential Change and Ticket allocation", () => {
 
     await expect(firstChange(repository, goalId)).rejects.toThrow(`already has unresolved Change 001`);
 
+    const decisionPath = changeDecisionPath(repository.root, goalId, "001");
     await installImmutable(
       repository.root,
-      changeDecisionPath(repository.root, goalId, "001"),
-      serializeDocument({ kind: "change-decision", disposition: "abandon" }, "Superseded."),
+      decisionPath,
+      serializeDocument({ kind: "change-decision", disposition: "abandon" }, "Invalid decision."),
+    );
+    await expect(changeStatus(repository.root, goalId, "001")).rejects.toThrow();
+    await rm(decisionPath);
+
+    await installImmutable(
+      repository.root,
+      decisionPath,
+      serializeDocument(
+        {
+          kind: "change-decision",
+          goalId,
+          changeId: "001",
+          decidedAt: "2026-03-19T10:15:00.000Z",
+          disposition: "abandon",
+        },
+        "Superseded.",
+      ),
     );
     expect(await changeStatus(repository.root, goalId, "001")).toBe("resolved");
     await expect(
@@ -100,28 +118,16 @@ describe("sequential Change and Ticket allocation", () => {
 
   test("issues immutable implement Tickets with exact provenance and derives open status from report presence", async () => {
     const { repository, goalId } = await fixture();
-    await firstChange(repository, goalId);
-    await writeFile(join(repository.root, "candidate-input.txt"), "input\n");
+    const change = await firstChange(repository, goalId);
+    await writeFile(join(repository.root, "candidate-input.txt"), "unrelated host change\n");
     await repository.git("add", "candidate-input.txt");
-    await repository.git("commit", "--quiet", "-m", "Ticket input");
-    const exactInputRevision = await repository.git("rev-parse", "HEAD");
-
-    await expect(
-      issueTicket({
-        cwd: repository.root,
-        goalId,
-        changeId: "001",
-        inputRevision: "HEAD",
-        instruction: "Use a symbolic revision.",
-        executionPolicy,
-      }),
-    ).rejects.toThrow("must be an exact commit hash");
+    await repository.git("commit", "--quiet", "-m", "Advance host after Change creation");
+    const hostRevision = await repository.git("rev-parse", "HEAD");
 
     const first = await issueTicket({
       cwd: repository.root,
       goalId,
       changeId: "001",
-      inputRevision: exactInputRevision,
       instruction: "Implement monotonic Ticket allocation.",
       curatedContext: "Preserve directories left by interrupted publication.",
       executionPolicy,
@@ -135,9 +141,10 @@ describe("sequential Change and Ticket allocation", () => {
       ticketId: "001",
       issuedAt: "2026-03-19T10:20:00.000Z",
       role: "implement",
-      inputRevision: exactInputRevision,
+      inputRevision: change.change.metadata.baseRevision,
       executionPolicy,
     });
+    expect(first.ticket.metadata.inputRevision).not.toBe(hostRevision);
     expect(first.ticket.metadata).not.toHaveProperty("status");
     expect(first.ticket.body).toContain("## Instruction\n\nImplement monotonic Ticket allocation.");
     expect(first.ticket.body).toContain("### Goal\n\n# Sequential workflow");
@@ -156,10 +163,36 @@ describe("sequential Change and Ticket allocation", () => {
       }),
     ).rejects.toThrow("already has open Ticket 001");
 
+    const interruptedReport = {
+      kind: "report",
+      goalId,
+      changeId: "001",
+      ticketId: "001",
+      role: "implement",
+      outcome: "interrupted",
+      publishedAt: "2026-03-19T10:21:00.000Z",
+      artifacts: [],
+      execution: {
+        adapter: "local-clone",
+        isolation: "workspace",
+        worker: "controlled-worker",
+        model: "none",
+        startedAt: "2026-03-19T10:20:00.000Z",
+        finishedAt: "2026-03-19T10:21:00.000Z",
+      },
+    };
+    const interruptedReportPath = reportPath(repository.root, goalId, "001", "001");
     await installImmutable(
       repository.root,
-      reportPath(repository.root, goalId, "001", "001"),
-      serializeDocument({ kind: "report", outcome: "interrupted" }, "Worker interrupted."),
+      interruptedReportPath,
+      serializeDocument({ ...interruptedReport, role: "review" }, "Worker interrupted."),
+    );
+    await expect(ticketStatus(repository.root, goalId, "001", "001")).rejects.toThrow("role does not match");
+    await rm(interruptedReportPath);
+    await installImmutable(
+      repository.root,
+      interruptedReportPath,
+      serializeDocument(interruptedReport, "Worker interrupted."),
     );
     expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
 

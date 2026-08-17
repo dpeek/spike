@@ -81,17 +81,17 @@ const executionSchema = z
     environmentDigest: z.string().min(1).optional(),
   })
   .strict();
-const commonReportSchema = z.object({
+const reportIdentitySchema = z.object({
   kind: z.literal("report"),
   goalId: z.string().regex(goalIdPattern),
   changeId: z.string().regex(sequenceIdPattern),
   ticketId: z.string().regex(sequenceIdPattern),
-  outcome: z.literal("completed"),
   publishedAt: timestamp,
   artifacts: z.array(reportArtifactSchema),
   execution: executionSchema,
 });
-const implementationReportSchema = commonReportSchema
+const completedReportSchema = reportIdentitySchema.extend({ outcome: z.literal("completed") });
+const implementationReportSchema = completedReportSchema
   .extend({
     role: z.literal("implement"),
     baseRevision: z.string().regex(revisionPattern),
@@ -100,7 +100,7 @@ const implementationReportSchema = commonReportSchema
     candidateRevision: z.string().regex(revisionPattern),
   })
   .strict();
-const reviewReportSchema = commonReportSchema
+const reviewReportSchema = completedReportSchema
   .extend({
     role: z.literal("review"),
     reviewedRevision: z.string().regex(revisionPattern),
@@ -112,7 +112,13 @@ const reviewReportSchema = commonReportSchema
     verdict: z.literal("remediate"),
   })
   .strict();
-const reportSchema = z.discriminatedUnion("role", [implementationReportSchema, reviewReportSchema]);
+const terminalReportSchema = reportIdentitySchema
+  .extend({
+    role: z.enum(["implement", "review"]),
+    outcome: z.enum(["partial", "blocked", "failed", "stopped", "interrupted"]),
+  })
+  .strict();
+const reportSchema = z.union([implementationReportSchema, reviewReportSchema, terminalReportSchema]);
 
 export type ImplementationReport = {
   metadata: z.infer<typeof implementationReportSchema>;
@@ -124,7 +130,20 @@ export type ReviewReport = {
   body: string;
 };
 
-export type Report = ImplementationReport | ReviewReport;
+export type TerminalReport = {
+  metadata: z.infer<typeof terminalReportSchema>;
+  body: string;
+};
+
+export type Report = ImplementationReport | ReviewReport | TerminalReport;
+
+function isImplementationReport(report: Report): report is ImplementationReport {
+  return report.metadata.outcome === "completed" && report.metadata.role === "implement";
+}
+
+function isReviewReport(report: Report): report is ReviewReport {
+  return report.metadata.outcome === "completed" && report.metadata.role === "review";
+}
 
 export type CurrentCandidate = {
   candidateRevision: string;
@@ -384,12 +403,33 @@ async function loadReportDocument(root: string, goalId: string, changeId: string
   if (metadata.goalId !== goalId || metadata.changeId !== changeId || metadata.ticketId !== ticketId) {
     throw new Error(`Report document belongs to a different Ticket: ${metadata.goalId}/${metadata.changeId}/${metadata.ticketId}`);
   }
-  return metadata.role === "implement"
-    ? { metadata, body: document.body }
-    : { metadata, body: document.body };
+  const ticket = await loadTicket(root, goalId, changeId, ticketId);
+  if (metadata.role !== ticket.metadata.role) {
+    throw new Error(`Report ${goalId}/${changeId}/${ticketId} role does not match its Ticket`);
+  }
+  if (metadata.outcome !== "completed" && !document.body.trim()) {
+    throw new Error(`terminal Report ${goalId}/${changeId}/${ticketId} must explain its outcome`);
+  }
+  if (metadata.outcome === "completed" && metadata.role === "implement") {
+    return { metadata, body: document.body };
+  }
+  if (metadata.outcome === "completed" && metadata.role === "review") {
+    return { metadata, body: document.body };
+  }
+  return { metadata, body: document.body };
 }
 
 export async function loadReport(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
+  return loadReportDocument(root, goalId, changeId, ticketId);
+}
+
+export async function loadReportIfPresent(
+  root: string,
+  goalId: string,
+  changeId: string,
+  ticketId: string,
+): Promise<Report | undefined> {
+  if (!(await documentExists(root, reportPath(root, goalId, changeId, ticketId)))) return undefined;
   return loadReportDocument(root, goalId, changeId, ticketId);
 }
 
@@ -400,7 +440,9 @@ export async function loadImplementationReport(
   ticketId: string,
 ): Promise<ImplementationReport> {
   const report = await loadReportDocument(root, goalId, changeId, ticketId);
-  if (report.metadata.role !== "implement") throw new Error(`Report ${goalId}/${changeId}/${ticketId} is not an implementation Report`);
+  if (!isImplementationReport(report)) {
+    throw new Error(`Report ${goalId}/${changeId}/${ticketId} is not a completed implementation Report`);
+  }
   return { metadata: report.metadata, body: report.body };
 }
 
@@ -411,7 +453,9 @@ export async function loadReviewReport(
   ticketId: string,
 ): Promise<ReviewReport> {
   const report = await loadReportDocument(root, goalId, changeId, ticketId);
-  if (report.metadata.role !== "review") throw new Error(`Report ${goalId}/${changeId}/${ticketId} is not a review Report`);
+  if (!isReviewReport(report)) {
+    throw new Error(`Report ${goalId}/${changeId}/${ticketId} is not a completed review Report`);
+  }
   return { metadata: report.metadata, body: report.body };
 }
 
@@ -426,12 +470,8 @@ export async function deriveCurrentCandidate(
     .sort()
     .reverse();
   for (const ticketId of ticketIds) {
-    const path = reportPath(root, goalId, changeId, ticketId);
-    if (!(await documentExists(root, path))) continue;
-    const document = await readDocument(root, path);
-    const metadata = document.metadata as Record<string, unknown>;
-    if (metadata["role"] !== "implement" || metadata["outcome"] !== "completed") continue;
-    const report = await loadImplementationReport(root, goalId, changeId, ticketId);
+    const report = await loadReportIfPresent(root, goalId, changeId, ticketId);
+    if (report === undefined || !isImplementationReport(report)) continue;
     return {
       candidateRevision: report.metadata.candidateRevision,
       producingImplementationTicketId: ticketId,
@@ -455,16 +495,10 @@ export async function deriveCurrentRemediation(
     .sort()
     .reverse();
   for (const ticketId of ticketIds) {
-    const path = reportPath(root, goalId, changeId, ticketId);
-    if (!(await documentExists(root, path))) continue;
-    const document = await readDocument(root, path);
-    const metadata = document.metadata as Record<string, unknown>;
-    if (metadata["role"] !== "review" || metadata["outcome"] !== "completed") continue;
+    const reviewReport = await loadReportIfPresent(root, goalId, changeId, ticketId);
+    if (reviewReport === undefined || !isReviewReport(reviewReport)) continue;
 
-    const [reviewReport, reviewTicket] = await Promise.all([
-      loadReviewReport(root, goalId, changeId, ticketId),
-      loadTicket(root, goalId, changeId, ticketId),
-    ]);
+    const reviewTicket = await loadTicket(root, goalId, changeId, ticketId);
     if (
       reviewTicket.metadata.role !== "review" ||
       reviewTicket.metadata.inputRevision !== reviewReport.metadata.reviewedRevision ||

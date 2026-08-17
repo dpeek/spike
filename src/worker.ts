@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { installImmutable, serializeDocument } from "./durable-state.ts";
 import { createInputBundle } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
-import { loadTicket, reportPath } from "./ticket.ts";
+import { loadTicket, ticketStatus } from "./ticket.ts";
 
 export type TicketIdentity = {
   goalId: string;
@@ -107,7 +107,7 @@ The completed Submission body must contain Summary, Verification, Assumptions, L
 
 export async function prepareTicketExchange(root: string, identity: TicketIdentity): Promise<TicketExchange> {
   const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
-  if (await pathExists(reportPath(root, identity.goalId, identity.changeId, identity.ticketId))) {
+  if ((await ticketStatus(root, identity.goalId, identity.changeId, identity.ticketId)) === "reported") {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} is already reported`);
   }
   const exchange = exchangePath(root, identity);

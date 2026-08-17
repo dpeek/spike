@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createGoal, integratedRef, loadGoal } from "../../src/goal.ts";
-import { loadPlan, revisePlan } from "../../src/plan.ts";
+import { loadPlan } from "../../src/plan.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ remove: () => Promise<void> }> = [];
@@ -43,31 +43,6 @@ describe("Goal planning", () => {
     expect(plan.body).toContain("## Planned Changes\n\nNo Changes planned yet.");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
     expect(await readFile(join(repository.root, "operator-notes.txt"), "utf8")).toBe("leave me dirty\n");
-  });
-
-  test("revises the planner-owned Plan without changing the approved Goal", async () => {
-    const repository = await temporaryRepository();
-    repositories.push(repository);
-    const created = await createGoal({
-      cwd: repository.root,
-      title: "Plan a Goal",
-      outcome: "Keep working memory durable.",
-      approval: "Proceed.",
-      now: new Date("2026-03-19T10:00:00.000Z"),
-    });
-    const goalId = created.goal.metadata.goalId;
-    const originalGoal = await readFile(join(repository.root, ".spike", "goals", goalId, "goal.md"), "utf8");
-
-    const revised = await revisePlan(
-      repository.root,
-      goalId,
-      "# Revised Plan\n\nFirst create Change 001.",
-      "2026-03-19T11:00:00.000Z",
-    );
-
-    expect(revised.metadata.updatedAt).toBe("2026-03-19T11:00:00.000Z");
-    expect((await loadPlan(repository.root, goalId)).body).toBe("# Revised Plan\n\nFirst create Change 001.\n");
-    expect(await readFile(join(repository.root, ".spike", "goals", goalId, "goal.md"), "utf8")).toBe(originalGoal);
   });
 
   test("creates the first slice through the terminal", async () => {

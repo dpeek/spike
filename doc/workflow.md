@@ -766,7 +766,7 @@ Do not create a mirrored unit-test tree under `test/`.
 
 ### Fast default suite
 
-The default Bun suite should remain under roughly two seconds and contain no network, Docker, Pi, Herdr, or model calls. Pure parsing, schema, derivation, allocation, and churn tests operate on strings and objects and may run concurrently.
+The default Bun suite should remain fast enough for frequent use and contain no network, Docker, Pi, Herdr, or model calls. Use real filesystem and Git integration tests deliberately for complete workflows and high-risk seams; prefer focused tests for parsing, schema, derivation, allocation, and churn where they provide equivalent confidence. Pure focused tests may run concurrently.
 
 Filesystem and Git behavior uses temporary directories and the real Git CLI. Do not introduce an in-memory filesystem or Git implementation: atomic rename, exclusive creation, symlink handling, bundles, refs, and commit identity are part of the production behavior under test. Use Git plumbing, deterministic scripted workers, injected clocks and crash points, and the production modules. Do not sleep or poll in default tests.
 

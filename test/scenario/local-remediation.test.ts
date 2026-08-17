@@ -158,13 +158,38 @@ describe("Candidate remediation", () => {
       worker: "independent-reviewer",
       model: "none",
     });
-    await publishReviewReport({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      ticketId: "002",
-      execution: reviewExecution.execution,
-    });
+    const reviewOutput = reviewExecution.exchange.outputDirectory;
+    const validReviewSubmission = await readFile(join(reviewOutput, "submission.md"), "utf8");
+    const publishReview = () =>
+      publishReviewReport({
+        cwd: repository.root,
+        goalId,
+        changeId: "001",
+        ticketId: "002",
+        execution: reviewExecution.execution,
+      });
+
+    await writeFile(
+      join(reviewOutput, "submission.md"),
+      validReviewSubmission.replace(`"reviewedRevision": "${candidateA}"`, `"reviewedRevision": "${baseRevision}"`),
+    );
+    await expect(publishReview()).rejects.toThrow("expected Candidate");
+    await writeFile(
+      join(reviewOutput, "submission.md"),
+      validReviewSubmission.replace('"producingImplementationTicketId": "001"', '"producingImplementationTicketId": "999"'),
+    );
+    await expect(publishReview()).rejects.toThrow("expected 001");
+    await writeFile(
+      join(reviewOutput, "submission.md"),
+      validReviewSubmission.replace("The remediated tree replaces Candidate A.", "An undeclared criterion."),
+    );
+    await expect(publishReview()).rejects.toThrow("assess every Change acceptance criterion");
+    await writeFile(join(reviewOutput, "submission.md"), validReviewSubmission);
+    await writeFile(join(reviewOutput, "repository.bundle"), "review must not return Git output\n");
+    await expect(publishReview()).rejects.toThrow("unexpected Ticket output path: repository.bundle");
+    await rm(join(reviewOutput, "repository.bundle"));
+
+    await publishReview();
     expect(await deriveCurrentRemediation(repository.root, goalId, "001")).toMatchObject({
       candidateRevision: candidateA,
       producingImplementationTicketId: "001",
@@ -177,18 +202,6 @@ describe("Candidate remediation", () => {
         cwd: repository.root,
         goalId,
         changeId: "001",
-        inputRevision: baseRevision,
-        remediationReviewTicketId: "002",
-        instruction: "Use a stale Candidate.",
-        executionPolicy: policy,
-      }),
-    ).rejects.toThrow("must use current Candidate");
-    await expect(
-      issueTicket({
-        cwd: repository.root,
-        goalId,
-        changeId: "001",
-        inputRevision: candidateA,
         remediationReviewTicketId: "001",
         instruction: "Use a mismatched review.",
         executionPolicy: policy,
@@ -288,12 +301,11 @@ describe("Candidate remediation", () => {
         cwd: repository.root,
         goalId,
         changeId: "001",
-        inputRevision: candidateA,
         remediationReviewTicketId: "002",
         instruction: "Retry the stale Candidate A review pair.",
         executionPolicy: policy,
       }),
-    ).rejects.toThrow(`must use current Candidate ${candidateB}`);
+    ).rejects.toThrow(`current Candidate ${candidateB} has no exact remediate review Report`);
     expect(await Bun.file(ticketPath(repository.root, goalId, "001", "004")).exists()).toBe(false);
 
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);

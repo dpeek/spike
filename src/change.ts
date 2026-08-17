@@ -23,9 +23,30 @@ const changeSchema = z
     baseRevision: z.string().regex(revisionPattern),
   })
   .strict();
+const decisionIdentitySchema = z.object({
+  kind: z.literal("change-decision"),
+  goalId: z.string().regex(goalIdPattern),
+  changeId: z.string().regex(sequenceIdPattern),
+  decidedAt: timestamp,
+});
+const changeDecisionSchema = z.discriminatedUnion("disposition", [
+  decisionIdentitySchema
+    .extend({
+      disposition: z.literal("land"),
+      approvedRevision: z.string().regex(revisionPattern),
+    })
+    .strict(),
+  decisionIdentitySchema.extend({ disposition: z.literal("reject") }).strict(),
+  decisionIdentitySchema.extend({ disposition: z.literal("abandon") }).strict(),
+]);
 
 export type Change = {
   metadata: z.infer<typeof changeSchema>;
+  body: string;
+};
+
+export type ChangeDecision = {
+  metadata: z.infer<typeof changeDecisionSchema>;
   body: string;
 };
 
@@ -119,8 +140,7 @@ function nextId(ids: string[], label: string): string {
 async function unresolvedChangeId(root: string, goalId: string): Promise<string | undefined> {
   for (const changeId of await allocatedChangeIds(root, goalId)) {
     if (!(await documentExists(root, changePath(root, goalId, changeId)))) continue;
-    await loadChange(root, goalId, changeId);
-    if (!(await documentExists(root, changeDecisionPath(root, goalId, changeId)))) return changeId;
+    if ((await changeStatus(root, goalId, changeId)) === "active") return changeId;
   }
   return undefined;
 }
@@ -134,9 +154,32 @@ export async function loadChange(root: string, goalId: string, changeId: string)
   return { metadata, body: document.body };
 }
 
+export async function loadChangeDecision(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<ChangeDecision> {
+  const document = await readDocument(root, changeDecisionPath(root, goalId, changeId));
+  const metadata = changeDecisionSchema.parse(document.metadata);
+  if (metadata.goalId !== goalId || metadata.changeId !== changeId) {
+    throw new Error(`Change decision belongs to a different Change: ${metadata.goalId}/${metadata.changeId}`);
+  }
+  if (!document.body.trim()) throw new Error(`Change decision ${goalId}/${changeId} must contain a statement`);
+  return { metadata, body: document.body };
+}
+
+export async function loadChangeDecisionIfPresent(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<ChangeDecision | undefined> {
+  if (!(await documentExists(root, changeDecisionPath(root, goalId, changeId)))) return undefined;
+  return loadChangeDecision(root, goalId, changeId);
+}
+
 export async function changeStatus(root: string, goalId: string, changeId: string): Promise<ChangeStatus> {
   await loadChange(root, goalId, changeId);
-  return (await documentExists(root, changeDecisionPath(root, goalId, changeId))) ? "resolved" : "active";
+  return (await loadChangeDecisionIfPresent(root, goalId, changeId)) === undefined ? "active" : "resolved";
 }
 
 export async function createChange(input: CreateChangeInput): Promise<CreatedChange> {

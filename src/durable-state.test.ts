@@ -39,6 +39,23 @@ describe("durable Markdown documents", () => {
     }
   });
 
+  test("publishes one complete immutable document without replacement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "spike-state-"));
+    const path = join(root, ".spike", "report.md");
+    try {
+      const publications = await Promise.allSettled([
+        installImmutable(root, path, serializeDocument({ kind: "report", ticket: "first" }, "first")),
+        installImmutable(root, path, serializeDocument({ kind: "report", ticket: "second" }, "second")),
+      ]);
+
+      expect(publications.filter((publication) => publication.status === "fulfilled")).toHaveLength(1);
+      expect(publications.filter((publication) => publication.status === "rejected")).toHaveLength(1);
+      expect(["first\n", "second\n"]).toContain((await readDocument(root, path)).body);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects symlinked workflow paths", async () => {
     const root = await mkdtemp(join(tmpdir(), "spike-state-"));
     const outside = await mkdtemp(join(tmpdir(), "spike-outside-"));

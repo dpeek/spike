@@ -21,7 +21,7 @@ Minimalism and simplicity above all else. Follow `doc/workflow.md` and use its d
 
 ## Tests
 
-- Keep the default suite useful and under roughly two seconds.
+- Keep the default suite useful and fast enough for frequent use. Reserve integration tests for complete workflows and high-risk seams; prefer focused tests where they provide equivalent confidence.
 - Collocate focused tests as `src/**/*.test.ts`.
 - Put scenarios in `test/scenario/`, adapter contracts in `test/contract/`, Docker tests in `test/docker/`, and helpers in `test/support/`.
 - Use real temporary filesystems and real Git. Do not add in-memory filesystem or Git implementations.

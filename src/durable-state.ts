@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { open, lstat, mkdir, readFile, readdir, rename, realpath, rm } from "node:fs/promises";
+import { link, open, lstat, mkdir, readFile, readdir, rename, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const defaultMaximumBytes = 128 * 1024;
@@ -91,15 +91,24 @@ async function writeSynced(path: string, contents: string): Promise<void> {
 
 export async function installImmutable(root: string, path: string, contents: string): Promise<void> {
   await prepareParent(root, path);
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   try {
-    await writeSynced(path, contents);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`immutable workflow document already exists: ${path}`);
+    await writeSynced(temporary, contents);
+    try {
+      // A same-directory hard link publishes the fully synced file without
+      // replacing an existing immutable document.
+      await link(temporary, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`immutable workflow document already exists: ${path}`);
+      }
+      throw error;
     }
-    throw error;
+    await rm(temporary);
+    await syncDirectory(dirname(path));
+  } finally {
+    await rm(temporary, { force: true });
   }
-  await syncDirectory(dirname(path));
 }
 
 export async function replaceAtomic(root: string, path: string, contents: string): Promise<void> {
