@@ -9,6 +9,7 @@ import {
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
+import { deriveCurrentApproval, deriveCurrentCandidate } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -67,6 +68,19 @@ export type CreateChangeInput = {
 export type CreatedChange = {
   root: string;
   change: Change;
+};
+
+export type LandChangeInput = {
+  cwd: string;
+  goalId: string;
+  changeId: string;
+  statement?: string;
+  now?: Date;
+};
+
+export type LandedChange = {
+  root: string;
+  decision: ChangeDecision;
 };
 
 function changesPath(root: string, goalId: string): string {
@@ -180,6 +194,82 @@ export async function loadChangeDecisionIfPresent(
 export async function changeStatus(root: string, goalId: string, changeId: string): Promise<ChangeStatus> {
   await loadChange(root, goalId, changeId);
   return (await loadChangeDecisionIfPresent(root, goalId, changeId)) === undefined ? "active" : "resolved";
+}
+
+export async function landChange(input: LandChangeInput): Promise<LandedChange> {
+  const repository = await discoverRepository(input.cwd);
+  const decisionDocumentPath = changeDecisionPath(repository.root, input.goalId, input.changeId);
+  if (await documentExists(repository.root, decisionDocumentPath)) {
+    throw new Error(`Change ${input.goalId}/${input.changeId} already has a terminal decision`);
+  }
+
+  await loadGoal(repository.root, input.goalId);
+  const change = await loadChange(repository.root, input.goalId, input.changeId);
+  const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  if (candidate === undefined) {
+    throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
+  }
+  const approval = await deriveCurrentApproval(repository.root, input.goalId, input.changeId);
+  if (approval === undefined) {
+    throw new Error(`current Candidate ${candidate.candidateRevision} has no exact approve review Report`);
+  }
+  if (
+    approval.candidateRevision !== candidate.candidateRevision ||
+    approval.producingImplementationTicketId !== candidate.producingImplementationTicketId ||
+    approval.reviewReport.metadata.reviewedRevision !== candidate.candidateRevision ||
+    approval.reviewReport.metadata.producingImplementationTicketId !== candidate.producingImplementationTicketId
+  ) {
+    throw new Error("approve review Report does not select the current Candidate and its producing implementation Ticket");
+  }
+  if (candidate.report.metadata.baseRevision !== change.metadata.baseRevision) {
+    throw new Error("current Candidate implementation Report does not match the Change base revision");
+  }
+
+  const ref = integratedRef(input.goalId);
+  const integratedRevision = await git(repository.root, ["rev-parse", "--verify", `${ref}^{commit}`]);
+  let symbolicTarget: string | undefined;
+  try {
+    symbolicTarget = await git(repository.root, ["symbolic-ref", "-q", ref]);
+  } catch {
+    // A direct ref is required and makes symbolic-ref exit non-zero.
+  }
+  if (symbolicTarget !== undefined) {
+    throw new Error(`Goal integration ref must be direct, not symbolic to ${symbolicTarget}`);
+  }
+  if (integratedRevision !== change.metadata.baseRevision) {
+    throw new Error(
+      `Change base ${change.metadata.baseRevision} does not equal Goal integrated revision ${integratedRevision}`,
+    );
+  }
+
+  const commit = (await git(repository.root, ["rev-list", "--parents", "-n", "1", candidate.candidateRevision])).split(
+    /\s+/,
+  );
+  if (
+    commit.length !== 2 ||
+    commit[0] !== candidate.candidateRevision ||
+    commit[1] !== change.metadata.baseRevision
+  ) {
+    throw new Error("approved Candidate must be one commit directly on the Change base revision");
+  }
+
+  const metadata = changeDecisionSchema.parse({
+    kind: "change-decision",
+    goalId: input.goalId,
+    changeId: input.changeId,
+    decidedAt: (input.now ?? new Date()).toISOString(),
+    disposition: "land",
+    approvedRevision: candidate.candidateRevision,
+  });
+  const body =
+    input.statement === undefined
+      ? `# Land Change\n\nCandidate \`${candidate.candidateRevision}\` was approved by review Ticket ${approval.reviewTicketId}.\n`
+      : `${requireText(input.statement, "Change decision statement")}\n`;
+  const decision = { metadata, body };
+
+  await installImmutable(repository.root, decisionDocumentPath, serializeDocument(metadata, body));
+  await git(repository.root, ["update-ref", "--no-deref", ref, candidate.candidateRevision, change.metadata.baseRevision]);
+  return { root: repository.root, decision };
 }
 
 export async function createChange(input: CreateChangeInput): Promise<CreatedChange> {

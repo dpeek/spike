@@ -83,7 +83,7 @@ The private checkout starts at the exact Candidate \`${inputRevision}\`.
 
 Write only to \`SPIKE_OUTPUT_DIR\`:
 
-- \`submission.md\` — JSON-frontmatter Markdown with kind \`submission\`, the full Ticket identity, outcome \`completed\`, \`reviewedRevision\`, \`producingImplementationTicketId\`, \`findings\`, \`acceptanceAssessment\`, verdict \`remediate\`, and declared \`artifacts\`;
+- \`submission.md\` — JSON-frontmatter Markdown with kind \`submission\`, the full Ticket identity, outcome \`completed\`, \`reviewedRevision\`, \`producingImplementationTicketId\`, \`findings\`, \`acceptanceAssessment\`, verdict \`remediate\` or \`approve\`, and declared \`artifacts\`;
 - files below \`artifacts/\` that are declared by path and SHA-256 digest in the Submission.
 
 Each finding requires a stable kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and a non-blank \`statement\`. Assess every acceptance criterion exactly once as \`met\`, \`not-met\`, or \`unclear\`, with evidence. Do not write an output Git bundle. The completed Submission body must contain a non-blank Review statement section.

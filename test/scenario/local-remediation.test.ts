@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createChange } from "../../src/change.ts";
+import { createChange, landChange, loadChangeDecision } from "../../src/change.ts";
 import { candidateRef } from "../../src/git-change.ts";
-import { createGoal } from "../../src/goal.ts";
+import { createGoal, integratedRef } from "../../src/goal.ts";
 import {
+  deriveCurrentApproval,
   deriveCurrentCandidate,
   deriveCurrentRemediation,
   loadImplementationReport,
@@ -37,15 +38,21 @@ const output = process.env.SPIKE_OUTPUT_DIR;
 const head = await git("rev-parse", "HEAD");
 if (head !== process.env.SPIKE_INPUT_REVISION) throw new Error("worker checkout does not match Ticket input");
 
-if (id === "002") {
+if (id === "002" || id === "004") {
+  const approve = id === "004";
   const metadata = {
     kind: "submission", goalId: process.env.SPIKE_GOAL_ID, changeId: process.env.SPIKE_CHANGE_ID,
-    ticketId: id, outcome: "completed", reviewedRevision: head, producingImplementationTicketId: "001",
-    findings: [{ id: "correctness-001", severity: "high", statement: "Replace Candidate A with the remediated behavior." }],
-    acceptanceAssessment: [{ criterion: "The remediated tree replaces Candidate A.", assessment: "not-met", evidence: "correctness-001 remains open." }],
-    verdict: "remediate", artifacts: [],
+    ticketId: id, outcome: "completed", reviewedRevision: head,
+    producingImplementationTicketId: approve ? "003" : "001",
+    findings: approve ? [] : [{ id: "correctness-001", severity: "high", statement: "Replace Candidate A with the remediated behavior." }],
+    acceptanceAssessment: [{
+      criterion: "The remediated tree replaces Candidate A.", assessment: approve ? "met" : "not-met",
+      evidence: approve ? "Candidate B contains the remediated behavior." : "correctness-001 remains open.",
+    }],
+    verdict: approve ? "approve" : "remediate", artifacts: [],
   };
-  const body = "# Review evidence\n\n## Review statement\n\nCandidate A must address correctness-001.\n";
+  const statement = approve ? "Candidate B satisfies every acceptance criterion." : "Candidate A must address correctness-001.";
+  const body = "# Review evidence\n\n## Review statement\n\n" + statement + "\n";
   await writeFile(join(output, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
 } else {
   await git("config", "user.name", "Controlled Implementer");
@@ -94,8 +101,8 @@ async function makeInputRemovable(inputDirectory: string): Promise<void> {
   ]);
 }
 
-describe("Candidate remediation", () => {
-  test("implements 003 from exact Candidate A and review 002, then publishes normalized Candidate B", async () => {
+describe("Candidate remediation and landing", () => {
+  test("implements 003, approves review 004 on exact Candidate B, and lands the Change", async () => {
     const repository = await temporaryRepository();
     repositories.push(repository);
     const goal = await createGoal({
@@ -294,6 +301,7 @@ describe("Candidate remediation", () => {
       producingImplementationTicketId: "003",
     });
     expect(await deriveCurrentRemediation(repository.root, goalId, "001")).toBeUndefined();
+    expect(await deriveCurrentApproval(repository.root, goalId, "001")).toBeUndefined();
 
     await expect(publishImplementationReport(publicationInput)).rejects.toThrow("immutable Report already exists");
     await expect(
@@ -306,8 +314,139 @@ describe("Candidate remediation", () => {
         executionPolicy: policy,
       }),
     ).rejects.toThrow(`current Candidate ${candidateB} has no exact remediate review Report`);
+    await expect(
+      landChange({ cwd: repository.root, goalId, changeId: "001" }),
+    ).rejects.toThrow(`current Candidate ${candidateB} has no exact approve review Report`);
+    await expect(
+      issueTicket({
+        cwd: repository.root,
+        goalId,
+        changeId: "001",
+        role: "review",
+        producingImplementationTicketId: "001",
+        instruction: "Review stale Candidate A.",
+        executionPolicy: policy,
+      }),
+    ).rejects.toThrow("must reference producing implementation Ticket 003");
     expect(await Bun.file(ticketPath(repository.root, goalId, "001", "004")).exists()).toBe(false);
 
+    const approvalTicket = await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      role: "review",
+      instruction: "Assess every acceptance criterion on exact Candidate B.",
+      executionPolicy: policy,
+    });
+    expect(approvalTicket.ticket.metadata).toMatchObject({
+      ticketId: "004",
+      role: "review",
+      inputRevision: candidateB,
+      producingImplementationTicketId: "003",
+    });
+    expect(approvalTicket.ticket.body).toContain("### Producing implementation Report");
+    expect(approvalTicket.ticket.body).toContain(`\"candidateRevision\": \"${candidateB}\"`);
+    expect(approvalTicket.ticket.body).toContain("Produced implementation 003.");
+
+    const approvalExecution = await dispatchLocalReview({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      ticketId: "004",
+      command: ["bun", "-e", worker],
+      worker: "independent-approver",
+      model: "none",
+    });
+    const approvalOutput = approvalExecution.exchange.outputDirectory;
+    const validApprovalSubmission = await readFile(join(approvalOutput, "submission.md"), "utf8");
+    const publishApproval = () =>
+      publishReviewReport({
+        cwd: repository.root,
+        goalId,
+        changeId: "001",
+        ticketId: "004",
+        execution: approvalExecution.execution,
+        now: new Date("2026-03-22T10:10:00.000Z"),
+      });
+
+    await writeFile(
+      join(approvalOutput, "submission.md"),
+      validApprovalSubmission.replace(`\"reviewedRevision\": \"${candidateB}\"`, `\"reviewedRevision\": \"${candidateA}\"`),
+    );
+    await expect(publishApproval()).rejects.toThrow("expected Candidate");
+    await writeFile(
+      join(approvalOutput, "submission.md"),
+      validApprovalSubmission.replace('"producingImplementationTicketId": "003"', '"producingImplementationTicketId": "001"'),
+    );
+    await expect(publishApproval()).rejects.toThrow("expected 003");
+    await writeFile(
+      join(approvalOutput, "submission.md"),
+      validApprovalSubmission.replace('"assessment": "met"', '"assessment": "unclear"'),
+    );
+    await expect(publishApproval()).rejects.toThrow("assess every acceptance criterion as met");
+    await writeFile(join(approvalOutput, "submission.md"), validApprovalSubmission);
+
+    const approvalPublication = await publishApproval();
+    expect(approvalPublication.report.metadata).toMatchObject({
+      ticketId: "004",
+      reviewedRevision: candidateB,
+      producingImplementationTicketId: "003",
+      verdict: "approve",
+      findings: [],
+      acceptanceAssessment: [{
+        criterion: "The remediated tree replaces Candidate A.",
+        assessment: "met",
+        evidence: "Candidate B contains the remediated behavior.",
+      }],
+      reviewer: "independent-approver",
+      publishedAt: "2026-03-22T10:10:00.000Z",
+    });
+    expect(await deriveCurrentApproval(repository.root, goalId, "001")).toMatchObject({
+      candidateRevision: candidateB,
+      producingImplementationTicketId: "003",
+      reviewTicketId: "004",
+      reviewReport: { metadata: { verdict: "approve", reviewedRevision: candidateB } },
+    });
+    await expect(publishApproval()).rejects.toThrow("immutable Report already exists");
+
+    const reportSources = await Promise.all(["001", "002", "003", "004"].map((ticketId) =>
+      readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
+    ));
+    await repository.git("update-ref", integratedRef(goalId), hostHead, baseRevision);
+    await expect(
+      landChange({ cwd: repository.root, goalId, changeId: "001" }),
+    ).rejects.toThrow("does not equal Goal integrated revision");
+    await repository.git("update-ref", integratedRef(goalId), baseRevision, hostHead);
+
+    const landed = await landChange({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      now: new Date("2026-03-22T10:20:00.000Z"),
+    });
+    expect(landed.decision.metadata).toEqual({
+      kind: "change-decision",
+      goalId,
+      changeId: "001",
+      decidedAt: "2026-03-22T10:20:00.000Z",
+      disposition: "land",
+      approvedRevision: candidateB,
+    });
+    expect((await loadChangeDecision(repository.root, goalId, "001")).metadata).toEqual(landed.decision.metadata);
+    expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(candidateB);
+    expect(await repository.git("rev-list", "--count", `${baseRevision}..${integratedRef(goalId)}`)).toBe("1");
+    expect(await repository.git("rev-parse", `${integratedRef(goalId)}^{tree}`)).toBe(
+      await repository.git("rev-parse", `${candidateB}^{tree}`),
+    );
+    await expect(
+      landChange({ cwd: repository.root, goalId, changeId: "001" }),
+    ).rejects.toThrow("already has a terminal decision");
+
+    expect(await repository.git("rev-parse", candidateRef(goalId, "001", "001"))).toBe(candidateA);
+    expect(await repository.git("rev-parse", candidateRef(goalId, "001", "003"))).toBe(candidateB);
+    expect(await Promise.all(["001", "002", "003", "004"].map((ticketId) =>
+      readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
+    ))).toEqual(reportSources);
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);
     expect(await repository.git("write-tree")).toBe(hostIndex);
     expect(await repository.git("diff", "--", "README.md")).toBe(hostDiff);

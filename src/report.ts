@@ -66,7 +66,7 @@ const reviewSubmissionSchema = commonSubmissionSchema
     producingImplementationTicketId: z.string().regex(sequenceIdPattern),
     findings: z.array(reviewFindingSchema),
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
-    verdict: z.literal("remediate"),
+    verdict: z.enum(["remediate", "approve"]),
   })
   .strict();
 const reportArtifactSchema = submittedArtifactSchema.extend({ bytes: z.number().int().nonnegative() }).strict();
@@ -109,7 +109,7 @@ const reviewReportSchema = completedReportSchema
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
     reviewStatement: z.string().trim().min(1),
     reviewer: z.string().trim().min(1),
-    verdict: z.literal("remediate"),
+    verdict: z.enum(["remediate", "approve"]),
   })
   .strict();
 const terminalReportSchema = reportIdentitySchema
@@ -151,10 +151,13 @@ export type CurrentCandidate = {
   report: ImplementationReport;
 };
 
-export type CurrentRemediation = CurrentCandidate & {
+export type CurrentReview = CurrentCandidate & {
   reviewTicketId: string;
   reviewReport: ReviewReport;
 };
+
+export type CurrentRemediation = CurrentReview;
+export type CurrentApproval = CurrentReview;
 
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
@@ -325,16 +328,17 @@ function acceptanceCriteria(body: string): string[] {
 function validateAcceptanceAssessment(
   submitted: Array<z.infer<typeof acceptanceAssessmentSchema>>,
   expected: string[],
+  source = "review Submission",
 ): void {
   const submittedCriteria = submitted.map((item) => item.criterion);
   if (new Set(submittedCriteria).size !== submittedCriteria.length) {
-    throw new Error("review Submission assesses an acceptance criterion more than once");
+    throw new Error(`${source} assesses an acceptance criterion more than once`);
   }
   if (
     submittedCriteria.length !== expected.length ||
     expected.some((criterion) => !submittedCriteria.includes(criterion))
   ) {
-    throw new Error("review Submission must assess every Change acceptance criterion exactly once");
+    throw new Error(`${source} must assess every Change acceptance criterion exactly once`);
   }
 }
 
@@ -364,8 +368,16 @@ async function validateReviewSubmission(
   }
   const findingIds = metadata.findings.map((finding) => finding.id);
   if (new Set(findingIds).size !== findingIds.length) throw new Error("review finding IDs must be unique");
-  if (metadata.findings.length === 0) throw new Error("remediate review Submission must contain at least one finding");
+  if (metadata.verdict === "remediate" && metadata.findings.length === 0) {
+    throw new Error("remediate review Submission must contain at least one finding");
+  }
   validateAcceptanceAssessment(metadata.acceptanceAssessment, expectedAcceptanceCriteria);
+  if (
+    metadata.verdict === "approve" &&
+    metadata.acceptanceAssessment.some((assessment) => assessment.assessment !== "met")
+  ) {
+    throw new Error("approve review Submission must assess every acceptance criterion as met");
+  }
 
   const artifactPaths = new Set(metadata.artifacts.map((artifact) => artifact.path));
   await validateDeclaredPaths(outputDirectory, artifactPaths, ["submission.md"]);
@@ -481,12 +493,16 @@ export async function deriveCurrentCandidate(
   return undefined;
 }
 
-export async function deriveCurrentRemediation(
+async function deriveCurrentReview(
   root: string,
   goalId: string,
   changeId: string,
-): Promise<CurrentRemediation | undefined> {
-  const candidate = await deriveCurrentCandidate(root, goalId, changeId);
+  verdict: ReviewReport["metadata"]["verdict"],
+): Promise<CurrentReview | undefined> {
+  const [candidate, change] = await Promise.all([
+    deriveCurrentCandidate(root, goalId, changeId),
+    loadChange(root, goalId, changeId),
+  ]);
   if (candidate === undefined) return undefined;
 
   const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
@@ -508,6 +524,18 @@ export async function deriveCurrentRemediation(
       throw new Error(`review Report ${goalId}/${changeId}/${ticketId} does not match its Ticket Candidate selection`);
     }
 
+    validateAcceptanceAssessment(
+      reviewReport.metadata.acceptanceAssessment,
+      acceptanceCriteria(change.body),
+      `review Report ${goalId}/${changeId}/${ticketId}`,
+    );
+    if (
+      reviewReport.metadata.verdict === "approve" &&
+      reviewReport.metadata.acceptanceAssessment.some((assessment) => assessment.assessment !== "met")
+    ) {
+      throw new Error(`approve review Report ${goalId}/${changeId}/${ticketId} must assess every acceptance criterion as met`);
+    }
+
     const producingReport = await loadImplementationReport(
       root,
       goalId,
@@ -520,7 +548,7 @@ export async function deriveCurrentRemediation(
       );
     }
     if (
-      reviewReport.metadata.verdict === "remediate" &&
+      reviewReport.metadata.verdict === verdict &&
       reviewReport.metadata.reviewedRevision === candidate.candidateRevision &&
       reviewReport.metadata.producingImplementationTicketId === candidate.producingImplementationTicketId
     ) {
@@ -528,6 +556,22 @@ export async function deriveCurrentRemediation(
     }
   }
   return undefined;
+}
+
+export function deriveCurrentRemediation(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<CurrentRemediation | undefined> {
+  return deriveCurrentReview(root, goalId, changeId, "remediate");
+}
+
+export function deriveCurrentApproval(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<CurrentApproval | undefined> {
+  return deriveCurrentReview(root, goalId, changeId, "approve");
 }
 
 export async function publishImplementationReport(
