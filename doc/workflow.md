@@ -9,9 +9,9 @@ Spike should replace its current ticket-centric workflow with a smaller model bu
 - **Goal** — the high- or low-level outcome the operator wants.
 - **Change** — one coherent integration unit that will land as one commit.
 - **Ticket** — one bounded assignment executed in one fresh worker session.
-- **Report** — the structured result returned by that worker to the planner.
+- **Report** — the canonical, host-published record of one Ticket's accepted outcome.
 
-A planner-owned **Plan** provides working memory: the intended Change sequence, current direction, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history.
+A planner-owned **Plan** provides working memory: the intended Change sequence, current direction, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history. Workers write staging Submissions; Spike validates them and publishes canonical Reports.
 
 The normal loop becomes:
 
@@ -19,31 +19,28 @@ The normal loop becomes:
 Goal
   Plan
     Change
-      implementation Ticket -> evidence Report
-      review Ticket         -> feedback Report
-      remediation Ticket    -> evidence Report
-      review Ticket         -> approved Report
+      implementation Ticket -> Report with Candidate A
+      review Ticket         -> Report: remediate
+      implementation Ticket -> Report with Candidate B
+      review Ticket         -> Report: approve
     Change lands as one commit
 ```
 
-This model preserves durable evidence, resumability, exact Git provenance, and independent review while deleting same-run remediation, report supersession, persistent conversational dependency, and most cross-transition locking.
+This model preserves durable evidence, resumability, exact Git provenance, and independent review with a small sequential workflow.
 
 ## Motivation
 
-Spike has accumulated strong local durability and provenance guarantees, but it currently conflates several different concerns:
+Spike needs a workflow that remains understandable across fresh planner and worker sessions while preserving exact evidence of what was requested, produced, reviewed, and landed.
 
-- a Ticket is both planner intent and an integration unit;
-- a Run is both a worker session and the continuation mechanism for remediation;
-- the first completion Report becomes immutable before review is complete;
-- remediation therefore requires report supersession and delivery provenance;
-- review findings discovered after publication require another durable correction mechanism;
-- planner transitions attempt to coordinate through a graph of filesystem locks;
-- stale-lock recovery depends on process identity and platform-specific behavior;
-- partial implementations sometimes have to be accepted merely to issue their correction.
+The model separates five concerns:
 
-The result is durable but difficult to reason about. Interruption safety has expanded into transparent recovery of arbitrary concurrent transitions, despite the intended workflow already having one planner, one active Goal, and serial integration.
+- a Goal records the approved outcome;
+- a Plan holds mutable planner working memory;
+- a Change defines one integration unit;
+- a Ticket assigns one bounded worker session;
+- a Report records that Ticket's canonical outcome.
 
-The proposed model keeps durable facts and removes unnecessary coordination capability.
+One planner, sequential Changes and Tickets, immutable evidence, and derived status make interruption recovery deterministic without requiring general concurrent transition coordination.
 
 ## Design principles
 
@@ -58,10 +55,9 @@ Authoritative evidence is immutable and append-only:
 - approved Goal;
 - landed Change;
 - Ticket assignment;
-- Report;
-- exact candidate revision;
-- publication or candidate bundle;
-- approval or rejection decision;
+- published Report;
+- exact proposed revision and its Git provenance;
+- review approval or rejection decision;
 - worker retirement evidence.
 
 These records prove what was requested, produced, reviewed, and landed.
@@ -78,9 +74,34 @@ The Plan and per-Change summaries are planner-owned working memory. They are:
 
 Working memory should not require evidence-grade locking, immutable history for every edit, or copied provenance from authoritative records.
 
+### One durable document format
+
+All durable workflow artefacts are Markdown documents with JSON frontmatter. This includes Goals, Plans, Changes, Tickets, Reports, and Change decisions. Review approval is represented by a published Report, not a separate document.
+
+Machine-readable identity, relationships, state, revisions, timestamps, and digests live in the JSON frontmatter. Human-facing intent, rationale, findings, decisions, and summaries live in the Markdown body. For example:
+
+```md
+---
+{
+  "kind": "ticket",
+  "goalId": "goal-...",
+  "changeId": "001",
+  "ticketId": "001"
+}
+---
+
+# Implement candidate normalization
+
+Create one normalized Candidate from the worker's reported tree.
+```
+
+Frontmatter metadata has no schema version initially. A `version` field and explicit migration should be introduced only when an incompatible format change requires one; filenames must not encode a speculative version.
+
+Git objects remain the authority for proposed source trees. Reports are authoritative for how those revisions entered the workflow; Git refs are retention indexes derived from Reports. Report attachments may retain their native formats and are referenced, hashed payloads rather than workflow documents.
+
 ### Fresh context by default
 
-Every Ticket starts a fresh worker session. A session is not reused for later implementation, review, or remediation Tickets.
+Every Ticket starts a fresh worker session. A session is not reused for later implementation or review Tickets.
 
 This makes context packaging an explicit part of the product and avoids:
 
@@ -90,17 +111,22 @@ This makes context packaging an explicit part of the product and avoids:
 - recovery depending on a Herdr conversation;
 - accumulating inactive worker tabs and resources.
 
-A worker may remain alive briefly while its Report is validated or corrected administratively. Once the Report is accepted into Change history, the worker is stopped and finalized.
+A worker may remain alive briefly while its Submission is validated or corrected administratively. Once Spike publishes the corresponding Report into Change history, the worker is stopped and finalized.
 
 Session reuse is a future optimization only if measured evidence shows fresh sessions are materially wasteful.
 
-### One planner writer
+### Sequential work and nested identity
 
-Initially, Spike supports one planner process mutating workflow state for a repository.
+Initially, Spike supports one planner process mutating workflow state for a repository. A Goal has at most one active Change, and a Change has at most one active Ticket. Workers write only through their assigned output paths; the planner imports those outputs and performs workflow transitions serially.
 
-Workers write only through their assigned output paths. The planner imports those outputs and performs workflow transitions serially.
+Change and Ticket IDs reflect this ordering:
 
-Spike does not initially guarantee safe concurrent planner CLI mutation. This explicit capability cut removes the need for lock ordering across activation, issuance, remediation, publication, acceptance, completion, and cleanup.
+- Change IDs are zero-padded decimal sequences such as `001`, allocated monotonically within one Goal.
+- Ticket IDs are zero-padded decimal sequences such as `001`, allocated monotonically within one Change.
+- IDs are never reused, including after rejection, abandonment, failure, or interruption.
+- A Change ID is unique only within its Goal; a Ticket ID is unique only within its Change. Durable references therefore include their parent IDs or use a parent-relative path.
+
+Spike does not initially guarantee safe concurrent planner CLI mutation. This explicit capability cut removes the need for lock ordering across activation, issuance, publication, acceptance, completion, and cleanup.
 
 ### Recovery rewinds rather than resumes
 
@@ -153,9 +179,7 @@ It contains:
 - churn indicators;
 - deferred improvements.
 
-The Plan may be rewritten atomically as understanding changes. It should include references to authoritative Ticket and Report IDs where useful, but it must not copy every digest or evidence field.
-
-A compact history of meaningful Plan revisions may be retained, but this is diagnostic history rather than workflow authority.
+The Plan may be rewritten atomically as understanding changes. It owns all mutable Change summaries and planned Ticket sequences. It should reference authoritative Tickets where useful, but it must not copy every digest or evidence field.
 
 ## Change
 
@@ -163,7 +187,7 @@ A Change is one coherent unit that will land as exactly one commit.
 
 A Change owns:
 
-- stable Change ID;
+- Goal-relative Change ID such as `001`;
 - Goal ID;
 - title and intent;
 - rationale;
@@ -171,49 +195,36 @@ A Change owns:
 - non-goals;
 - dependencies;
 - exact base revision;
-- planned Ticket sequence;
-- actual Ticket history;
-- immutable candidate versions;
-- current candidate;
-- current Change summary;
-- approval or rejection decision;
-- landed commit, when complete.
+- authoritative Ticket and Report history;
+- current candidate revision and review verdict, derived from that history;
+- terminal Change decision, when resolved.
 
-A Change exists before its first candidate commit, so its identity cannot be a commit hash.
+The full identity of a Change is its Goal ID plus Change ID. A Change exists before its first candidate commit, so its identity cannot be a commit hash.
 
-### Change states
+### Derived status and terminal decision
 
-```text
-draft
-  -> implementing
-  -> reviewing
-  -> implementing
-  -> approved
-  -> landed
+Spike does not persist a Change state enum or transition graph. It derives status for presentation from the latest candidate-producing Ticket, the review verdict for that exact revision, any active runtime Ticket, and the terminal Change decision.
 
-Any non-landed state may become rejected or abandoned by explicit planner decision.
-```
+One immutable `decision.md` resolves a Change with a disposition of `land`, `reject`, or `abandon`. A landing decision records the exact approved commit and advances the Goal's integrated revision. Rejection and abandonment record a statement without advancing it. A resolved Change is never reopened; later work receives the next Change ID.
 
-The state is derived from authoritative Tickets and Reports plus the current planner decision. It should not require a separate complex state machine record when the facts already determine it.
+### Candidate revisions
 
-## Candidate
+A Candidate is not a separate durable entity or document. It is the role played by an exact normalized Git commit proposed for the Change. Its identity is its commit hash.
 
-A Candidate is an exact Git version of a Change.
+Each Candidate commit has:
 
-Each Candidate is one commit whose:
-
-- parent is the Change base revision;
-- tree is the complete proposed product tree for the Change;
-- message is the proposed landed commit message;
-- trailers contain stable Goal and Change IDs.
+- the Change base revision as its parent;
+- the complete proposed product tree as its tree;
+- the proposed landed commit message;
+- stable Goal and Change IDs in its trailers.
 
 Example commit message:
 
 ```text
 Simplify durable workflow transitions
 
-Replace same-run remediation with fresh ticket/report rounds while
-preserving exact candidate review and interruption evidence.
+Use fresh ticket/report rounds while preserving exact candidate
+review and interruption evidence.
 
 Spike-Goal-Id: goal-...
 Spike-Change-Id: change-...
@@ -237,30 +248,41 @@ Commit messages must not store:
 - artifacts;
 - workflow status.
 
-### Candidate identity
+A completed implementation Report records the Change base revision, Ticket input revision, worker-reported revision, and normalized candidate revision. A completed review Report records the exact candidate revision and implementation Ticket it reviewed. Reports always use exact commit hashes. For example:
 
-The Change ID is stable across the entire Change. A commit hash identifies one exact Candidate version.
+```md
+---
+{
+  "kind": "report",
+  "goalId": "goal-...",
+  "changeId": "001",
+  "ticketId": "001",
+  "outcome": "completed",
+  "baseRevision": "<change-base-hash>",
+  "inputRevision": "<ticket-input-hash>",
+  "workerRevision": "<worker-reported-hash>",
+  "candidateRevision": "<normalized-commit-hash>"
+}
+---
 
-Candidates are retained under immutable refs:
+# Implementation evidence
 
-```text
-refs/spike/changes/<change-id>/candidates/001
-refs/spike/changes/<change-id>/candidates/002
+Implemented candidate normalization and ran the focused tests.
 ```
 
-A mutable pointer identifies the current Candidate:
+Candidate commits are retained under refs keyed by the producing Ticket's full nested identity:
 
 ```text
-refs/spike/changes/<change-id>/current
+refs/spike/goals/<goal-id>/changes/<change-id>/tickets/<ticket-id>
 ```
 
-Reports always reference exact commit hashes, never only the moving pointer.
+There is no mutable current-Candidate ref. The current Candidate is the `candidateRevision` from the highest-numbered completed implementation Ticket in the Change. Spike passes that exact hash directly to the next worker.
 
-### Candidate normalization
+#### Normalization
 
 Workers should not be required to maintain a single amended commit correctly during implementation. They may create whatever local commits help them work.
 
-After importing an implementation or remediation Report at revision `R`, Spike creates a normalized Candidate commit using Git plumbing:
+After validating a completed implementation Submission at worker revision `R`, Spike creates a normalized Candidate commit using Git plumbing:
 
 ```text
 parent  = Change base revision
@@ -268,7 +290,7 @@ tree    = tree of R
 message = current proposed Change commit message
 ```
 
-The resulting commit is retained as the next immutable Candidate version. This allows fresh workers to begin from one clean Candidate while preserving the worker's reported revision as evidence.
+Spike then publishes the Report containing both `workerRevision` and `candidateRevision`. Report publication makes the Candidate authoritative. Git objects or refs left without a published Report are staging debris.
 
 ## Ticket
 
@@ -276,26 +298,23 @@ A Ticket is one bounded planner assignment performed by one fresh worker session
 
 A Ticket owns:
 
-- stable Ticket ID;
-- Goal ID;
-- Change ID;
+- Change-relative Ticket ID such as `001`;
+- Goal ID and Change ID;
 - role;
 - intended outcome;
 - exact input Candidate or base revision;
 - curated context snapshot;
-- worker/session correlation;
-- resulting Report ID;
-- terminal status.
+- worker/session correlation.
+
+The full identity of a Ticket is its Goal ID, Change ID, and Ticket ID. The Ticket ID is also its sequence within the Change.
 
 Ticket roles initially include:
 
 - `implement`;
 - `review`;
-- `remediate`;
-- `investigate`;
-- `verify`.
+- `investigate`.
 
-Roles describe intent and context packaging. They should not introduce separate transition machinery.
+A remediation is another `implement` Ticket with prior review findings in its context. Verification performed while changing code belongs in implementation evidence; independent verification uses a `review` Ticket. Roles describe intent and context packaging, not separate transition machinery.
 
 ### Ticket context
 
@@ -303,7 +322,7 @@ Each Ticket automatically packages:
 
 1. stable Goal summary;
 2. current Change brief and acceptance criteria;
-3. planner's current Change summary;
+3. planner's current Change summary from the Plan;
 4. specific Ticket instruction;
 5. exact starting revision;
 6. relevant prior Reports;
@@ -314,88 +333,51 @@ The planner selects relevant Reports rather than passing an unbounded history to
 
 ### Ticket lifecycle
 
+The durable lifecycle has one transition:
+
 ```text
-issued -> running -> reported
-                  -> failed
-                  -> stopped
+issued -> reported
 ```
 
-A reported Ticket does not advance the Goal's integrated revision. An implementation or remediation Report may produce a new Change Candidate. A review Report may request another Ticket, approve a Candidate, or reject the Change.
+A Ticket is open while `report.md` is absent and terminal once Spike publishes it. Running, stopping, and cleanup status are operational projections rather than workflow states.
 
-A worker session is stopped and finalized after its Report is validated and incorporated into Change history.
+Every issued Ticket eventually receives exactly one Report. Its outcome is `completed`, `partial`, `blocked`, `failed`, `stopped`, or `interrupted`. Spike may publish `failed`, `stopped`, or `interrupted` Reports from host evidence without a worker Submission. A Report does not advance the Goal's integrated revision.
 
-## Report
+On normal completion, a worker session is stopped and finalized after Spike publishes its Report. For explicit stop or recovery, Spike stops the runtime first and then publishes the host-generated terminal Report.
 
-A Report is the structured response from one Ticket to the planner.
+## Submission and Report
 
-Reports are immutable, append-only, and host-owned in their identity and provenance fields.
+A Submission is the worker-authored, untrusted response to a Ticket. It exists only in staging, may be corrected before Report publication, and does not advance workflow state. A terminal host-generated Report does not require a Submission.
 
-### Report kinds
+A Report is the canonical, host-sealed outcome Spike publishes for one Ticket. Reports are immutable and append-only. A Report has no separate ID: its full identity and path are those of its Ticket. Spike owns its provenance, timestamps, exact revisions, artifact digests, and worker correlation while preserving any accepted worker-authored content.
 
-#### Evidence Report
+Publishing `report.md` is the Ticket's commit point. There is no separate Result artefact.
 
-Typically returned by `implement`, `remediate`, or `verify` Tickets.
+### Report content by Ticket role
 
-Worker-authored fields include:
+Every Report uses `kind: "report"` and records its terminal `outcome`. The Ticket role determines additional validation:
 
-- outcome;
-- summary;
-- verification results;
-- artifacts;
-- assumptions;
-- limitations;
-- risks;
-- recommended follow-up.
+- A completed `implement` Report records worker-authored summary, verification, assumptions, limitations, risks, follow-up, artifacts, and Git evidence. It also records the Change base, Ticket input, worker, and normalized candidate revisions.
+- A completed `review` Report records the exact candidate revision and producing implementation Ticket, findings with stable IDs and severity, acceptance-criteria assessment, review statement, reviewer identity, and verdict: `remediate`, `approve`, `reject`, or `ask-operator`.
+- A completed `investigate` Report records findings, evidence, conclusions, remaining uncertainty, and recommended follow-up without producing a candidate revision.
+- Non-completed Reports record the available evidence and reason for their terminal outcome. They do not produce a candidate revision or review verdict.
 
-Spike supplies:
+A completed review Report with an `approve` verdict is the approval evidence for that exact candidate revision. There is no separate approval document. Approval does not land the Change; landing remains an explicit planner transition.
 
-- Goal, Change, Ticket, and worker identity;
-- input revision;
-- resulting revision;
-- timestamps;
-- candidate relationship;
-- Git evidence;
-- artifact paths and digests.
+### One Report per Ticket
 
-#### Feedback Report
-
-Typically returned by a `review` Ticket.
-
-It includes:
-
-- exact Candidate and Evidence Report reviewed;
-- findings with stable finding IDs;
-- severity;
-- actionable feedback;
-- acceptance-criteria assessment;
-- recommendation: remediate, approve, reject, or ask operator.
-
-#### Approval Report
-
-An approval is a review result that selects:
-
-- exact Candidate hash;
-- exact Evidence Report;
-- satisfied acceptance criteria;
-- review statement;
-- reviewer identity.
-
-Approval alone does not land the Change. Landing remains an explicit planner transition.
-
-### No report supersession
-
-Reports are never amended or superseded. A later Ticket produces a later Report.
+Reports are never amended. A later Ticket produces a later Report.
 
 Example:
 
 ```text
-Ticket 1 implement  -> Report 1 evidence at Candidate A
-Ticket 2 review     -> Report 2 feedback on Candidate A
-Ticket 3 remediate  -> Report 3 evidence at Candidate B
-Ticket 4 review     -> Report 4 approval of Candidate B
+Ticket 001 implement -> Report with Candidate A
+Ticket 002 review    -> Report on A: remediate
+Ticket 003 implement -> Report with Candidate B
+Ticket 004 review    -> Report on B: approve
 ```
 
-This removes schema-versioned supersession and remediation-specific provenance.
+Each Report remains a permanent, self-contained record of one Ticket outcome.
 
 ## Normal workflow
 
@@ -408,36 +390,39 @@ This removes schema-versioned supersession and remediation-specific provenance.
 
 ## Implementation
 
-1. Planner creates Change at current integrated revision.
-2. Planner issues an `implement` Ticket.
+1. Planner creates the next sequential Change at the Goal's current integrated revision.
+2. Planner issues the next sequential `implement` Ticket.
 3. Spike launches a fresh worker at the exact Change base or current Candidate.
-4. Worker implements and returns Evidence Report.
-5. Spike validates the Report and worker Git evidence.
+4. Worker implements and writes a Submission containing its reported revision and evidence.
+5. Spike validates the Submission and worker Git evidence.
 6. Spike normalizes the worker tree into Candidate A.
-7. Planner updates the Change summary and finalizes the worker.
+7. Spike publishes the Ticket's Report referencing the worker revision and Candidate A. This is the commit point.
+8. Planner updates the Change summary in the Plan and finalizes the worker.
 
 ## Review
 
-1. Planner issues a fresh `review` Ticket for Candidate A.
-2. Reviewer receives Goal, Change, acceptance criteria, Evidence Report, and exact Candidate.
-3. Reviewer returns Feedback or Approval Report.
-4. Planner records findings and finalizes the reviewer.
+1. Planner issues the next sequential `review` Ticket for Candidate A.
+2. Reviewer receives Goal, Change, acceptance criteria, producing implementation Report, and exact Candidate.
+3. Reviewer writes a Submission with findings and a verdict.
+4. Spike validates the Submission and publishes the Ticket's Report.
+5. Planner records findings in the Plan and finalizes the reviewer.
 
 ## Remediation
 
-1. Planner creates a `remediate` Ticket from Candidate A.
-2. A fresh implementer receives relevant feedback and Change context.
-3. Worker returns Evidence Report at revision R.
-4. Spike normalizes R into Candidate B with the same Change base.
-5. Another fresh review Ticket evaluates Candidate B.
+1. Planner issues another `implement` Ticket from Candidate A.
+2. A fresh implementer receives relevant review findings and Change context.
+3. Worker writes a Submission at revision R.
+4. Spike validates the Submission and normalizes R into Candidate B with the same Change base.
+5. Spike publishes the Ticket's Report referencing R and Candidate B.
+6. Another fresh `review` Ticket evaluates Candidate B.
 
-Remediation is ordinary Ticket creation. It has no delivery state machine, same-session requirement, report amendment, or special lock.
+Remediation is ordinary implementation: a review verdict leads to another fresh `implement` Ticket.
 
 ## Landing
 
-1. Planner verifies an Approval Report selecting the current Candidate.
+1. Planner verifies a completed `review` Report with an `approve` verdict selecting the current Candidate.
 2. Planner verifies the Change base still matches the Goal's integrated revision.
-3. Planner records an immutable landing decision.
+3. Planner atomically installs `decision.md` with disposition `land` and the exact approved commit.
 4. The approved Candidate becomes the landed Change commit.
 5. Goal integrated revision advances to that commit.
 6. Planner updates the Plan and selects the next Change.
@@ -446,28 +431,24 @@ If the integrated revision moved, Spike must explicitly rebase or recreate the C
 
 ## Rejection and abandonment
 
-A review may reject a Candidate or the entire Change.
+A review Report may recommend rejecting a Candidate or the entire Change.
 
-- Rejecting a Candidate keeps it as evidence and permits another Ticket.
-- Rejecting a Change closes it without advancing the Goal integrated revision.
-- Abandonment is an explicit planner decision with a statement.
-- Rejected and abandoned work remains inspectable.
+- Rejecting a Candidate leaves its producing implementation Report as durable evidence and permits another Ticket.
+- Rejecting or abandoning a Change installs `decision.md` with the corresponding disposition and statement without advancing the Goal integrated revision.
+- Rejected and abandoned work remains inspectable and cannot be reopened. Related later work receives the next Change ID.
 
-Unlike the current model, a poor Ticket never has to be accepted merely to unblock subsequent work.
+A poor Ticket never has to be approved merely to continue with a later Ticket.
 
 ## Churn detection
 
 The planner needs enough Change history to detect non-convergence.
 
-Initial deterministic indicators should include:
+Initial deterministic indicators should include only:
 
 - actual Ticket count materially exceeds planned Ticket count;
 - review/remediation rounds exceed a threshold;
 - the same finding ID is reopened;
-- consecutive `partial` or `blocked` Evidence Reports;
-- acceptance criteria repeatedly change;
-- the Change summary repeatedly reverses the same decision;
-- multiple Candidates show no progress against open findings.
+- consecutive `partial` or `blocked` Reports.
 
 Initial thresholds should be simple and configurable. For example:
 
@@ -491,7 +472,7 @@ Churn detection produces planner guidance, not automatic rejection. The planner 
 - reject or abandon the Change;
 - continue with an explicit rationale.
 
-Semantic diff oscillation and automated design judgment are non-goals initially.
+Acceptance-criteria churn, summary reversals, semantic diff oscillation, automated progress judgment, and automated design judgment are non-goals initially.
 
 ## Interruption and recovery
 
@@ -500,24 +481,26 @@ Semantic diff oscillation and automated design judgment are non-goals initially.
 Only a small set of immutable records advance authoritative workflow state:
 
 - a Ticket record commits the assignment, but not any worker progress;
-- a Ticket Result commits a validated Report and, for implementation work, its normalized Candidate;
-- an Approval Report commits review approval of an exact Candidate;
-- a landing record commits the Change to the Goal's integrated history.
+- its published Report commits the Ticket's terminal outcome;
+- a completed `implement` Report commits its normalized candidate revision;
+- a completed `review` Report with an `approve` verdict commits review approval of an exact candidate revision;
+- `decision.md` resolves the Change and, for `land`, commits it to the Goal's integrated history.
 
-Worker output, temporary Reports, candidate objects, candidate refs, mutable pointers, and planner summaries prepared before the relevant commit record are staging or projections. They do not advance workflow state by themselves.
+Submissions, candidate objects, candidate refs, runtime status, and planner summaries prepared before Report publication are staging or projections. They do not advance workflow state by themselves.
 
-For an implementation or remediation Ticket, Spike prepares and validates the Report and normalized Candidate first, then installs one immutable Ticket Result referencing both. The Ticket Result is the commit point. Git objects or refs left without a Ticket Result are uncommitted debris and may be retained for diagnosis or cleaned up.
+For a completed `implement` Ticket, Spike validates the Submission and prepares the normalized Candidate first, then atomically installs the immutable Report referencing the worker and candidate revisions. For other outcomes and roles, it installs the Report after validating the available worker or host evidence. Report publication is always the Ticket commit point. Git objects or refs left without a published Report are uncommitted debris and may be retained for diagnosis or cleaned up.
 
 ## Rewind policy
 
 On planner or supervisor restart:
 
-1. load the latest valid Goal, landed Change, current Change, and committed Ticket Results;
-2. derive the latest committed Candidate from those Results;
-3. classify every issued Ticket without a committed Result as interrupted;
-4. stop and finalize all worker resources correlated with interrupted Tickets;
-5. ignore or quarantine their staged output;
-6. issue a fresh replacement Ticket from the latest committed Candidate when the Plan still calls for that work.
+1. load the latest valid Goal, resolved Changes, current Change, Tickets, Reports, and Change decisions;
+2. derive the latest committed Candidate from the highest-numbered completed `implement` Ticket;
+3. classify an issued Ticket without `report.md` as interrupted;
+4. stop and finalize its worker resources;
+5. ignore or quarantine its Submission and other staged output;
+6. publish its host-generated Report with outcome `interrupted`;
+7. issue the next sequential Ticket from the latest committed Candidate when the Plan still calls for that work.
 
 Spike never reconnects to an interrupted session, resumes its conversation, imports its uncommitted output automatically, or retries an ambiguous prompt. The replacement Ticket may repeat work.
 
@@ -532,7 +515,7 @@ Retain narrow coordination only where independent processes genuinely race:
 - runtime stop versus runtime exit recording;
 - Herdr workspace placement.
 
-Do not add per-transition PID/start-time locks for Goal, Change, Ticket, Report, Candidate, review, or landing operations. Do not add automatic stale-lock recovery for planner work.
+Do not add workflow locks for Goal, Change, Ticket, Report publication, candidate normalization, review, or Change decision operations. The single planner writer makes them unnecessary.
 
 If concurrent planner mutation becomes a demonstrated requirement, design it later against this simpler model.
 
@@ -544,10 +527,11 @@ For each Ticket:
 
 1. create a fresh worker session and clone;
 2. run the Ticket;
-3. import and validate its Report;
-4. retain the worker only for immediate administrative Report correction;
-5. stop and finalize it;
-6. close its Herdr tab and release runtime resources.
+3. import and validate its Submission;
+4. prepare any normalized Candidate and publish the canonical Report;
+5. retain the worker only for immediate administrative Submission correction before publication;
+6. stop and finalize it;
+7. close its Herdr tab and release runtime resources.
 
 The Herdr Agents panel indexes active sessions. One tab per active worker is acceptable because terminal workers are finalized promptly.
 
@@ -576,40 +560,32 @@ Ticket workers never inherit the planner model implicitly. Explicit Ticket-level
 
 ## Proposed durable layout
 
-This is illustrative rather than final:
+This is illustrative rather than final. Every durable workflow file is one Markdown document with unversioned JSON frontmatter:
 
 ```text
 .spike/
   goals/
     <goal-id>/
       goal.md
-      goal.v1.json
       plan.md
-      plan.v1.json
       changes/
-        <change-id>/
+        001/
           change.md
-          change.v1.json
-          summary.md
-          candidates/
-            001.v1.json
-            002.v1.json
           tickets/
-            <ticket-id>/
+            001/
               ticket.md
-              ticket.v1.json
-              report.v1.json
-          approval.v1.json
-          landing.v1.json
+              report.md
+          decision.md
   output/
-    goals/<goal-id>/changes/<change-id>/tickets/<ticket-id>/
+    goals/<goal-id>/changes/001/tickets/001/
       ticket.md
       context.md
-      report-input.json
-    artifacts/<ticket-id>/
+      submission.md
+    artifacts/
+      goals/<goal-id>/changes/001/tickets/001/
 ```
 
-Git remains authoritative for Candidate trees and commit objects. Durable records retain stable IDs, exact refs, hashes, and decisions.
+Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The `001` directories illustrate parent-relative sequential IDs. Files under `output/` are staging inputs and projections, but use the same document format where structured workflow data is exchanged.
 
 ## Module direction
 
@@ -621,19 +597,19 @@ Owns planner notebook loading, atomic update, compact Change summaries, and chur
 
 ### Change module
 
-Owns Change creation, Candidate progression, approval, rejection, abandonment, and landing invariants.
+Owns sequential Change creation, Report-derived candidate progression and review status, and terminal Change decision invariants.
 
 ### Ticket module
 
-Owns immutable Ticket context, fresh-session assignment, status, and Report correlation.
+Owns sequential Ticket issuance, immutable context, fresh-session assignment, and derivation of open versus reported status.
 
 ### Report module
 
-Owns canonical host-generated Reports, worker-authored evidence input, review findings, and strict validation.
+Owns Submission import, host terminal evidence, role-specific validation, canonical Report publication, review findings, and verdicts.
 
 ### Git Change module
 
-Owns Candidate normalization, immutable refs, current Candidate pointer, commit messages, and landing.
+Owns Candidate normalization, Ticket-keyed retention refs, commit messages, and landing.
 
 ### Worker module
 
@@ -643,14 +619,29 @@ Owns fresh worker launch, exact revision setup, status, stop, finalization eligi
 
 Owns concrete shared filesystem behavior only:
 
-- bounded JSON reads;
-- canonical timestamps, IDs, and digests;
+- bounded Markdown and JSON-frontmatter reads;
+- canonical frontmatter serialization, timestamps, IDs, and digests;
 - project-relative path resolution;
 - component symlink rejection;
 - immutable file installation;
-- atomic pointer replacement.
+- atomic mutable-document replacement.
 
 Record validators remain with their owning modules. Avoid creating a broad abstract repository interface.
+
+## Dependency strategy
+
+Use one initial production dependency: `zod` for structural validation of JSON frontmatter and inference of the corresponding TypeScript types. Keep schemas internal to the Goal, Change, Ticket, Report, and Change decision modules. Zod validates document shape; owning modules enforce cross-document workflow invariants such as sequential IDs, exact candidate selection, approval, and landing.
+
+Do not add a state-machine dependency. Durable status is derived from Tickets, Reports, and `decision.md`; encoding the same facts in XState or a similar library would recreate duplicate state and transition machinery.
+
+Use Bun and platform primitives for the remaining small interfaces:
+
+- strict frontmatter delimiters plus `JSON.parse` and a small sorted-key serializer built on `JSON.stringify`, rather than a Markdown/frontmatter package with YAML semantics;
+- `Bun.spawn` with argument arrays for Git plumbing, rather than a Git wrapper;
+- filesystem create-exclusive, rename, and sync primitives for immutable installation and atomic Plan replacement;
+- built-in argument parsing, hashing, and `bun:test` rather than CLI, digest, or test frameworks.
+
+Add another dependency only when repeated implementation inside one of these modules demonstrates that it would reduce the interface or materially improve correctness. Keep dependency-specific types behind the owning module so callers and tests use the workflow's domain language.
 
 ## Implementation strategy
 
@@ -661,15 +652,14 @@ Build a disposable Bun terminal prototype using a temporary Git repository.
 The prototype should demonstrate:
 
 - Goal and Plan creation;
-- Change creation;
-- implementation Ticket and Evidence Report;
-- Candidate normalization;
-- review Ticket and Feedback Report;
-- remediation Ticket from current Candidate;
-- Approval Report;
-- one-commit landing;
-- failed Ticket;
-- rejected Change;
+- sequential Change and Ticket allocation;
+- implementation Ticket, Submission, Candidate normalization, and published Report;
+- review Ticket, Submission, and Report with a `remediate` verdict;
+- another implementation Ticket from the current Candidate;
+- review Report with an `approve` verdict;
+- one-commit landing through `decision.md`;
+- failed and interrupted Tickets with host-generated Reports;
+- rejected and abandoned Change decisions;
 - Plan revision;
 - churn warning;
 - interruption before and after each immutable commit point.
@@ -681,49 +671,18 @@ The prototype should not launch containers or Herdr.
 Implement one complete vertical workflow:
 
 ```text
-change create
-  -> ticket issue
+change create 001
+  -> ticket issue 001
   -> ticket dispatch
-  -> report import
-  -> candidate record
-  -> review ticket
-  -> change approve
-  -> change land
+  -> submission import
+  -> candidate normalize
+  -> report publish
+  -> review ticket 002
+  -> review report approve
+  -> change decision land
 ```
 
 Do not implement session reuse, concurrent Changes, semantic churn analysis, or multiple backends.
-
-## Phase 3: One-way migration
-
-Do not dual-write the current and proposed models.
-
-- Store all new durable workflow state under `.spike/`.
-- Preserve existing `.pi-swarm/` v1 state as read-only legacy evidence.
-- Keep Ticket 022 unaccepted.
-- Record a migration receipt under `.spike/` explaining that the unresolved v1 Ticket was superseded by the workflow migration.
-- Seed the new Goal from the current integrated revision.
-- Seed the Plan with remaining model-configuration, cleanup, smoke-test, and Goal-completion Changes.
-- Switch commands to the new model only after tracer-bullet verification.
-
-Historical v1 records do not need to be rewritten into every new concept. They remain inspectable through legacy status/history commands or an archived snapshot.
-
-## Phase 4: Delete replaced capability
-
-Once the new tracer bullet and migration pass:
-
-- delete same-run remediation;
-- delete report supersession;
-- delete remediation delivery state;
-- delete remediation PID/start-time lock recovery;
-- delete cross-transition lock ordering;
-- simplify Goal completion to one immutable marker;
-- delete mutable completed-history advancement and recovery;
-- delete headless supervisor delegation;
-- delete recursive CLI orchestration;
-- consolidate duplicated durable-state primitives;
-- shrink CLI to parsing and presentation.
-
-The migrated implementation should be materially smaller than the code it replaces.
 
 ## Testing strategy
 
@@ -731,16 +690,17 @@ Tests should exercise the same deep module interfaces used by production callers
 
 Prioritize scenario tests:
 
-1. implement -> review -> approve -> land;
-2. implement -> review -> remediate -> approve -> land;
-3. failed Ticket -> replacement Ticket;
-4. rejected Change;
-5. crash around each immutable commit point;
-6. stale mutable projections rebuilt from immutable facts;
-7. fresh worker context contains all required information;
-8. worker finalization preserves Reports, Candidates, and artifacts;
-9. churn warning after repeated feedback;
-10. dirty host checkout remains untouched.
+1. sequential Change and Ticket IDs are allocated monotonically and never reused;
+2. implement -> review -> approve -> land decision;
+3. implement -> review -> implement -> approve -> land decision;
+4. failed Ticket Report -> replacement Ticket;
+5. interrupted Ticket Report -> replacement Ticket;
+6. rejected or abandoned Change decision;
+7. crash around each immutable commit point;
+8. fresh worker context contains all required information;
+9. worker finalization preserves Reports, referenced Candidate commits, and artifacts;
+10. deterministic churn warning after repeated feedback;
+11. dirty host checkout remains untouched.
 
 Avoid tests for unsupported arbitrary concurrent planner mutation. Retain focused tests for genuine runtime stop/exit and Herdr placement races.
 
@@ -748,27 +708,22 @@ Avoid tests for unsupported arbitrary concurrent planner mutation. Retain focuse
 
 The proposal succeeds when:
 
-- one Goal can execute an evolving ordered Plan of Changes;
-- each Change lands as exactly one reviewed commit;
-- multiple fresh-session Tickets can contribute to one Change;
+- one Goal can execute an evolving ordered Plan of sequential Changes;
+- Change and Ticket IDs are monotonic parent-relative `nnn` sequences;
+- each landed Change is exactly one reviewed commit;
+- multiple sequential fresh-session Tickets can contribute to one Change;
 - Reports provide sufficient context for planner recovery and fresh workers;
 - review and remediation require no same-session continuation;
 - planner can detect and surface obvious churn;
 - interruption rewinds to the latest committed Candidate, abandons in-progress sessions, and cleans their resources without PID-based workflow locks;
 - terminal workers are finalized promptly;
 - model defaults are project-configured;
-- current v1 evidence remains inspectable;
-- the production implementation is smaller and easier to navigate than the workflow it replaces.
+- the production implementation remains small and easy to navigate.
 
 ## Open decisions
 
 The following should be resolved during review of this proposal:
 
-- whether the Plan is Markdown with small JSON metadata, JSON with rendered Markdown, or both;
-- whether review, approval, and feedback share one Report schema with a discriminated kind;
 - how candidate commit authorship and contributor trailers are assigned;
 - whether landing updates `main` directly or advances a dedicated integration ref for explicit operator application;
-- exact churn thresholds;
-- whether rejected Changes may later be reopened;
-- how much legacy v1 history remains queryable through normal CLI commands;
-- whether multiple active Changes should ever be supported.
+- exact churn thresholds.
