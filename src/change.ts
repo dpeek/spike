@@ -9,7 +9,7 @@ import {
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
-import { deriveCurrentApproval, deriveCurrentCandidate } from "./report.ts";
+import { deriveCurrentApproval, deriveCurrentCandidate, deriveCurrentRejection } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -79,6 +79,19 @@ export type LandChangeInput = {
 };
 
 export type LandedChange = {
+  root: string;
+  decision: ChangeDecision;
+};
+
+export type ResolveChangeInput = {
+  cwd: string;
+  goalId: string;
+  changeId: string;
+  statement: string;
+  now?: Date;
+};
+
+export type ResolvedChange = {
   root: string;
   decision: ChangeDecision;
 };
@@ -270,6 +283,59 @@ export async function landChange(input: LandChangeInput): Promise<LandedChange> 
   await installImmutable(repository.root, decisionDocumentPath, serializeDocument(metadata, body));
   await git(repository.root, ["update-ref", "--no-deref", ref, candidate.candidateRevision, change.metadata.baseRevision]);
   return { root: repository.root, decision };
+}
+
+async function resolveChangeWithoutLanding(
+  input: ResolveChangeInput,
+  disposition: "reject" | "abandon",
+): Promise<ResolvedChange> {
+  const repository = await discoverRepository(input.cwd);
+  const decisionDocumentPath = changeDecisionPath(repository.root, input.goalId, input.changeId);
+  if (await documentExists(repository.root, decisionDocumentPath)) {
+    throw new Error(`Change ${input.goalId}/${input.changeId} already has a terminal decision`);
+  }
+
+  await loadGoal(repository.root, input.goalId);
+  await loadChange(repository.root, input.goalId, input.changeId);
+  const statement = requireText(input.statement, "Change decision statement");
+
+  if (disposition === "reject") {
+    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    if (candidate === undefined) {
+      throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
+    }
+    const rejection = await deriveCurrentRejection(repository.root, input.goalId, input.changeId);
+    if (rejection === undefined) {
+      throw new Error(`current Candidate ${candidate.candidateRevision} has no exact reject review Report`);
+    }
+    if (
+      rejection.candidateRevision !== candidate.candidateRevision ||
+      rejection.producingImplementationTicketId !== candidate.producingImplementationTicketId ||
+      rejection.reviewReport.metadata.reviewedRevision !== candidate.candidateRevision ||
+      rejection.reviewReport.metadata.producingImplementationTicketId !== candidate.producingImplementationTicketId
+    ) {
+      throw new Error("reject review Report does not select the current Candidate and its producing implementation Ticket");
+    }
+  }
+
+  const metadata = changeDecisionSchema.parse({
+    kind: "change-decision",
+    goalId: input.goalId,
+    changeId: input.changeId,
+    decidedAt: (input.now ?? new Date()).toISOString(),
+    disposition,
+  });
+  const decision = { metadata, body: `${statement}\n` };
+  await installImmutable(repository.root, decisionDocumentPath, serializeDocument(metadata, decision.body));
+  return { root: repository.root, decision };
+}
+
+export function rejectChange(input: ResolveChangeInput): Promise<ResolvedChange> {
+  return resolveChangeWithoutLanding(input, "reject");
+}
+
+export function abandonChange(input: ResolveChangeInput): Promise<ResolvedChange> {
+  return resolveChangeWithoutLanding(input, "abandon");
 }
 
 export async function createChange(input: CreateChangeInput): Promise<CreatedChange> {

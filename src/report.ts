@@ -72,7 +72,7 @@ const reviewSubmissionSchema = commonSubmissionSchema
     producingImplementationTicketId: z.string().regex(sequenceIdPattern),
     findings: z.array(reviewFindingSchema),
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
-    verdict: z.enum(["remediate", "approve"]),
+    verdict: z.enum(["remediate", "approve", "reject"]),
   })
   .strict();
 const reportArtifactSchema = submittedArtifactSchema.extend({ bytes: z.number().int().nonnegative() }).strict();
@@ -115,7 +115,7 @@ const reviewReportSchema = completedReportSchema
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
     reviewStatement: z.string().trim().min(1),
     reviewer: z.string().trim().min(1),
-    verdict: z.enum(["remediate", "approve"]),
+    verdict: z.enum(["remediate", "approve", "reject"]),
   })
   .strict();
 const terminalReportSchema = reportIdentitySchema
@@ -164,6 +164,7 @@ export type CurrentReview = CurrentCandidate & {
 
 export type CurrentRemediation = CurrentReview;
 export type CurrentApproval = CurrentReview;
+export type CurrentRejection = CurrentReview;
 
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
@@ -588,11 +589,12 @@ async function deriveCurrentReview(
       );
     }
     if (
-      reviewReport.metadata.verdict === verdict &&
       reviewReport.metadata.reviewedRevision === candidate.candidateRevision &&
       reviewReport.metadata.producingImplementationTicketId === candidate.producingImplementationTicketId
     ) {
-      return { ...candidate, reviewTicketId: ticketId, reviewReport };
+      return reviewReport.metadata.verdict === verdict
+        ? { ...candidate, reviewTicketId: ticketId, reviewReport }
+        : undefined;
     }
   }
   return undefined;
@@ -612,6 +614,14 @@ export function deriveCurrentApproval(
   changeId: string,
 ): Promise<CurrentApproval | undefined> {
   return deriveCurrentReview(root, goalId, changeId, "approve");
+}
+
+export function deriveCurrentRejection(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<CurrentRejection | undefined> {
+  return deriveCurrentReview(root, goalId, changeId, "reject");
 }
 
 export async function publishFailedReport(
