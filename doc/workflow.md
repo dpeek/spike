@@ -1,6 +1,6 @@
-# Proposal: Goal, Change, Ticket, and Report Workflow
+# Goal, Change, Ticket, and Report Workflow
 
-Status: Draft for review
+Status: Ready for implementation
 
 ## Summary
 
@@ -108,12 +108,32 @@ This makes context packaging an explicit part of the product and avoids:
 - conversational drift;
 - hidden assumptions retained only by one worker;
 - review anchored to implementation reasoning;
-- recovery depending on a Herdr conversation;
+- recovery depending on a live worker conversation;
 - accumulating inactive worker tabs and resources.
 
 A worker may remain alive briefly while its Submission is validated or corrected administratively. Once Spike publishes the corresponding Report into Change history, the worker is stopped and finalized.
 
 Session reuse is a future optimization only if measured evidence shows fresh sessions are materially wasteful.
+
+### Worker exchange is runtime-independent
+
+The Worker module has one real seam: a host-local clone adapter proves the workflow first, and a Docker adapter later provides process isolation without changing Ticket, Submission, Report, or Git provenance semantics.
+
+The adapters share one filesystem exchange contract:
+
+1. Spike prepares a read-only input directory containing `ticket.md`, `context.md`, and `repository.bundle` at the Ticket's exact input revision.
+2. The adapter creates a private checkout from that bundle and starts the worker there.
+3. The worker writes only to its assigned output directory: `submission.md`, an output `repository.bundle` for a completed `implement` Ticket, and declared artifacts.
+4. Spike imports the output bundle into a quarantine ref, verifies that it contains the submitted `workerRevision`, validates the Submission and artifact digests, and only then normalizes a Candidate.
+5. Spike never publishes a Report by inspecting an unreported live checkout. The exchange output must contain everything required for publication after the worker stops.
+
+Local paths, process IDs, container IDs, and adapter-specific cleanup details are operational projections, not workflow facts. A staging worker record correlates an opaque adapter handle with the Ticket's full nested identity so stop and cleanup can be retried. Durable Ticket and Report formats remain adapter-independent.
+
+The exchange importer treats all worker output as untrusted. It accepts only declared regular files, rejects symlinks, unexpected paths and path traversal, applies explicit size limits, verifies artifact digests, and validates Git bundles before importing them.
+
+Ticket execution policy describes required capabilities rather than selecting an adapter. Credential grants contain identifiers, never secret values; the selected adapter resolves them at launch. An adapter must refuse a Ticket whose isolation, network, or credential policy it cannot satisfy.
+
+The local-clone adapter provides workspace separation only and may run controlled prototype workers. It is not security isolation. Autonomous workers must use the Docker adapter before Spike is used against valuable repositories.
 
 ### Sequential work and nested identity
 
@@ -133,7 +153,7 @@ Spike does not initially guarantee safe concurrent planner CLI mutation. This ex
 Spike never resumes an interrupted worker session or attempts to recover work in progress. Recovery means:
 
 1. identify the latest committed workflow state;
-2. stop and remove any recorded worker processes, containers, aliases, tabs, volumes, and networks left by later incomplete work;
+2. ask the recorded Worker adapter to stop and remove any runtime resources left by later incomplete work;
 3. ignore or quarantine uncommitted output and partial projections;
 4. start a fresh Ticket and fresh worker session from the latest committed Candidate.
 
@@ -235,8 +255,7 @@ Commit messages may store durable, human-facing Change information:
 - summary;
 - rationale;
 - stable Goal and Change IDs;
-- permanent decisions;
-- contributor trailers.
+- permanent decisions.
 
 Commit messages must not store:
 
@@ -247,6 +266,8 @@ Commit messages must not store:
 - test logs;
 - artifacts;
 - workflow status.
+
+Candidate commits use the operator's configured Git identity for both author and committer. Worker and model identity remain in the Report rather than contributor trailers. The only workflow trailers are the stable Goal and Change IDs.
 
 A completed implementation Report records the Change base revision, Ticket input revision, worker-reported revision, and normalized candidate revision. A completed review Report records the exact candidate revision and implementation Ticket it reviewed. Reports always use exact commit hashes. For example:
 
@@ -282,7 +303,7 @@ There is no mutable current-Candidate ref. The current Candidate is the `candida
 
 Workers should not be required to maintain a single amended commit correctly during implementation. They may create whatever local commits help them work.
 
-After validating a completed implementation Submission at worker revision `R`, Spike creates a normalized Candidate commit using Git plumbing:
+After importing the output bundle into a quarantine ref and validating a completed implementation Submission at worker revision `R`, Spike creates a normalized Candidate commit using Git plumbing:
 
 ```text
 parent  = Change base revision
@@ -304,7 +325,7 @@ A Ticket owns:
 - intended outcome;
 - exact input Candidate or base revision;
 - curated context snapshot;
-- worker/session correlation.
+- adapter-independent execution policy for isolation, network access, and credential grants.
 
 The full identity of a Ticket is its Goal ID, Change ID, and Ticket ID. The Ticket ID is also its sequence within the Change.
 
@@ -327,7 +348,8 @@ Each Ticket automatically packages:
 5. exact starting revision;
 6. relevant prior Reports;
 7. unresolved findings;
-8. decisions, constraints, assumptions, and non-goals.
+8. decisions, constraints, assumptions, and non-goals;
+9. execution policy and expected output contract.
 
 The planner selects relevant Reports rather than passing an unbounded history to every worker.
 
@@ -350,6 +372,8 @@ On normal completion, a worker session is stopped and finalized after Spike publ
 A Submission is the worker-authored, untrusted response to a Ticket. It exists only in staging, may be corrected before Report publication, and does not advance workflow state. A terminal host-generated Report does not require a Submission.
 
 A Report is the canonical, host-sealed outcome Spike publishes for one Ticket. Reports are immutable and append-only. A Report has no separate ID: its full identity and path are those of its Ticket. Spike owns its provenance, timestamps, exact revisions, artifact digests, and worker correlation while preserving any accepted worker-authored content.
+
+Every Report records common execution provenance: adapter name, isolation level, worker and model identity, start and finish timestamps, and an optional immutable environment digest such as a Docker image digest. It does not retain local clone paths, process IDs, container IDs, or other cleanup handles.
 
 Publishing `report.md` is the Ticket's commit point. There is no separate Result artefact.
 
@@ -393,9 +417,9 @@ Each Report remains a permanent, self-contained record of one Ticket outcome.
 1. Planner creates the next sequential Change at the Goal's current integrated revision.
 2. Planner issues the next sequential `implement` Ticket.
 3. Spike launches a fresh worker at the exact Change base or current Candidate.
-4. Worker implements and writes a Submission containing its reported revision and evidence.
-5. Spike validates the Submission and worker Git evidence.
-6. Spike normalizes the worker tree into Candidate A.
+4. Worker implements and writes a Submission, output Git bundle, and declared artifacts.
+5. Spike imports the bundle into a quarantine ref and validates the submitted revision, evidence, and artifact digests.
+6. Spike normalizes the imported worker tree into Candidate A.
 7. Spike publishes the Ticket's Report referencing the worker revision and Candidate A. This is the commit point.
 8. Planner updates the Change summary in the Plan and finalizes the worker.
 
@@ -411,8 +435,8 @@ Each Report remains a permanent, self-contained record of one Ticket outcome.
 
 1. Planner issues another `implement` Ticket from Candidate A.
 2. A fresh implementer receives relevant review findings and Change context.
-3. Worker writes a Submission at revision R.
-4. Spike validates the Submission and normalizes R into Candidate B with the same Change base.
+3. Worker writes a Submission and output bundle at revision R.
+4. Spike imports and validates the bundle, then normalizes R into Candidate B with the same Change base.
 5. Spike publishes the Ticket's Report referencing R and Candidate B.
 6. Another fresh `review` Ticket evaluates Candidate B.
 
@@ -420,14 +444,22 @@ Remediation is ordinary implementation: a review verdict leads to another fresh 
 
 ## Landing
 
+Each Goal has a dedicated integration ref:
+
+```text
+refs/spike/goals/<goal-id>/integrated
+```
+
+It begins at the Goal's initial revision and is a rebuildable projection of landed Change decisions. Landing never updates `main` or the host worktree.
+
 1. Planner verifies a completed `review` Report with an `approve` verdict selecting the current Candidate.
 2. Planner verifies the Change base still matches the Goal's integrated revision.
 3. Planner atomically installs `decision.md` with disposition `land` and the exact approved commit.
 4. The approved Candidate becomes the landed Change commit.
-5. Goal integrated revision advances to that commit.
+5. Goal integrated revision and its dedicated integration ref advance to that commit.
 6. Planner updates the Plan and selects the next Change.
 
-If the integrated revision moved, Spike must explicitly rebase or recreate the Candidate and require review of the new hash. It must not silently land an unreviewed rewrite.
+If the integrated revision moved, Spike must explicitly recreate the Candidate and require review of the new hash. It must not silently land an unreviewed rewrite. Applying the integrated history to `main` is a separate explicit operator action.
 
 ## Rejection and abandonment
 
@@ -443,14 +475,14 @@ A poor Ticket never has to be approved merely to continue with a later Ticket.
 
 The planner needs enough Change history to detect non-convergence.
 
-Initial deterministic indicators should include only:
+Initial deterministic indicators use hard-coded prototype thresholds:
 
-- actual Ticket count materially exceeds planned Ticket count;
-- review/remediation rounds exceed a threshold;
-- the same finding ID is reopened;
-- consecutive `partial` or `blocked` Reports.
+- actual Ticket count exceeds planned Ticket count by more than two;
+- three completed review Reports have a `remediate` verdict;
+- the same finding ID appears in three review Reports, meaning it reopened twice;
+- two consecutive Reports have a `partial` or `blocked` outcome.
 
-Initial thresholds should be simple and configurable. For example:
+These thresholds become configurable only if observed workflows justify it. For example:
 
 ```text
 Change churn detected
@@ -486,9 +518,9 @@ Only a small set of immutable records advance authoritative workflow state:
 - a completed `review` Report with an `approve` verdict commits review approval of an exact candidate revision;
 - `decision.md` resolves the Change and, for `land`, commits it to the Goal's integrated history.
 
-Submissions, candidate objects, candidate refs, runtime status, and planner summaries prepared before Report publication are staging or projections. They do not advance workflow state by themselves.
+Submissions, input and output bundles, quarantine refs, candidate objects, candidate refs, runtime status, and planner summaries prepared before Report publication are staging or projections. They do not advance workflow state by themselves.
 
-For a completed `implement` Ticket, Spike validates the Submission and prepares the normalized Candidate first, then atomically installs the immutable Report referencing the worker and candidate revisions. For other outcomes and roles, it installs the Report after validating the available worker or host evidence. Report publication is always the Ticket commit point. Git objects or refs left without a published Report are uncommitted debris and may be retained for diagnosis or cleaned up.
+For a completed `implement` Ticket, Spike validates the Submission, imports and verifies the output bundle, and prepares the normalized Candidate first, then atomically installs the immutable Report referencing the worker and candidate revisions. For other outcomes and roles, it installs the Report after validating the available worker or host evidence. Report publication is always the Ticket commit point. Bundles, Git objects, or refs left without a published Report are uncommitted debris and may be retained for diagnosis or cleaned up.
 
 ## Rewind policy
 
@@ -504,38 +536,33 @@ On planner or supervisor restart:
 
 Spike never reconnects to an interrupted session, resumes its conversation, imports its uncommitted output automatically, or retries an ambiguous prompt. The replacement Ticket may repeat work.
 
-Cleanup is idempotent and independent from workflow progress. A failed container, tab, volume, network, or alias removal produces a visible health warning and can be retried, but does not make interrupted worker output authoritative.
+Cleanup is idempotent and independent from workflow progress. A failed adapter cleanup produces a visible health warning and can be retried, but does not make interrupted worker output authoritative.
 
 ## Locking
 
 The initial workflow assumes one planner writer and does not support concurrent planner mutation.
 
-Retain narrow coordination only where independent processes genuinely race:
-
-- runtime stop versus runtime exit recording;
-- Herdr workspace placement.
+Retain narrow coordination only where runtime stop and runtime exit recording genuinely race.
 
 Do not add workflow locks for Goal, Change, Ticket, Report publication, candidate normalization, review, or Change decision operations. The single planner writer makes them unnecessary.
 
 If concurrent planner mutation becomes a demonstrated requirement, design it later against this simpler model.
 
-## Worker lifecycle and Herdr
+## Worker execution and lifecycle
 
-Persistent Herdr is the only initial delegated worker backend.
+The initial adapter creates a disposable local clone from the Ticket input bundle. The production adapter runs the same checkout and exchange contract inside one Docker container per Ticket.
 
-For each Ticket:
+For each Ticket, the Worker module:
 
-1. create a fresh worker session and clone;
-2. run the Ticket;
-3. import and validate its Submission;
-4. prepare any normalized Candidate and publish the canonical Report;
-5. retain the worker only for immediate administrative Submission correction before publication;
-6. stop and finalize it;
-7. close its Herdr tab and release runtime resources.
+1. prepares the input exchange and creates a fresh private checkout;
+2. launches the worker and persists its opaque operational handle;
+3. waits for a Submission or a terminal runtime outcome;
+4. stops the worker when necessary;
+5. imports and validates only the declared exchange output;
+6. prepares any normalized Candidate and publishes the canonical Report;
+7. finalizes the adapter resources and removes the operational record.
 
-The Herdr Agents panel indexes active sessions. One tab per active worker is acceptable because terminal workers are finalized promptly.
-
-Detached/headless free-form delegation and session reuse are non-goals for the initial model.
+Stop and cleanup are idempotent. Report publication must not depend on the worker remaining live. Session attachment, service networking, and interactive follow-up sit outside this seam and are deferred until the Docker workflow is reliable.
 
 ## Model configuration
 
@@ -558,6 +585,20 @@ Project configuration should distinguish planner and worker roles:
 
 Ticket workers never inherit the planner model implicitly. Explicit Ticket-level overrides remain one-session overrides and are retained as Ticket provenance.
 
+## Runtime policy
+
+Spike is Bun-first and does not promise Node compatibility for its CLI, modules, or tests. Use Bun where it provides leverage, while continuing to use `node:` standard-library modules where they are equally convenient. Maintain one Bun test and build path rather than a Bun/Node compatibility matrix.
+
+Integration runtimes remain explicit:
+
+- Spike core, CLI, tests, and local Worker adapter run on a pinned Bun version.
+- Pi runs on its supported Node runtime and is invoked through its CLI or JSONL RPC protocol. Spike does not run Pi under Bun or embed the Pi SDK into the Bun process initially.
+- Any Pi extension remains thin, Node-compatible TypeScript. It communicates with Spike through its CLI or process protocol rather than importing Spike internals.
+- Herdr launches and observes processes and does not own Spike runtime semantics.
+- The Docker worker image starts from a pinned Node base for Pi and installs a pinned Bun binary for Spike and project tooling.
+
+Pin Bun, Node, and Pi versions in the Docker build. Record the immutable Docker image digest in Report execution provenance. A Docker smoke test must launch Pi under Node and complete one Ticket through the standard exchange contract.
+
 ## Proposed durable layout
 
 This is illustrative rather than final. Every durable workflow file is one Markdown document with unversioned JSON frontmatter:
@@ -576,16 +617,21 @@ This is illustrative rather than final. Every durable workflow file is one Markd
               ticket.md
               report.md
           decision.md
-  output/
+  exchange/
     goals/<goal-id>/changes/001/tickets/001/
-      ticket.md
-      context.md
-      submission.md
-    artifacts/
-      goals/<goal-id>/changes/001/tickets/001/
+      input/
+        ticket.md
+        context.md
+        repository.bundle
+      output/
+        submission.md
+        repository.bundle
+        artifacts/
+  runtime/
+    workers/goals/<goal-id>/changes/001/tickets/001/worker.md
 ```
 
-Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The `001` directories illustrate parent-relative sequential IDs. Files under `output/` are staging inputs and projections, but use the same document format where structured workflow data is exchanged.
+Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The `001` directories illustrate parent-relative sequential IDs. Files under `exchange/` and `runtime/` are staging inputs and operational projections rather than authoritative workflow documents. Structured files use Markdown with JSON frontmatter; Git bundles and worker artifacts retain their native formats.
 
 ## Module direction
 
@@ -609,11 +655,11 @@ Owns Submission import, host terminal evidence, role-specific validation, canoni
 
 ### Git Change module
 
-Owns Candidate normalization, Ticket-keyed retention refs, commit messages, and landing.
+Owns input bundle creation, quarantine import and verification, Candidate normalization, Ticket-keyed retention refs, commit messages, and landing.
 
 ### Worker module
 
-Owns fresh worker launch, exact revision setup, status, stop, finalization eligibility, and cleanup.
+Owns the runtime-independent exchange contract, fresh worker launch at the exact revision, opaque operational handles, terminal outcome observation, stop, and idempotent cleanup. Its first adapter uses disposable local clones; its production adapter uses Docker. Do not create a general adapter registry or expose adapter-specific types to callers.
 
 ### Durable-state module
 
@@ -647,7 +693,7 @@ Add another dependency only when repeated implementation inside one of these mod
 
 ## Phase 1: Model prototype
 
-Build a disposable Bun terminal prototype using a temporary Git repository.
+Build a disposable Bun terminal prototype using a temporary host Git repository and controlled workers in disposable local clones. Each clone is created from the standard input bundle and returns the standard output bundle.
 
 The prototype should demonstrate:
 
@@ -662,13 +708,14 @@ The prototype should demonstrate:
 - rejected and abandoned Change decisions;
 - Plan revision;
 - churn warning;
-- interruption before and after each immutable commit point.
+- interruption before and after each immutable commit point;
+- Report publication after the worker has stopped, using only exchange output.
 
-The prototype should not launch containers or Herdr.
+The prototype should not launch containers or interactive session tooling. Local clones are development-only and provide no security isolation.
 
-## Phase 2: Production tracer bullet
+## Phase 2: Host-local tracer bullet
 
-Implement one complete vertical workflow:
+Implement one complete vertical workflow through the local-clone Worker adapter:
 
 ```text
 change create 001
@@ -682,11 +729,50 @@ change create 001
   -> change decision land
 ```
 
-Do not implement session reuse, concurrent Changes, semantic churn analysis, or multiple backends.
+Do not implement session reuse, concurrent Changes, semantic churn analysis, interactive sessions, or a general runtime plugin system. Do not use this adapter to run autonomous workers against valuable repositories.
+
+## Phase 3: Docker isolation
+
+Implement one Docker adapter behind the existing Worker module seam before production use:
+
+- use a pinned Node base image, run Pi under Node, and install a pinned Bun binary for Spike and project tooling;
+- consume the same read-only input exchange;
+- create the private repository inside the container;
+- write only the declared output exchange;
+- do not mount the host checkout, `.spike/` authority, Docker socket, unrelated credentials, or the operator's home directory;
+- make network access and credentials explicit Ticket execution policy;
+- retain the same Submission, bundle import, Report publication, stop, and cleanup behavior;
+- pass the same Worker module contract tests as the local-clone adapter.
+
+This phase should add isolation only. Interactive sessions, service networking, multiple container runtimes, and runtime plugin discovery remain out of scope.
 
 ## Testing strategy
 
 Tests should exercise the same deep module interfaces used by production callers.
+
+### Layout
+
+Focused module tests are collocated as `src/**/*.test.ts`. Cross-module tests live by purpose:
+
+```text
+test/
+  scenario/   # complete workflow and recovery paths
+  contract/   # reusable Worker adapter contract suites
+  docker/     # explicit slow isolation smoke tests
+  support/    # scripted workers and Git fixtures
+```
+
+Do not create a mirrored unit-test tree under `test/`.
+
+### Fast default suite
+
+The default Bun suite should remain under roughly two seconds and contain no network, Docker, Pi, Herdr, or model calls. Pure parsing, schema, derivation, allocation, and churn tests operate on strings and objects and may run concurrently.
+
+Filesystem and Git behavior uses temporary directories and the real Git CLI. Do not introduce an in-memory filesystem or Git implementation: atomic rename, exclusive creation, symlink handling, bundles, refs, and commit identity are part of the production behavior under test. Use Git plumbing, deterministic scripted workers, injected clocks and crash points, and the production modules. Do not sleep or poll in default tests.
+
+Repository scenarios remain isolated and are not globally concurrent unless measurements show that parallelism improves total time. Docker tests run explicitly from `test/docker/`; Herdr and real model execution remain manual smoke tests initially.
+
+### Scenarios
 
 Prioritize scenario tests:
 
@@ -697,12 +783,18 @@ Prioritize scenario tests:
 5. interrupted Ticket Report -> replacement Ticket;
 6. rejected or abandoned Change decision;
 7. crash around each immutable commit point;
-8. fresh worker context contains all required information;
-9. worker finalization preserves Reports, referenced Candidate commits, and artifacts;
-10. deterministic churn warning after repeated feedback;
-11. dirty host checkout remains untouched.
+8. Worker adapter starts at the exact revision from the input bundle;
+9. Report publication succeeds after worker exit using only declared exchange output;
+10. missing, malformed, or revision-mismatched output bundles are rejected;
+11. stop and cleanup are idempotent;
+12. fresh worker context contains all required information;
+13. worker finalization preserves Reports, referenced Candidate commits, and artifacts;
+14. deterministic churn warning after repeated feedback;
+15. dirty host checkout remains untouched;
+16. Docker exposes only declared inputs, outputs, network, and credentials;
+17. Docker launches Pi under Node and completes one Ticket through the standard exchange contract.
 
-Avoid tests for unsupported arbitrary concurrent planner mutation. Retain focused tests for genuine runtime stop/exit and Herdr placement races.
+Run the same Worker module contract suite against the local-clone adapter in Phase 2 and the Docker adapter in Phase 3. Avoid tests for unsupported arbitrary concurrent planner mutation. Retain focused tests for the genuine runtime stop/exit race.
 
 ## Success criteria
 
@@ -712,18 +804,13 @@ The proposal succeeds when:
 - Change and Ticket IDs are monotonic parent-relative `nnn` sequences;
 - each landed Change is exactly one reviewed commit;
 - multiple sequential fresh-session Tickets can contribute to one Change;
-- Reports provide sufficient context for planner recovery and fresh workers;
+- Reports and exchange output provide sufficient context for publication, planner recovery, and fresh workers after the producing worker has stopped;
+- the local-clone and Docker adapters satisfy the same Worker module contract;
 - review and remediation require no same-session continuation;
 - planner can detect and surface obvious churn;
 - interruption rewinds to the latest committed Candidate, abandons in-progress sessions, and cleans their resources without PID-based workflow locks;
 - terminal workers are finalized promptly;
+- Docker isolation is required before autonomous workers run against valuable repositories;
+- Spike uses Bun as its sole application runtime while Pi remains on Node behind process protocols;
 - model defaults are project-configured;
 - the production implementation remains small and easy to navigate.
-
-## Open decisions
-
-The following should be resolved during review of this proposal:
-
-- how candidate commit authorship and contributor trailers are assigned;
-- whether landing updates `main` directly or advances a dedicated integration ref for explicit operator application;
-- exact churn thresholds.

@@ -6,15 +6,14 @@ Version 2 is starting from a deliberately small foundation.
 
 ## Documentation
 
-- [Workflow proposal](doc/workflow.md)
-- [Long-term vision](doc/vision.md)
+- [Workflow design](doc/workflow.md)
 
 ## Development
 
 Requires [Bun](https://bun.sh/).
 
 ```bash
-bun test
+bun run test
 bun run check
 bin/spike --help
 ```

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { usage, version } from "../src/cli.ts";
+import { usage, version } from "./cli.ts";
 
 const root = join(import.meta.dir, "..");
 
