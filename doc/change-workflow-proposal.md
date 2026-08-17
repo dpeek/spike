@@ -102,18 +102,18 @@ Workers write only through their assigned output paths. The planner imports thos
 
 Spike does not initially guarantee safe concurrent planner CLI mutation. This explicit capability cut removes the need for lock ordering across activation, issuance, remediation, publication, acceptance, completion, and cleanup.
 
-### Interruption is inspectable, not magically resumable
+### Recovery rewinds rather than resumes
 
-After interruption, Spike should answer:
+Spike never resumes an interrupted worker session or attempts to recover work in progress. Recovery means:
 
-- what immutable evidence exists;
-- which commit point was reached;
-- whether retry is provably idempotent;
-- whether operator acknowledgement is required.
+1. identify the latest committed workflow state;
+2. stop and remove any recorded worker processes, containers, aliases, tabs, volumes, and networks left by later incomplete work;
+3. ignore or quarantine uncommitted output and partial projections;
+4. start a fresh Ticket and fresh worker session from the latest committed Candidate.
 
-It should not infer safety from PID liveness, process birth time, terminal output, or conversational state.
+Some rework is acceptable. A simple, deterministic restart is preferable to preserving uncertain session state.
 
-Ambiguous external effects are never replayed automatically. An operator may explicitly retry or abandon them by exact identity.
+Spike must not infer recoverability from PID liveness, process birth time, terminal output, or conversational state. It does not automatically replay ambiguous prompts or external effects. If cleanup is incomplete, workflow recovery still rewinds to the committed Candidate and surfaces cleanup as a separate retryable health problem.
 
 ## Domain model
 
@@ -495,24 +495,33 @@ Semantic diff oscillation and automated design judgment are non-goals initially.
 
 ## Interruption and recovery
 
-## Commit points
+## Committed workflow state
 
-Each operation should have one small immutable commit point:
+Only a small set of immutable records advance authoritative workflow state:
 
-- Ticket issuance: immutable Ticket exists.
-- Report import: immutable Report exists.
-- Candidate creation: immutable Candidate ref exists.
-- Change approval: immutable Approval Report exists.
-- Change landing: immutable landing record exists.
+- a Ticket record commits the assignment, but not any worker progress;
+- a Ticket Result commits a validated Report and, for implementation work, its normalized Candidate;
+- an Approval Report commits review approval of an exact Candidate;
+- a landing record commits the Change to the Goal's integrated history.
 
-Mutable pointers and planner summaries are projections. If stale after a crash, they can be repaired from immutable facts.
+Worker output, temporary Reports, candidate objects, candidate refs, mutable pointers, and planner summaries prepared before the relevant commit record are staging or projections. They do not advance workflow state by themselves.
 
-## Retry rules
+For an implementation or remediation Ticket, Spike prepares and validates the Report and normalized Candidate first, then installs one immutable Ticket Result referencing both. The Ticket Result is the commit point. Git objects or refs left without a Ticket Result are uncommitted debris and may be retained for diagnosis or cleaned up.
 
-- Retry automatically only when the immutable result already proves the requested operation completed exactly.
-- If no commit point exists, the operation may be attempted again.
-- If an external effect is ambiguous, require explicit exact-ID acknowledgement.
-- Never infer completion from terminal prose, chat history, PID state, or a completion notification.
+## Rewind policy
+
+On planner or supervisor restart:
+
+1. load the latest valid Goal, landed Change, current Change, and committed Ticket Results;
+2. derive the latest committed Candidate from those Results;
+3. classify every issued Ticket without a committed Result as interrupted;
+4. stop and finalize all worker resources correlated with interrupted Tickets;
+5. ignore or quarantine their staged output;
+6. issue a fresh replacement Ticket from the latest committed Candidate when the Plan still calls for that work.
+
+Spike never reconnects to an interrupted session, resumes its conversation, imports its uncommitted output automatically, or retries an ambiguous prompt. The replacement Ticket may repeat work.
+
+Cleanup is idempotent and independent from workflow progress. A failed container, tab, volume, network, or alias removal produces a visible health warning and can be retried, but does not make interrupted worker output authoritative.
 
 ## Locking
 
@@ -523,7 +532,7 @@ Retain narrow coordination only where independent processes genuinely race:
 - runtime stop versus runtime exit recording;
 - Herdr workspace placement.
 
-Do not add per-transition PID/start-time locks for Goal, Change, Ticket, Report, Candidate, review, or landing operations.
+Do not add per-transition PID/start-time locks for Goal, Change, Ticket, Report, Candidate, review, or landing operations. Do not add automatic stale-lock recovery for planner work.
 
 If concurrent planner mutation becomes a demonstrated requirement, design it later against this simpler model.
 
@@ -570,7 +579,7 @@ Ticket workers never inherit the planner model implicitly. Explicit Ticket-level
 This is illustrative rather than final:
 
 ```text
-.pi-swarm/
+.spike/
   goals/
     <goal-id>/
       goal.md
@@ -688,9 +697,10 @@ Do not implement session reuse, concurrent Changes, semantic churn analysis, or 
 
 Do not dual-write the current and proposed models.
 
-- Preserve existing v1 state as read-only legacy evidence.
+- Store all new durable workflow state under `.spike/`.
+- Preserve existing `.pi-swarm/` v1 state as read-only legacy evidence.
 - Keep Ticket 022 unaccepted.
-- Record a migration receipt explaining that the unresolved v1 Ticket was superseded by the workflow migration.
+- Record a migration receipt under `.spike/` explaining that the unresolved v1 Ticket was superseded by the workflow migration.
 - Seed the new Goal from the current integrated revision.
 - Seed the Plan with remaining model-configuration, cleanup, smoke-test, and Goal-completion Changes.
 - Switch commands to the new model only after tracer-bullet verification.
@@ -744,7 +754,7 @@ The proposal succeeds when:
 - Reports provide sufficient context for planner recovery and fresh workers;
 - review and remediation require no same-session continuation;
 - planner can detect and surface obvious churn;
-- interruption is recoverable from immutable facts without PID-based workflow locks;
+- interruption rewinds to the latest committed Candidate, abandons in-progress sessions, and cleans their resources without PID-based workflow locks;
 - terminal workers are finalized promptly;
 - model defaults are project-configured;
 - current v1 evidence remains inspectable;
