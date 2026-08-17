@@ -338,8 +338,9 @@ state, while `spike herdr attach` opens the full workspace UI.
 The Herdr supervisor is placed in the repository's canonical project space and
 attached directly to your terminal. Every persistent worker gets its own labelled
 tab in that same space; workspace labels are display names and are not used as
-project identity. Spike revalidates the recorded Herdr workspace against the
-repository on each launch and safely creates a replacement if it is missing.
+project identity. Spike revalidates the recorded workspace, tab, and pane IDs
+against live pane working directories in the exact repository checkout on each
+launch, and safely creates a replacement space if that identity is missing.
 Detach with `ctrl+b q`; its terminal and workers keep running. Running
 `spike supervisor --herdr` again reattaches to the existing supervisor.
 

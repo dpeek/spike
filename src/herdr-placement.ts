@@ -1,5 +1,5 @@
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export type HerdrCommand = (args: string[]) => Promise<unknown>;
 
@@ -16,16 +16,20 @@ export type HerdrPlacementEnvironment = {
   HERDR_PANE_ID?: string;
 };
 
+// Herdr 0.8 workspace summaries deliberately do not include a cwd. Repository
+// identity comes from pane list records, never from labels or imagined fields.
 type Workspace = {
   workspace_id?: unknown;
   number?: unknown;
   label?: unknown;
+};
+
+type Pane = {
+  workspace_id?: unknown;
+  tab_id?: unknown;
+  pane_id?: unknown;
   cwd?: unknown;
-  identity_cwd?: unknown;
-  worktree?: {
-    checkout_path?: unknown;
-    repo_root?: unknown;
-  } | null;
+  foreground_cwd?: unknown;
 };
 
 type PlacementRecord = {
@@ -55,20 +59,26 @@ function workspaceId(workspace: Workspace): string | undefined {
   return typeof workspace.workspace_id === "string" && workspace.workspace_id ? workspace.workspace_id : undefined;
 }
 
-function samePath(left: unknown, right: string): boolean {
-  return typeof left === "string" && left.length > 0 && resolve(left) === resolve(right);
+function pathBelongsToCheckout(value: unknown, root: string): boolean {
+  if (typeof value !== "string" || !value || !isAbsolute(value)) return false;
+  const candidate = resolve(value);
+  return candidate === root || candidate.startsWith(`${root}${sep}`);
 }
 
-/** Labels are intentionally excluded: a display label is not project identity. */
-function belongsToRepository(workspace: Workspace, root: string): boolean {
-  if (typeof workspace.worktree?.checkout_path === "string" && workspace.worktree.checkout_path) {
-    // A linked worktree shares repo_root with its parent but is a different
-    // repository context, so checkout_path is authoritative when available.
-    return samePath(workspace.worktree.checkout_path, root);
+function paneBelongsToRepository(pane: Pane, root: string): boolean {
+  // foreground_cwd is the live process cwd when Herdr can resolve it. Treat it
+  // as authoritative so a pane currently operating in another checkout is not
+  // claimed from its older terminal cwd.
+  if (typeof pane.foreground_cwd === "string" && pane.foreground_cwd) {
+    return pathBelongsToCheckout(pane.foreground_cwd, root);
   }
-  return samePath(workspace.worktree?.repo_root, root) ||
-    samePath(workspace.cwd, root) ||
-    samePath(workspace.identity_cwd, root);
+  return pathBelongsToCheckout(pane.cwd, root);
+}
+
+/** Labels are intentionally excluded: live pane cwd is project identity. */
+function belongsToRepository(workspace: Workspace, panes: Pane[], root: string): boolean {
+  const id = workspaceId(workspace);
+  return Boolean(id && panes.some((pane) => pane.workspace_id === id && paneBelongsToRepository(pane, root)));
 }
 
 function workspaceOrder(left: Workspace, right: Workspace): number {
@@ -145,11 +155,28 @@ function listedWorkspaces(value: unknown): Workspace[] {
   return workspaces.filter((candidate): candidate is Workspace => Boolean(candidate && typeof candidate === "object" && workspaceId(candidate as Workspace)));
 }
 
-function validCurrentWorkspace(environment: HerdrPlacementEnvironment, workspaces: Workspace[], root: string): Workspace | undefined {
+function listedPanes(value: unknown): Pane[] {
+  const panes = result(value, "pane list").panes;
+  if (!Array.isArray(panes)) throw new Error("Herdr placement: pane list is invalid");
+  return panes.filter((candidate): candidate is Pane => Boolean(
+    candidate && typeof candidate === "object" &&
+    typeof (candidate as Pane).workspace_id === "string" &&
+    typeof (candidate as Pane).tab_id === "string" &&
+    typeof (candidate as Pane).pane_id === "string",
+  ));
+}
+
+function validCurrentWorkspace(environment: HerdrPlacementEnvironment, workspaces: Workspace[], panes: Pane[], root: string): Workspace | undefined {
   if (environment.HERDR_ENV !== "1") return undefined;
-  const currentId = environment.HERDR_WORKSPACE_ID?.trim();
-  if (!currentId) return undefined;
-  return workspaces.find((candidate) => workspaceId(candidate) === currentId && belongsToRepository(candidate, root));
+  const currentWorkspaceId = environment.HERDR_WORKSPACE_ID?.trim();
+  const currentTabId = environment.HERDR_TAB_ID?.trim();
+  const currentPaneId = environment.HERDR_PANE_ID?.trim();
+  if (!currentWorkspaceId || !currentTabId || !currentPaneId) return undefined;
+  const workspace = workspaces.find((candidate) => workspaceId(candidate) === currentWorkspaceId);
+  if (!workspace) return undefined;
+  const currentPane = panes.find((pane) =>
+    pane.workspace_id === currentWorkspaceId && pane.tab_id === currentTabId && pane.pane_id === currentPaneId);
+  return currentPane && paneBelongsToRepository(currentPane, root) ? workspace : undefined;
 }
 
 function createdPlacement(value: unknown): HerdrPlacement {
@@ -187,13 +214,14 @@ export async function placeHerdrTab(options: {
   const recordPath = join(options.stateDir, "herdr", "project-space.v1.json");
   return withPlacementLock(options.stateDir, async () => {
     const workspaces = listedWorkspaces(await options.command(["workspace", "list"]));
+    const panes = listedPanes(await options.command(["pane", "list"]));
     const saved = await readPlacement(recordPath);
     const environment = options.environment ?? {};
-    const current = validCurrentWorkspace(environment, workspaces, root);
+    const current = validCurrentWorkspace(environment, workspaces, panes, root);
     const recorded = saved
-      ? workspaces.find((candidate) => workspaceId(candidate) === saved.workspaceId && belongsToRepository(candidate, root))
+      ? workspaces.find((candidate) => workspaceId(candidate) === saved.workspaceId && belongsToRepository(candidate, panes, root))
       : undefined;
-    const discovered = workspaces.filter((candidate) => belongsToRepository(candidate, root)).sort(workspaceOrder)[0];
+    const discovered = workspaces.filter((candidate) => belongsToRepository(candidate, panes, root)).sort(workspaceOrder)[0];
     const selected = current ?? recorded ?? discovered;
 
     if (!selected) {
