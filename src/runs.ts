@@ -1005,16 +1005,94 @@ export function validateCompletionReport(value: unknown, expected: { goalId: str
   return report as CompletionReport;
 }
 
-async function gitReportCheck(root: string, base: string, revision: string, label: string): Promise<void> {
-  const object = await Bun.spawn(["git", "-C", root, "cat-file", "-t", revision], { stdout: "pipe", stderr: "pipe" });
-  if (await object.exited !== 0 || (await new Response(object.stdout).text()).trim() !== "commit") throw new Error(`completion report ${label} is not an available commit: ${revision}`);
-  const ancestor = Bun.spawn(["git", "-C", root, "merge-base", "--is-ancestor", base, revision], { stdout: "ignore", stderr: "ignore" });
-  if (await ancestor.exited !== 0) throw new Error(`completion report ${label} is not a descendant of base ${base}`);
+type GitEvidenceResult = { code: number; stdout: string; stderr: string };
+type GitEvidenceRunner = (args: string[]) => Promise<GitEvidenceResult>;
+
+class HostReportObjectUnavailable extends Error {}
+
+async function spawnEvidence(command: string[]): Promise<GitEvidenceResult> {
+  try {
+    const child = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { code, stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch (error) { return { code: 127, stdout: "", stderr: error instanceof Error ? error.message : String(error) }; }
 }
 
-async function validateReportEvidence(root: string, report: CompletionReport): Promise<void> {
-  await gitReportCheck(root, report.baseRevision, report.resultingRevision, "resultingRevision");
-  for (const commit of report.producedCommitIds) await gitReportCheck(root, report.baseRevision, commit, "produced commit");
+async function validateGitReportEvidence(report: CompletionReport, git: GitEvidenceRunner, source: "host" | "worker"): Promise<void> {
+  const revisions: Array<{ revision: string; label: string }> = [
+    { revision: report.baseRevision, label: "baseRevision" },
+    { revision: report.resultingRevision, label: "resultingRevision" },
+    ...report.producedCommitIds.map((revision) => ({ revision, label: "produced commit" })),
+  ];
+  for (const { revision, label } of revisions) {
+    const object = await git(["cat-file", "-t", revision]);
+    if (object.code !== 0) {
+      if (source === "host" && revision !== report.baseRevision) throw new HostReportObjectUnavailable(revision);
+      throw new Error(`completion report ${label} is not an available commit in ${source} Git: ${revision}`);
+    }
+    if (object.stdout !== "commit") throw new Error(`completion report ${label} is not a commit in ${source} Git: ${revision}`);
+    const ancestor = await git(["merge-base", "--is-ancestor", report.baseRevision, revision]);
+    if (ancestor.code !== 0) throw new Error(`completion report ${label} is not a descendant of base ${report.baseRevision} in ${source} Git`);
+  }
+  for (const revision of report.producedCommitIds) {
+    const included = await git(["merge-base", "--is-ancestor", revision, report.resultingRevision]);
+    if (included.code !== 0) throw new Error(`completion report produced commit ${revision} is not contained in resultingRevision ${report.resultingRevision} in ${source} Git`);
+  }
+}
+
+function workerEvidenceCommand(state: AgentState, args: string[]): string[] {
+  const runtime = state.runtime === "apple" ? "container" : "docker";
+  return [runtime, "exec", "--user", "node", state.container, "git", "-C", "/workspace/project", ...args];
+}
+
+async function validateWorkerReportEvidence(stateDir: string, run: RunRecord, report: CompletionReport): Promise<void> {
+  const state = await readAgentState(stateDir, run.worker.slug);
+  if (!state || state.finishedAt || state.lifecycle !== "running" || state.backend !== "herdr" ||
+    state.name !== run.worker.name || state.slug !== run.worker.slug || state.goalId !== run.goalId || state.ticketId !== run.ticketId ||
+    state.runId !== run.runId || state.baseRevision !== run.baseRevision || state.runtime !== run.runtime || state.container !== run.container) {
+    throw new Error(`completion report Git objects are not available on the host and exact correlated live worker ${run.worker.slug} is unavailable`);
+  }
+  const git: GitEvidenceRunner = async (args) => await spawnEvidence(workerEvidenceCommand(state, args));
+  await validateGitReportEvidence(report, git, "worker");
+  const head = await git(["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (head.code !== 0 || head.stdout !== report.resultingRevision) throw new Error(`completion report resultingRevision ${report.resultingRevision} does not match live worker HEAD ${head.stdout || "unavailable"}`);
+  const status = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (status.code !== 0) throw new Error(`could not validate completion report worker dirty state: ${status.stderr || status.stdout || `exit code ${status.code}`}`);
+  const dirty = status.stdout.length > 0;
+  if (dirty !== report.dirtyWorktree) throw new Error(`completion report dirtyWorktree=${report.dirtyWorktree} does not match live worker dirty state (${dirty})`);
+}
+
+export async function validateCompletionReportGitEvidence(root: string, run: RunRecord, report: CompletionReport): Promise<void> {
+  const published = await spawnEvidence(["git", "-C", root, "rev-parse", "--verify", `refs/spike/agents/${run.worker.slug}^{commit}`]);
+  const retainedByPublication = published.code === 0 && (await spawnEvidence(["git", "-C", root, "merge-base", "--is-ancestor", report.resultingRevision, published.stdout])).code === 0;
+  if (!retainedByPublication) {
+    await validateWorkerReportEvidence(join(root, ".pi-swarm"), run, report);
+    return;
+  }
+  const hostGit: GitEvidenceRunner = async (args) => await spawnEvidence(["git", "-C", root, ...args]);
+  try { await validateGitReportEvidence(report, hostGit, "host"); }
+  catch (error) {
+    if (!(error instanceof HostReportObjectUnavailable)) throw error;
+    await validateWorkerReportEvidence(join(root, ".pi-swarm"), run, report);
+  }
+}
+
+async function validateSupersedingRevision(root: string, run: RunRecord, prior: string, current: string): Promise<void> {
+  const hostPrior = await spawnEvidence(["git", "-C", root, "cat-file", "-t", prior]);
+  const hostCurrent = await spawnEvidence(["git", "-C", root, "cat-file", "-t", current]);
+  if (hostPrior.code === 0 && hostPrior.stdout === "commit" && hostCurrent.code === 0 && hostCurrent.stdout === "commit") {
+    const ancestor = await spawnEvidence(["git", "-C", root, "merge-base", "--is-ancestor", prior, current]);
+    if (ancestor.code !== 0) throw new Error(`completion report superseding resultingRevision is not a descendant of ${prior} in host Git`);
+    return;
+  }
+  const state = await readAgentState(join(root, ".pi-swarm"), run.worker.slug);
+  if (!state || state.finishedAt || state.lifecycle !== "running" || state.runId !== run.runId || state.container !== run.container || state.runtime !== run.runtime) throw new Error(`completion report supersession requires exact correlated live worker ${run.worker.slug}`);
+  const ancestor = await spawnEvidence(workerEvidenceCommand(state, ["merge-base", "--is-ancestor", prior, current]));
+  if (ancestor.code !== 0) throw new Error(`completion report superseding resultingRevision is not a descendant of ${prior} in worker Git`);
+}
+
+async function validateReportEvidence(root: string, run: RunRecord, report: CompletionReport): Promise<void> {
+  await validateCompletionReportGitEvidence(root, run, report);
   for (const artifact of report.artifacts) {
     const path = within(root, artifact.path, "completion report artifact path");
     await rejectSymlinks(root, path, "completion report artifact path");
@@ -1055,7 +1133,7 @@ export async function validateStoredCompletionReport(root: string, run: RunRecor
     await rejectSymlinks(root, path, label);
     const bytes = await completionReportBytes(path, label);
     const report = validateCompletionReport(parseCompletionReport(bytes, label), expected);
-    await validateReportEvidence(root, report);
+    await validateReportEvidence(root, run, report);
     return { bytes, report };
   };
   try {
@@ -1066,7 +1144,7 @@ export async function validateStoredCompletionReport(root: string, run: RunRecor
     if (run.report.schemaVersion === 3) {
       const prior = await read(run.report.supersedes!.path, "superseded completion report");
       if (prior.report.schemaVersion !== 1 || prior.bytes.byteLength !== run.report.supersedes!.byteLength || completionReportDigest(prior.bytes) !== run.report.supersedes!.sha256 || prior.report.resultingRevision !== run.report.supersedes!.resultingRevision || current.report.schemaVersion !== 2 || current.report.supersedes?.sha256 !== run.report.supersedes!.sha256 || current.report.supersedes?.path !== run.report.supersedes!.path) throw new Error("completion report supersession chain is inconsistent");
-      await gitReportCheck(root, prior.report.resultingRevision, current.report.resultingRevision, "superseding resultingRevision");
+      await validateSupersedingRevision(root, run, prior.report.resultingRevision, current.report.resultingRevision);
     }
     return current.report;
   } catch (error) {
@@ -1085,7 +1163,7 @@ export async function importCompletionReport(cwd = process.cwd()): Promise<{ rep
   if (!info.isFile()) throw new Error("completion report staging path is not a regular file");
   const stagingBytes = await completionReportBytes(staging, "completion report staging file");
   const report = validateCompletionReport(parseCompletionReport(stagingBytes, "completion report staging file"), { goalId: run.goalId, ticketId: run.ticketId, runId: run.runId, baseRevision: run.baseRevision, worker: run.worker });
-  await validateReportEvidence(ctx.root, report);
+  await validateReportEvidence(ctx.root, run, report);
   const destination = completionReportPath(ctx, run.runId);
   await rejectSymlinks(ctx.root, destination, "completion report destination path");
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
@@ -1099,8 +1177,8 @@ export async function importCompletionReport(cwd = process.cwd()): Promise<{ rep
     if (canonicalCompletionReport(current) !== canonicalCompletionReport(report)) {
       const active = await loadRunFromContext(ctx);
       if (active.report?.schemaVersion !== 1 || active.report.path !== `.pi-swarm/goals/${run.goalId}/tickets/${run.ticketId}/runs/${run.runId}/report.v1.json` || current.outcome !== report.outcome) throw new Error("completion report already exists with conflicting content");
-      await validateReportEvidence(ctx.root, current);
-      await gitReportCheck(ctx.root, current.resultingRevision, report.resultingRevision, "superseding resultingRevision");
+      await validateReportEvidence(ctx.root, run, current);
+      await validateSupersedingRevision(ctx.root, run, current.resultingRevision, report.resultingRevision);
       const supersedes = { path: active.report.path, sha256: completionReportDigest(storedBytes), byteLength: storedBytes.byteLength, resultingRevision: current.resultingRevision };
       const amended = { ...report, schemaVersion: 2 as const, supersedes };
       const amendedBytes = Buffer.from(`${JSON.stringify(amended, null, 2)}\n`);

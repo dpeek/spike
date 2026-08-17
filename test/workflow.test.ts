@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { activateGoal, issueTicket, loadActiveGoal, loadWorkflowState } from "../src/goals.ts";
 import {
+  completionReportStagingPath,
   dispatchTicket,
+  importCompletionReport,
   readAgentState,
   recordAgentExit,
   requestAgentStop,
@@ -94,9 +96,17 @@ async function acceptedWorker(item: Fixture, name = "worker") {
     return { runtime: "apple", container: `container-${request.workerSlug}`, herdrName: `herdr-${request.workerSlug}`, herdrTabId: `tab-${request.workerSlug}`, herdrPaneId: `pane-${request.workerSlug}` };
   } });
   const running = (await readAgentState(item.stateDir, run.worker.slug))!;
+  await publishExplicit(item, head, run.worker.slug);
+  const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
+  await writeFile(staging, `${JSON.stringify({
+    schemaVersion: 1, goalId: item.goalId, ticketId: item.ticketId, runId: run.runId, worker: run.worker,
+    baseRevision: item.base, resultingRevision: head, producedCommitIds: [head], dirtyWorktree: false,
+    outcome: "completed", summary: `completed ${name}`, verification: [], services: [], artifacts: [], assumptions: [], limitations: [], risks: [],
+    followUp: { state: "ready" }, createdAt: "2026-01-03T00:30:00.000Z",
+  }, null, 2)}\n`);
+  await importCompletionReport(item.root);
   await requestAgentStop({ cwd: item.root, name: run.worker.slug, requester: "cli", reason: "operator-requested", now: new Date("2026-01-03T01:00:00.000Z"), stopRuntime: async () => {} });
   await recordAgentExit({ cwd: item.root, state: running, exitCode: 143, now: new Date("2026-01-03T01:00:01.000Z") });
-  await publishExplicit(item, head, run.worker.slug);
   const accepted = await acceptTicket({ cwd: item.root, revision: head, review: "planner", statement: `accepted ${name}`, now: new Date("2026-01-04T00:00:00.000Z") });
   return { run, head, result: accepted.result, slug: run.worker.slug };
 }
@@ -191,6 +201,43 @@ describe("durable ticket acceptance", () => {
     await expect(acceptTicket({ cwd: running.root, revision: head, review: "planner" })).rejects.toThrow("nonterminal");
   });
 
+  test("requires an imported report matching the durable publication and accepted revision", async () => {
+    const missing = await fixture();
+    const missingHead = await commit(missing, "missing-report");
+    const missingRun = await dispatchTicket({ cwd: missing.root, workerName: "missing-worker", launcher: async (request) => {
+      await writeAgentState(missing.stateDir, agent(missing, request));
+      return { runtime: "apple", container: "container" };
+    } });
+    const missingState = (await readAgentState(missing.stateDir, missingRun.worker.slug))!;
+    const blockedPublication = await execute([process.execPath, cli, "agent", "publish", missingRun.worker.slug, "--json"], missing.root, { ...process.env, REPO_SEED: missing.root });
+    expect(blockedPublication.code).not.toBe(0);
+    expect(blockedPublication.stderr).toContain("no imported completion report");
+    await publishExplicit(missing, missingHead, missingRun.worker.slug);
+    await requestAgentStop({ cwd: missing.root, name: missingRun.worker.slug, requester: "cli", reason: "done", stopRuntime: async () => {} });
+    await recordAgentExit({ cwd: missing.root, state: missingState, exitCode: 143 });
+    await expect(acceptTicket({ cwd: missing.root, revision: missingHead, review: "planner" })).rejects.toThrow("no imported completion report");
+
+    const mismatch = await fixture();
+    const publishedHead = await commit(mismatch, "published-head");
+    const mismatchRun = await dispatchTicket({ cwd: mismatch.root, workerName: "mismatch-worker", launcher: async (request) => {
+      await writeAgentState(mismatch.stateDir, agent(mismatch, request));
+      return { runtime: "apple", container: "container" };
+    } });
+    const mismatchState = (await readAgentState(mismatch.stateDir, mismatchRun.worker.slug))!;
+    await publishExplicit(mismatch, publishedHead, mismatchRun.worker.slug);
+    const staging = completionReportStagingPath(mismatch.root, mismatch.goalId, mismatch.ticketId, mismatchRun.runId);
+    await writeFile(staging, `${JSON.stringify({
+      schemaVersion: 1, goalId: mismatch.goalId, ticketId: mismatch.ticketId, runId: mismatchRun.runId, worker: mismatchRun.worker,
+      baseRevision: mismatch.base, resultingRevision: mismatch.base, producedCommitIds: [], dirtyWorktree: false,
+      outcome: "completed", summary: "stale report", verification: [], services: [], artifacts: [], assumptions: [], limitations: [], risks: [],
+      followUp: { state: "ready" }, createdAt: "2026-01-03T00:30:00.000Z",
+    }, null, 2)}\n`);
+    await importCompletionReport(mismatch.root);
+    await requestAgentStop({ cwd: mismatch.root, name: mismatchRun.worker.slug, requester: "cli", reason: "done", stopRuntime: async () => {} });
+    await recordAgentExit({ cwd: mismatch.root, state: mismatchState, exitCode: 143 });
+    await expect(acceptTicket({ cwd: mismatch.root, revision: publishedHead, review: "planner" })).rejects.toThrow("does not match publication and accepted revision");
+  });
+
   test("recovers a validated acceptance interrupted after immutable result creation", async () => {
     const item = await fixture();
     const head = await commit(item, "recover");
@@ -240,6 +287,26 @@ describe("agent finalization and provenance", () => {
     expect(redispatched.worker.slug).toBe(accepted.slug);
     expect(redispatched.runId).not.toBe(accepted.run.runId);
     expect((await workflowDoctor(item.root)).ok).toBe(true);
+  });
+
+  test("doctor detects an integrity-consistent report/publication/result mismatch", async () => {
+    const item = await fixture();
+    const accepted = await acceptedWorker(item, "report-mismatch");
+    const runDirectory = join(item.stateDir, "goals", item.goalId, "tickets", item.ticketId, "runs", accepted.run.runId);
+    const reportPath = join(runDirectory, "report.v1.json");
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    report.resultingRevision = item.base;
+    report.producedCommitIds = [];
+    const bytes = Buffer.from(`${JSON.stringify(report, null, 2)}\n`);
+    await writeFile(reportPath, bytes);
+    const recordPath = join(runDirectory, "record.v1.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8"));
+    record.report.sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+    record.report.byteLength = bytes.byteLength;
+    await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+    const diagnosis = await workflowDoctor(item.root);
+    expect(diagnosis.ok).toBe(false);
+    expect(diagnosis.errors.join(" ")).toContain("completion report/publication/result provenance");
   });
 
   test("doctor fails closed on tampered finalization evidence", async () => {

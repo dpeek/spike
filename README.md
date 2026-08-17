@@ -227,6 +227,32 @@ checking both `spike ticket status --json` and `spike run status --json` first.
 The existing `dispatch` action remains available only for free-form work not
 represented by a durable ready ticket.
 
+## Import the completion report before publication
+
+A durable worker exports its bounded structured report through the mounted
+output boundary. Import and inspect that report before publishing code:
+
+```bash
+spike run report import
+spike run report show
+spike run report show --json
+spike agent publish <worker-name>
+spike agent diff <worker-name> -- --stat
+```
+
+Before publication, report import validates Git evidence read-only in the exact
+correlated live worker when the resulting objects are not yet in host Git. It
+checks the worker HEAD, dirty state, base, resulting revision, produced commits,
+and ancestry without fetching or moving a host ref. Publication then requires
+that imported report and refuses a worker base or head mismatch before creating
+a bundle, updating a ref, or writing a manifest. After publication, report
+validation uses the imported host objects and remains available after the worker
+stops. Artifacts remain confined to the report's run-specific output boundary.
+
+The supported order is report import, report inspection, publication, diff or
+Hunk review, then acceptance. No manual bundle or fetch step is part of this
+flow.
+
 ## Accept and inspect ticket history
 
 After the worker run is terminal and its latest publication has been reviewed,
@@ -267,9 +293,8 @@ legacy evidence is considered migrated. The current ready ticket is retained on
 its accepted base. Unknown, missing, or conflicting evidence is retained and
 reported rather than guessed.
 
-Current workflow limitations remain intentional: Spike does not parse a
-structured completion report, remediate/cancel a ticket, or associate detached
-one-shot work with durable runs.
+Current workflow limitations remain intentional: Spike does not yet
+remediate/cancel a ticket or associate detached one-shot work with durable runs.
 
 ## Build and start services
 

@@ -164,6 +164,10 @@ export async function acceptTicket(options: {
       const project = basename(root).toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
       publication = await loadLatestPublication({ root, stateDir: join(root, ".pi-swarm"), project, }, durableRun.worker.slug, commandRunner);
       await verifyPublication(root, publication, options.revision, ready.record.baseRevision);
+      const completion = await loadCompletionReport(root);
+      if (completion.baseRevision !== publication.base || completion.resultingRevision !== publication.head || completion.resultingRevision !== options.revision) {
+        throw new Error(`completion report ${completion.baseRevision}...${completion.resultingRevision} does not match publication and accepted revision ${publication.base}...${publication.head}`);
+      }
     } else {
       publication = await findExplicitPublication(root, options.revision, ready.record.baseRevision);
       if (!publication) throw new Error("ticket acceptance without a durable run requires an explicit validated publication identity");
@@ -338,7 +342,13 @@ export async function workflowDoctor(cwd = process.cwd()): Promise<DoctorReport>
           try {
             const runRecord = validateRunRecord(await readJson(runPath, "result run record"), { goalId: state.goalId, ticketId: entry.ticket.ticketId, baseRevision: entry.ticket.baseRevision, runId: entry.result.runId });
             if (!terminalRuns.has(runRecord.status) || runRecord.worker.slug !== entry.result.worker?.slug) throw new Error(`run provenance for ${entry.ticket.ticketId} is inconsistent`);
-            if (runRecord.report) await validateStoredCompletionReport(root, runRecord);
+            if (runRecord.report) {
+              const completion = await validateStoredCompletionReport(root, runRecord);
+              if (!completion || completion.baseRevision !== entry.result.baseRevision || completion.resultingRevision !== entry.result.acceptedRevision ||
+                completion.resultingRevision !== entry.result.publication?.head || completion.baseRevision !== entry.result.publication?.base) {
+                throw new Error(`completion report/publication/result provenance for ${entry.ticket.ticketId} is inconsistent`);
+              }
+            } else if (!entry.result.provenanceMigrated) throw new Error(`accepted durable run for ${entry.ticket.ticketId} has no completion report`);
             const agent = await readAgentReadonly(join(root, ".pi-swarm"), runRecord.worker.slug);
             const activeMatches = Boolean(agent && agent.runId === runRecord.runId && agent.goalId === runRecord.goalId && agent.ticketId === runRecord.ticketId &&
               agent.baseRevision === runRecord.baseRevision && agent.finishedAt);

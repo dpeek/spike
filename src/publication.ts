@@ -46,6 +46,11 @@ export type PublicationContext = {
   project: string;
 };
 
+export type ExpectedPublicationProvenance = {
+  baseRevision: string;
+  resultingRevision: string;
+};
+
 const objectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function commandText(result: CommandResult): string {
@@ -245,6 +250,7 @@ export async function publishBranch(
   state: PublicationAgentState,
   run: CommandRunner,
   now = () => new Date(),
+  expectedProvenance?: ExpectedPublicationProvenance,
 ): Promise<PublicationResult> {
   const agent = state.slug;
   if (!agent || state.project !== context.project) throw new Error("recorded agent state does not belong to this project");
@@ -262,6 +268,9 @@ export async function publishBranch(
   const base = await deriveBase(run, state, branch, head);
   if (state.baseRevision && base !== state.baseRevision) {
     throw new Error(`agent ${agent} publication base ${base} does not match its correlated durable base ${state.baseRevision}`);
+  }
+  if (expectedProvenance && (base !== expectedProvenance.baseRevision || head !== expectedProvenance.resultingRevision)) {
+    throw new Error(`agent ${agent} inspected publication ${base}...${head} does not match imported completion report ${expectedProvenance.baseRevision}...${expectedProvenance.resultingRevision}`);
   }
   if (base === head) throw new Error(`agent ${agent} has no commits beyond its base ${base}; commit the intended changes before publishing`);
 

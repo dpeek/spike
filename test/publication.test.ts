@@ -244,6 +244,25 @@ describe("worker branch publication", () => {
     expect(await readFile(join(item.root, first.latestManifestPath), "utf8")).toBe(latestBefore);
   });
 
+  test("requires exact imported-report provenance before any durable publication mutation", async () => {
+    const headMismatch = await fixture();
+    const headLatest = join(headMismatch.context.stateDir, "output", "branches", "frontend", "latest.json");
+    await expect(publishBranch(headMismatch.context, headMismatch.state, headMismatch.run, () => new Date(), {
+      baseRevision: headMismatch.base,
+      resultingRevision: "f".repeat(40),
+    })).rejects.toThrow("does not match imported completion report");
+    expect((await execute(["git", "rev-parse", "--verify", "refs/spike/agents/frontend"], headMismatch.root)).code).not.toBe(0);
+    expect(await Bun.file(headLatest).exists()).toBe(false);
+    expect(headMismatch.runtimeCommands.some((command) => command.includes("bundle"))).toBe(false);
+
+    const baseMismatch = await fixture();
+    await expect(publishBranch(baseMismatch.context, baseMismatch.state, baseMismatch.run, () => new Date(), {
+      baseRevision: "e".repeat(40),
+      resultingRevision: await must(["git", "rev-parse", "HEAD"], baseMismatch.worker),
+    })).rejects.toThrow("does not match imported completion report");
+    expect((await execute(["git", "rev-parse", "--verify", "refs/spike/agents/frontend"], baseMismatch.root)).code).not.toBe(0);
+  });
+
   test("rejects a durable publication whose derived base mismatches the correlated ticket base before moving refs", async () => {
     const item = await fixture();
     const latestPath = join(item.context.stateDir, "output", "branches", "frontend", "latest.json");

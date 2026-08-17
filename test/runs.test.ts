@@ -217,6 +217,23 @@ esac
   return { logPath, env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, REPO_SEED: root, SPIKE_RUNTIME: runtime } };
 }
 
+async function installWorkerGitRuntime(root: string, worker: string, state: AgentState) {
+  const fakeBin = join(root, `fake-worker-git-${state.slug}`);
+  const logPath = join(root, `worker-git-${state.slug}.log`);
+  const executable = state.runtime === "apple" ? "container" : "docker";
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(join(fakeBin, executable), `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
+if [[ "$1" != "exec" || "$2" != "--user" || "$3" != "node" || "$4" != ${JSON.stringify(state.container)} || "$5" != "git" || "$6" != "-C" || "$7" != "/workspace/project" ]]; then
+  echo "invalid worker Git command" >&2
+  exit 2
+fi
+shift 7
+exec git -C ${JSON.stringify(worker)} "$@"
+`, { mode: 0o755 });
+  return { logPath, env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, REPO_SEED: root } };
+}
+
 async function successfulDispatch(item: Fixture, name = "worker-a") {
   return dispatchTicket({
     cwd: item.root,
@@ -1147,6 +1164,7 @@ describe("durable completion reports", () => {
     await must(["git", "add", "implementation.txt"], item.root);
     await must(["git", "commit", "-m", "implementation"], item.root);
     const head = await must(["git", "rev-parse", "HEAD"], item.root);
+    await must(["git", "update-ref", "refs/spike/agents/worker-a", head], item.root);
     const artifactPath = `.pi-swarm/output/artifacts/${run.runId}/verification.txt`;
     await writeFile(join(item.root, artifactPath), "verified\n");
     const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
@@ -1166,6 +1184,8 @@ describe("durable completion reports", () => {
     const shown = await execute([process.execPath, cli, "run", "report", "show", "--json"], item.root);
     expect(shown.code).toBe(0);
     expect(JSON.parse(shown.stdout).resultingRevision).toBe(head);
+    await rm(join(item.stateDir, "agents", "worker-a.json"));
+    expect((await loadCompletionReport(item.root)).resultingRevision).toBe(head);
     const importedPath = join(item.root, `.pi-swarm/goals/${item.goalId}/tickets/${item.ticketId}/runs/${run.runId}/report.v1.json`);
     const tampered = JSON.parse(await readFile(importedPath, "utf8"));
     tampered.summary = "valid JSON, but tampered";
@@ -1175,6 +1195,65 @@ describe("durable completion reports", () => {
     report.summary = "conflicting replacement";
     await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
     await expect(importCompletionReport(item.root)).rejects.toThrow("conflicting");
+  });
+
+  test("imports and shows worker-only Git evidence before publication and rejects HEAD or dirty-state mismatch", async () => {
+    const item = await fixture();
+    const worker = join(item.root, "report-worker");
+    await must(["git", "clone", item.root, worker], item.root);
+    await must(["git", "config", "user.name", "Report Worker"], worker);
+    await must(["git", "config", "user.email", "worker@example.test"], worker);
+    await must(["git", "switch", "-c", "agent/worker-a"], worker);
+    await writeFile(join(worker, "worker-only.txt"), "worker only\n");
+    await must(["git", "add", "worker-only.txt"], worker);
+    await must(["git", "commit", "-m", "worker-only result"], worker);
+    const head = await must(["git", "rev-parse", "HEAD"], worker);
+    expect((await execute(["git", "cat-file", "-e", `${head}^{commit}`], item.root)).code).not.toBe(0);
+
+    const run = await successfulDispatch(item);
+    const state = (await readAgentState(item.stateDir, run.worker.slug))!;
+    const tooling = await installWorkerGitRuntime(item.root, worker, state);
+    const staging = completionReportStagingPath(item.root, item.goalId, item.ticketId, run.runId);
+    const report = {
+      schemaVersion: 1, goalId: item.goalId, ticketId: item.ticketId, runId: run.runId, worker: run.worker,
+      baseRevision: item.base, resultingRevision: head, producedCommitIds: [head], dirtyWorktree: false,
+      outcome: "completed", summary: "Validated in the live worker before publication.", verification: [], services: [], artifacts: [],
+      assumptions: [], limitations: [], risks: [], followUp: { state: "ready" }, createdAt: "2026-08-18T12:00:00.000Z",
+    };
+    await writeFile(staging, `${JSON.stringify(report, null, 2)}\n`);
+    const imported = await execute([process.execPath, cli, "run", "report", "import"], item.root, tooling.env);
+    expect(imported.code).toBe(0);
+    const shown = await execute([process.execPath, cli, "run", "report", "show", "--json"], item.root, tooling.env);
+    expect(shown.code).toBe(0);
+    expect(JSON.parse(shown.stdout).resultingRevision).toBe(head);
+    expect((await readFile(tooling.logPath, "utf8")).trim()).toContain(`exec --user node ${state.container} git -C /workspace/project`);
+
+    const dirtyItem = await fixture();
+    const dirtyWorker = join(dirtyItem.root, "dirty-report-worker");
+    await must(["git", "clone", dirtyItem.root, dirtyWorker], dirtyItem.root);
+    await must(["git", "config", "user.name", "Dirty Worker"], dirtyWorker);
+    await must(["git", "config", "user.email", "dirty@example.test"], dirtyWorker);
+    await writeFile(join(dirtyWorker, "committed.txt"), "committed\n");
+    await must(["git", "add", "committed.txt"], dirtyWorker);
+    await must(["git", "commit", "-m", "dirty result"], dirtyWorker);
+    const dirtyHead = await must(["git", "rev-parse", "HEAD"], dirtyWorker);
+    await writeFile(join(dirtyWorker, "untracked.txt"), "dirty\n");
+    const dirtyRun = await successfulDispatch(dirtyItem);
+    const dirtyState = (await readAgentState(dirtyItem.stateDir, dirtyRun.worker.slug))!;
+    const dirtyTooling = await installWorkerGitRuntime(dirtyItem.root, dirtyWorker, dirtyState);
+    const dirtyStaging = completionReportStagingPath(dirtyItem.root, dirtyItem.goalId, dirtyItem.ticketId, dirtyRun.runId);
+    const correlated = { ...report, goalId: dirtyItem.goalId, ticketId: dirtyItem.ticketId, runId: dirtyRun.runId, worker: dirtyRun.worker, baseRevision: dirtyItem.base };
+    await writeFile(dirtyStaging, `${JSON.stringify({ ...correlated, resultingRevision: dirtyItem.base, producedCommitIds: [] }, null, 2)}\n`);
+    const rejectedHead = await execute([process.execPath, cli, "run", "report", "import"], dirtyItem.root, dirtyTooling.env);
+    expect(rejectedHead.code).not.toBe(0);
+    expect(rejectedHead.stderr).toContain("does not match live worker HEAD");
+    expect((await loadActiveRun(dirtyItem.root)).report).toBeUndefined();
+
+    await writeFile(dirtyStaging, `${JSON.stringify({ ...correlated, resultingRevision: dirtyHead, producedCommitIds: [dirtyHead] }, null, 2)}\n`);
+    const rejected = await execute([process.execPath, cli, "run", "report", "import"], dirtyItem.root, dirtyTooling.env);
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stderr).toContain("dirtyWorktree=false does not match live worker dirty state");
+    expect((await loadActiveRun(dirtyItem.root)).report).toBeUndefined();
   });
 
   test("rejects traversal, oversized, and mismatched report evidence", () => {

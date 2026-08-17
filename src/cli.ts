@@ -1394,7 +1394,17 @@ async function publishAgent(name: string | undefined, json: boolean) {
   const state = await readState(context.stateDir, agent);
   if (!state) fail(`unknown agent: ${agent}; start it with spike agent persistent ${agent}`);
   try {
-    const result = await publishBranch(publication, state, commandRunner);
+    let expectedReport: { baseRevision: string; resultingRevision: string } | undefined;
+    if (state.runId) {
+      const run = await loadActiveRun(context.root);
+      if (run.runId !== state.runId || run.worker.slug !== state.slug || run.goalId !== state.goalId || run.ticketId !== state.ticketId ||
+        run.baseRevision !== state.baseRevision || run.runtime !== state.runtime || run.container !== state.container) {
+        throw new Error(`agent ${agent} does not match the active durable run identity`);
+      }
+      const report = await loadCompletionReport(context.root);
+      expectedReport = { baseRevision: report.baseRevision, resultingRevision: report.resultingRevision };
+    }
+    const result = await publishBranch(publication, state, commandRunner, undefined, expectedReport);
     if (json) {
       console.log(JSON.stringify(result));
       return;
