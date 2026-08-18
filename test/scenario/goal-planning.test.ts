@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createGoal, integratedRef, loadGoal } from "../../src/goal.ts";
 import { loadPlan } from "../../src/plan.ts";
+import { loadTicket } from "../../src/ticket.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ remove: () => Promise<void> }> = [];
@@ -70,5 +71,49 @@ describe("Goal planning", () => {
     expect(goalId).toBeDefined();
     expect(await Bun.file(join(repository.root, ".spike", "goals", goalId!, "goal.md")).exists()).toBe(true);
     expect(await Bun.file(join(repository.root, ".spike", "goals", goalId!, "plan.md")).exists()).toBe(true);
+
+    const change = Bun.spawn(
+      [
+        spike,
+        "change",
+        "create",
+        "--goal",
+        goalId!,
+        "--title",
+        "Terminal Change",
+        "--intent",
+        "Freeze worker selection.",
+        "--rationale",
+        "Dispatch must reproduce the assignment.",
+        "--acceptance",
+        "The Ticket records its model selection.",
+      ],
+      { cwd: repository.root, stdout: "ignore", stderr: "pipe" },
+    );
+    expect(await change.exited).toBe(0);
+
+    const ticket = Bun.spawn(
+      [
+        spike,
+        "ticket",
+        "issue",
+        "--goal",
+        goalId!,
+        "--change",
+        "001",
+        "--instruction",
+        "Implement the selection.",
+        "--model",
+        "one-ticket-model",
+        "--thinking",
+        "low",
+      ],
+      { cwd: repository.root, stdout: "ignore", stderr: "pipe" },
+    );
+    expect(await ticket.exited).toBe(0);
+    expect((await loadTicket(repository.root, goalId!, "001", "001")).metadata).toMatchObject({
+      model: "one-ticket-model",
+      thinking: "low",
+    });
   });
 });

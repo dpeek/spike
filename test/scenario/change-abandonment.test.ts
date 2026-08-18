@@ -57,7 +57,7 @@ describe("Change abandonment", () => {
     expect(stopped.report.metadata).toMatchObject({
       role: "implement",
       outcome: "stopped",
-      execution: { adapter: "host", worker: "not-launched", model: "not-launched" },
+      execution: { adapter: "host", worker: "not-launched", model: "implementation-model", thinking: "medium" },
     });
     expect((await loadReport(repository.root, goalId, "001", "001")).metadata.outcome).toBe("stopped");
 

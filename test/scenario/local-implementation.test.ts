@@ -93,6 +93,8 @@ async function fixture() {
         issuedAt: "2026-03-20T10:02:00.000Z",
         role: "implement",
         inputRevision: baseRevision,
+        model: "implementation-model",
+        thinking: "medium",
         executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
       },
       "# Implement Change\n\n## Instruction\n\nAdd the implementation marker.\n",
@@ -104,6 +106,10 @@ async function fixture() {
   await repository.git("commit", "--quiet", "-m", "Host moved after Change creation");
   const hostHead = await repository.git("rev-parse", "HEAD");
   await writeFile(join(repository.root, "README.md"), "dirty host edit\n");
+  await writeFile(
+    join(repository.root, "spike.json"),
+    '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+  );
   const dirtyDiff = await repository.git("diff", "--", "README.md");
   const indexTree = await repository.git("write-tree");
 
@@ -114,7 +120,6 @@ async function fixture() {
     ticketId,
     command: ["bun", "-e", workerSource],
     worker: "controlled-script",
-    model: "none",
     clock: (() => {
       const times = [new Date("2026-03-20T10:03:00.000Z"), new Date("2026-03-20T10:04:00.000Z")];
       return () => times.shift()!;
@@ -197,7 +202,8 @@ describe("host-local implementation exchange", () => {
       adapter: "local-clone",
       isolation: "workspace",
       worker: "controlled-script",
-      model: "none",
+      model: "implementation-model",
+      thinking: "medium",
       startedAt: "2026-03-20T10:03:00.000Z",
       finishedAt: "2026-03-20T10:04:00.000Z",
     });

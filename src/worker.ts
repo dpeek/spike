@@ -29,6 +29,7 @@ export type LocalCloneExecution = TicketIdentity & {
   isolation: "workspace";
   worker: string;
   model: string;
+  thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   startedAt: string;
   finishedAt: string;
   exitCode: number;
@@ -41,7 +42,6 @@ export type DispatchLocalTicketInput = TicketIdentity & {
   cwd: string;
   command: string[];
   worker: string;
-  model: string;
   environmentDigest?: string;
   clock?: () => Date;
 };
@@ -59,6 +59,7 @@ const workerRecordSchema = z
     isolation: z.literal("workspace"),
     worker: nonBlankString,
     model: nonBlankString,
+    thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
     startedAt: timestamp,
     environmentDigest: nonBlankString.optional(),
     resource: z
@@ -201,6 +202,7 @@ function localExecution(
     isolation: record.isolation,
     worker: record.worker,
     model: record.model,
+    thinking: record.thinking,
     startedAt: record.startedAt,
     finishedAt,
     exitCode: record.exitCode ?? -1,
@@ -240,6 +242,9 @@ export async function loadRecordedWorkerIfPresent(
   if (metadata.isolation !== ticket.metadata.executionPolicy.isolation) {
     throw new Error("Worker record isolation does not match its Ticket execution policy");
   }
+  if (metadata.model !== ticket.metadata.model || metadata.thinking !== ticket.metadata.thinking) {
+    throw new Error("Worker record model selection does not match its Ticket");
+  }
   if (Date.parse(metadata.finishedAt ?? metadata.startedAt) < Date.parse(metadata.startedAt)) {
     throw new Error("Worker record finishedAt must not precede startedAt");
   }
@@ -252,7 +257,6 @@ export async function recordLocalWorker(
   input: TicketIdentity & {
     role: "implement" | "review";
     worker: string;
-    model: string;
     startedAt: string;
     workspace: string;
     pid?: number;
@@ -260,6 +264,7 @@ export async function recordLocalWorker(
   },
 ): Promise<RecordedWorker> {
   validateWorkspace(input.workspace);
+  const ticket = await loadTicket(root, input.goalId, input.changeId, input.ticketId);
   const metadata = workerRecordSchema.parse({
     kind: "worker",
     goalId: input.goalId,
@@ -269,7 +274,8 @@ export async function recordLocalWorker(
     adapter: "local-clone",
     isolation: "workspace",
     worker: input.worker,
-    model: input.model,
+    model: ticket.metadata.model,
+    thinking: ticket.metadata.thinking,
     startedAt: input.startedAt,
     ...(input.environmentDigest === undefined ? {} : { environmentDigest: input.environmentDigest }),
     resource: {
@@ -277,7 +283,6 @@ export async function recordLocalWorker(
       ...(input.pid === undefined ? {} : { pid: input.pid }),
     },
   });
-  const ticket = await loadTicket(root, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.role !== input.role) throw new Error("Worker record role does not match its Ticket");
   if (ticket.metadata.executionPolicy.isolation !== "workspace") {
     throw new Error("local-clone Worker record requires workspace isolation");
@@ -447,7 +452,6 @@ export async function dispatchLocalTicket(
 ): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
-  const model = requireText(input.model, "Model identity");
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.executionPolicy.isolation !== "workspace") {
@@ -489,7 +493,6 @@ export async function dispatchLocalTicket(
       ...identity,
       role: ticket.metadata.role,
       worker,
-      model,
       startedAt,
       workspace,
       ...(input.environmentDigest === undefined ? {} : { environmentDigest: input.environmentDigest }),
@@ -564,7 +567,8 @@ export async function dispatchLocalTicket(
       adapter: "local-clone",
       isolation: "workspace",
       worker,
-      model,
+      model: ticket.metadata.model,
+      thinking: ticket.metadata.thinking,
       startedAt,
       finishedAt,
       exitCode,

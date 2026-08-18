@@ -142,6 +142,8 @@ describe("sequential Change and Ticket allocation", () => {
       issuedAt: "2026-03-19T10:20:00.000Z",
       role: "implement",
       inputRevision: change.change.metadata.baseRevision,
+      model: "implementation-model",
+      thinking: "medium",
       executionPolicy,
     });
     expect(first.ticket.metadata.inputRevision).not.toBe(hostRevision);
@@ -176,7 +178,8 @@ describe("sequential Change and Ticket allocation", () => {
         adapter: "local-clone",
         isolation: "workspace",
         worker: "controlled-worker",
-        model: "none",
+        model: "implementation-model",
+        thinking: "medium",
         startedAt: "2026-03-19T10:20:00.000Z",
         finishedAt: "2026-03-19T10:21:00.000Z",
       },

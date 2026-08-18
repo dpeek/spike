@@ -23,8 +23,24 @@ export async function temporaryRepository(): Promise<{
   await git(root, "init", "--quiet");
   await git(root, "config", "user.name", "Spike Test");
   await git(root, "config", "user.email", "spike@example.test");
-  await writeFile(join(root, "README.md"), "fixture\n");
-  await git(root, "add", "README.md");
+  await Promise.all([
+    writeFile(join(root, "README.md"), "fixture\n"),
+    writeFile(
+      join(root, "spike.json"),
+      `${JSON.stringify(
+        {
+          models: {
+            planner: { model: "planner-model", thinking: "high" },
+            implement: { model: "implementation-model", thinking: "medium" },
+            review: { model: "review-model", thinking: "high" },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    ),
+  ]);
+  await git(root, "add", "README.md", "spike.json");
   await git(root, "commit", "--quiet", "-m", "Initial fixture");
   return {
     root,

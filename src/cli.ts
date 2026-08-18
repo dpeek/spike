@@ -2,6 +2,7 @@
 
 import { relative } from "node:path";
 import { changePath, createChange } from "./change.ts";
+import type { ThinkingLevel } from "./config.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { planPath } from "./plan.ts";
 import { issueTicket, ticketPath, type ExecutionPolicy } from "./ticket.ts";
@@ -35,6 +36,8 @@ Ticket issuance options:
   --isolation <level>             workspace (default) or container
   --network-access <access>       none (default), restricted, or unrestricted
   --credential <grant-id>         Repeat for each credential grant identifier
+  --model <model>                 Override the role's configured model for this Ticket
+  --thinking <level>              Override thinking: off, minimal, low, medium, high, or xhigh
 `;
 }
 
@@ -153,6 +156,8 @@ function parseTicketIssue(args: string[]): {
   producingImplementationTicketId?: string;
   remediationReviewTicketId?: string;
   executionPolicy: ExecutionPolicy;
+  model?: string;
+  thinking?: ThinkingLevel;
 } {
   let goalId: string | undefined;
   let changeId: string | undefined;
@@ -161,6 +166,8 @@ function parseTicketIssue(args: string[]): {
   let producingImplementationTicketId: string | undefined;
   let remediationReviewTicketId: string | undefined;
   let role: "implement" | "review" = "implement";
+  let model: string | undefined;
+  let thinking: ThinkingLevel | undefined;
   let isolation: ExecutionPolicy["isolation"] = "workspace";
   let networkAccess: ExecutionPolicy["networkAccess"] = "none";
   const credentialGrants: string[] = [];
@@ -204,6 +211,15 @@ function parseTicketIssue(args: string[]): {
       case "--credential":
         credentialGrants.push(value);
         break;
+      case "--model":
+        model = value;
+        break;
+      case "--thinking":
+        if (!["off", "minimal", "low", "medium", "high", "xhigh"].includes(value)) {
+          throw new UsageError(`invalid thinking level: ${value}`);
+        }
+        thinking = value as ThinkingLevel;
+        break;
       default:
         throw new UsageError(`unknown option: ${option}`);
     }
@@ -218,6 +234,8 @@ function parseTicketIssue(args: string[]): {
     instruction,
     role,
     executionPolicy: { isolation, networkAccess, credentialGrants },
+    ...(model === undefined ? {} : { model }),
+    ...(thinking === undefined ? {} : { thinking }),
     ...(curatedContext === undefined ? {} : { curatedContext }),
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
     ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),

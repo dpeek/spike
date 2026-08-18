@@ -47,8 +47,18 @@ describe("interrupted Ticket recovery", () => {
       instruction: "Produce Candidate A.",
       curatedContext: "Discard uncertain progress after interruption.",
       executionPolicy: policy,
+      model: "controlled-model",
+      thinking: "low",
     });
-    expect(first.ticket.metadata.ticketId).toBe("001");
+    expect(first.ticket.metadata).toMatchObject({
+      ticketId: "001",
+      model: "controlled-model",
+      thinking: "low",
+    });
+    await writeFile(
+      join(repository.root, "spike.json"),
+      '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+    );
 
     const identity = { goalId, changeId: "001", ticketId: "001" };
     const exchange = await prepareTicketExchange(repository.root, identity);
@@ -60,7 +70,6 @@ describe("interrupted Ticket recovery", () => {
       ...identity,
       role: "implement",
       worker: "interrupted-worker",
-      model: "controlled-model",
       startedAt: "2026-03-24T10:00:00.000Z",
       workspace,
       pid: 424242,
@@ -137,6 +146,7 @@ describe("interrupted Ticket recovery", () => {
         isolation: "workspace",
         worker: "interrupted-worker",
         model: "controlled-model",
+        thinking: "low",
         startedAt: "2026-03-24T10:00:00.000Z",
         finishedAt: "2026-03-24T10:05:00.000Z",
       },
@@ -157,6 +167,8 @@ describe("interrupted Ticket recovery", () => {
       role: "implement",
       inputRevision: baseRevision,
       replacesTicketId: "001",
+      model: "controlled-model",
+      thinking: "low",
       executionPolicy: policy,
     });
     expect(replacement.body).toContain("## Instruction\n\nProduce Candidate A.");
@@ -226,7 +238,6 @@ describe("interrupted Ticket recovery", () => {
       ...identity,
       role: "implement",
       worker: "stale-direct-worker",
-      model: "controlled-model",
       startedAt: "2026-03-24T12:00:00.000Z",
       workspace,
       pid: 2_147_483_647,

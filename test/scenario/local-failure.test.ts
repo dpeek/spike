@@ -88,7 +88,6 @@ describe("failed Ticket replacement", () => {
       ticketId: "001",
       command: ["bun", "-e", failedWorker],
       worker: "controlled-failing-worker",
-      model: "none",
       clock: clock("2026-03-23T10:00:00.000Z", "2026-03-23T10:01:00.000Z"),
     });
     expect(failed.execution.exitCode).toBe(23);
@@ -117,6 +116,12 @@ describe("failed Ticket replacement", () => {
     await expect(
       publishFailure({ execution: { ...failed.execution, worker: " " } }),
     ).rejects.toThrow();
+    await expect(
+      publishFailure({ execution: { ...failed.execution, model: "dispatch-override" } }),
+    ).rejects.toThrow("model selection does not match its Ticket assignment");
+    await expect(
+      publishFailure({ execution: { ...failed.execution, thinking: "high" } }),
+    ).rejects.toThrow("model selection does not match its Ticket assignment");
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
 
     const publication = await publishFailure();
@@ -133,7 +138,8 @@ describe("failed Ticket replacement", () => {
         adapter: "local-clone",
         isolation: "workspace",
         worker: "controlled-failing-worker",
-        model: "none",
+        model: "implementation-model",
+        thinking: "medium",
         startedAt: "2026-03-23T10:00:00.000Z",
         finishedAt: "2026-03-23T10:01:00.000Z",
       },

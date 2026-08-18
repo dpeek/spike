@@ -145,7 +145,7 @@ describe("crash-point recovery", () => {
     const issuedRecovery = await reconcileRepository({ cwd: repository.root, now: new Date("2026-04-01T00:00:00.000Z") });
     expect(issuedRecovery.goals[0]?.interruptedTickets[0]?.report.metadata).toMatchObject({
       outcome: "interrupted",
-      execution: { adapter: "host", worker: "not-launched", model: "not-launched" },
+      execution: { adapter: "host", worker: "not-launched", model: "implementation-model", thinking: "medium" },
     });
     expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
     const replacement002 = await issueReplacementTicket({
@@ -167,7 +167,6 @@ describe("crash-point recovery", () => {
       ticketId: "002",
       command: ["bun", "-e", implementationWorker],
       worker: "implementation-before",
-      model: "controlled-model",
     });
     await expect(
       publishImplementationReport({
@@ -212,7 +211,6 @@ describe("crash-point recovery", () => {
       ticketId: "003",
       command: ["bun", "-e", implementationWorker],
       worker: "implementation-after",
-      model: "controlled-model",
     });
     await expect(
       publishImplementationReport({
@@ -251,7 +249,6 @@ describe("crash-point recovery", () => {
       ticketId: "004",
       command: ["bun", "-e", reviewWorker],
       worker: "review-before",
-      model: "controlled-model",
     });
     await expect(
       publishReviewReport({
@@ -285,7 +282,6 @@ describe("crash-point recovery", () => {
       ticketId: "005",
       command: ["bun", "-e", reviewWorker],
       worker: "review-after",
-      model: "controlled-model",
     });
     await expect(
       publishReviewReport({

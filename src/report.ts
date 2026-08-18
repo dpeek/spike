@@ -83,6 +83,7 @@ const executionSchema = z
     isolation: z.enum(["workspace", "container"]),
     worker: nonBlankString,
     model: nonBlankString,
+    thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
     startedAt: timestamp,
     finishedAt: timestamp,
     environmentDigest: nonBlankString.optional(),
@@ -183,6 +184,7 @@ export type ReportExecution = TicketIdentity & {
   isolation: "workspace" | "container";
   worker: string;
   model: string;
+  thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   startedAt: string;
   finishedAt: string;
   exitCode: number;
@@ -475,6 +477,7 @@ function executionMetadata(execution: ReportExecution): z.infer<typeof execution
     isolation: execution.isolation,
     worker: execution.worker,
     model: execution.model,
+    thinking: execution.thinking,
     startedAt: execution.startedAt,
     finishedAt: execution.finishedAt,
     ...(execution.environmentDigest === undefined ? {} : { environmentDigest: execution.environmentDigest }),
@@ -483,6 +486,15 @@ function executionMetadata(execution: ReportExecution): z.infer<typeof execution
     throw new Error("execution finishedAt must not precede startedAt");
   }
   return metadata;
+}
+
+function matchingTicketModelSelection(
+  ticket: Awaited<ReturnType<typeof loadTicket>>,
+  execution: Pick<ReportExecution, "model" | "thinking">,
+): void {
+  if (execution.model !== ticket.metadata.model || execution.thinking !== ticket.metadata.thinking) {
+    throw new Error("Report execution model selection does not match its Ticket assignment");
+  }
 }
 
 function requireTerminalReason(reason: string, outcome: "Failure" | "Interruption" | "Stop"): string {
@@ -501,6 +513,7 @@ async function loadReportDocument(root: string, goalId: string, changeId: string
   if (metadata.role !== ticket.metadata.role) {
     throw new Error(`Report ${goalId}/${changeId}/${ticketId} role does not match its Ticket`);
   }
+  matchingTicketModelSelection(ticket, metadata.execution);
   if (metadata.outcome !== "completed" && !document.body.trim()) {
     throw new Error(`terminal Report ${goalId}/${changeId}/${ticketId} must explain its outcome`);
   }
@@ -710,6 +723,7 @@ export async function publishFailedReport(
     throw new Error(`failed Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
   matchingExecution(input.execution, identity, false);
+  matchingTicketModelSelection(ticket, input.execution);
   const execution = executionMetadata(input.execution);
   const reason = requireTerminalReason(input.reason, "Failure");
   const metadata = terminalReportSchema.parse({
@@ -752,6 +766,7 @@ async function publishHostTerminalReport(
     throw new Error(`${outcome} Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
   matchingReportExecution(input.execution, identity);
+  matchingTicketModelSelection(ticket, input.execution);
   if (input.execution.isolation !== ticket.metadata.executionPolicy.isolation) {
     throw new Error(`${outcome} Report execution isolation does not match its Ticket execution policy`);
   }
@@ -808,6 +823,7 @@ export async function publishImplementationReport(
     loadChange(repository.root, input.goalId, input.changeId),
   ]);
   if (ticket.metadata.role !== "implement") throw new Error("implementation Report requires an implement Ticket");
+  matchingTicketModelSelection(ticket, input.execution);
 
   const currentCandidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
   if (ticket.metadata.remediationReviewTicketId === undefined) {
@@ -888,6 +904,7 @@ export async function publishReviewReport(
     deriveCurrentCandidate(repository.root, input.goalId, input.changeId),
   ]);
   if (ticket.metadata.role !== "review") throw new Error("review Report requires a review Ticket");
+  matchingTicketModelSelection(ticket, input.execution);
   if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
   if (
     ticket.metadata.inputRevision !== candidate.candidateRevision ||

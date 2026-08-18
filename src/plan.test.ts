@@ -21,7 +21,8 @@ const execution = {
   adapter: "fixture",
   isolation: "workspace" as const,
   worker: "controlled-worker",
-  model: "none",
+  model: "fixture-model",
+  thinking: "low" as const,
   startedAt: "2026-03-25T10:00:00.000Z",
   finishedAt: "2026-03-25T10:01:00.000Z",
 };
@@ -42,6 +43,8 @@ async function installChurnHistory(root: string): Promise<string[]> {
               ticketId,
               issuedAt: "2026-03-25T10:00:00.000Z",
               inputRevision: baseRevision,
+              model: "fixture-model",
+              thinking: "low",
               executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
               role: "implement",
             }
@@ -52,6 +55,8 @@ async function installChurnHistory(root: string): Promise<string[]> {
               ticketId,
               issuedAt: "2026-03-25T10:00:00.000Z",
               inputRevision: candidateRevision,
+              model: "fixture-model",
+              thinking: "low",
               executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
               role: "review",
               producingImplementationTicketId: "001",

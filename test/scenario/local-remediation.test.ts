@@ -137,7 +137,6 @@ describe("Candidate remediation and landing", () => {
       ticketId: "001",
       command: ["bun", "-e", worker],
       worker: "controlled-implementer-a",
-      model: "none",
     });
     const firstPublication = await publishImplementationReport({
       cwd: repository.root,
@@ -149,7 +148,7 @@ describe("Candidate remediation and landing", () => {
     });
     const candidateA = firstPublication.report.metadata.candidateRevision;
 
-    await issueTicket({
+    const reviewTicket = await issueTicket({
       cwd: repository.root,
       goalId,
       changeId: "001",
@@ -157,6 +156,7 @@ describe("Candidate remediation and landing", () => {
       instruction: "Review Candidate A.",
       executionPolicy: policy,
     });
+    expect(reviewTicket.ticket.metadata).toMatchObject({ model: "review-model", thinking: "high" });
     const reviewExecution = await dispatchLocalReview({
       cwd: repository.root,
       goalId,
@@ -164,8 +164,8 @@ describe("Candidate remediation and landing", () => {
       ticketId: "002",
       command: ["bun", "-e", worker],
       worker: "independent-reviewer",
-      model: "none",
     });
+    expect(reviewExecution.execution).toMatchObject({ model: "review-model", thinking: "high" });
     const reviewOutput = reviewExecution.exchange.outputDirectory;
     const validReviewSubmission = await readFile(join(reviewOutput, "submission.md"), "utf8");
     const publishReview = () =>
@@ -250,7 +250,6 @@ describe("Candidate remediation and landing", () => {
       ticketId: "003",
       command: ["bun", "-e", worker],
       worker: "controlled-implementer-b",
-      model: "none",
     });
     expect(remediationExecution.execution.exitCode).toBe(0);
     await makeInputRemovable(remediationExecution.exchange.inputDirectory);
@@ -356,7 +355,6 @@ describe("Candidate remediation and landing", () => {
       ticketId: "004",
       command: ["bun", "-e", worker],
       worker: "independent-approver",
-      model: "none",
     });
     const approvalOutput = approvalExecution.exchange.outputDirectory;
     const validApprovalSubmission = await readFile(join(approvalOutput, "submission.md"), "utf8");

@@ -3,6 +3,11 @@ import { z } from "zod";
 import { changePath, changeStatus, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
+  resolveTicketModelSelection,
+  type ModelSelection,
+  type ThinkingLevel,
+} from "./config.ts";
+import {
   documentExists,
   installImmutable,
   listDirectoryNames,
@@ -33,6 +38,8 @@ const commonTicketSchema = z.object({
   issuedAt: timestamp,
   inputRevision: z.string().regex(revisionPattern),
   replacesTicketId: z.string().regex(sequenceIdPattern).optional(),
+  model: z.string().trim().min(1),
+  thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
   executionPolicy: executionPolicySchema,
 });
 const ticketSchema = z.discriminatedUnion("role", [
@@ -69,6 +76,8 @@ export type IssueTicketInput = {
   instruction: string;
   curatedContext?: string;
   executionPolicy: ExecutionPolicy;
+  model?: string;
+  thinking?: ThinkingLevel;
   now?: Date;
   crash?: CrashInjector;
 };
@@ -321,6 +330,10 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")),
   });
   const role = input.role ?? "implement";
+  const modelSelection: ModelSelection = await resolveTicketModelSelection(repository.root, role, {
+    ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.thinking === undefined ? {} : { thinking: input.thinking }),
+  });
   let derivedRevision: string;
   let producingImplementationTicketId: string | undefined;
   let remediationReviewTicketId: string | undefined;
@@ -387,6 +400,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     issuedAt: (input.now ?? new Date()).toISOString(),
     role,
     inputRevision,
+    model: modelSelection.model,
+    thinking: modelSelection.thinking,
     executionPolicy: policy,
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
     ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),

@@ -115,7 +115,6 @@ async function implementedChange() {
     ticketId: "001",
     command: ["bun", "-e", worker],
     worker: "controlled-implementer",
-    model: "none",
   });
   const publication = await publishImplementationReport({
     cwd: repository.root,
@@ -195,7 +194,6 @@ describe("Change rejection and abandonment", () => {
       ticketId: "002",
       command: ["bun", "-e", worker],
       worker: "independent-rejector",
-      model: "none",
     });
     const review = await publishReviewReport({
       cwd: repository.root,
