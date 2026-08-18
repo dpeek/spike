@@ -18,7 +18,7 @@ const baseRevision = "0".repeat(40);
 const candidateRevision = "1".repeat(40);
 const workerRevision = "2".repeat(40);
 const execution = {
-  adapter: "fixture",
+  adapter: "local-clone",
   isolation: "workspace" as const,
   worker: "controlled-worker",
   model: "fixture-model",

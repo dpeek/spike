@@ -18,10 +18,11 @@ import { loadTicket, reportPath, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
   loadRecordedWorkerIfPresent,
-  stopAndFinalizeRecordedWorker,
+  finalizeWorker,
+  selectWorkerAdapter,
   ticketOutputPath,
-  type LocalCloneExecution,
-  type LocalWorkerResourceOperations,
+  type WorkerExecution,
+  type WorkerRuntimeOperations,
   type TicketIdentity,
 } from "./worker.ts";
 
@@ -197,32 +198,32 @@ export type ReportExecution = TicketIdentity & {
 
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
-  execution: LocalCloneExecution;
+  execution: WorkerExecution;
   commitMessage: {
     summary: string;
     body?: string;
   };
   now?: Date;
   crash?: CrashInjector;
-  resourceOperations?: LocalWorkerResourceOperations;
+  runtimeOperations?: WorkerRuntimeOperations;
 };
 
 export type PublishReviewReportInput = TicketIdentity & {
   cwd: string;
-  execution: LocalCloneExecution;
+  execution: WorkerExecution;
   now?: Date;
   crash?: CrashInjector;
-  resourceOperations?: LocalWorkerResourceOperations;
+  runtimeOperations?: WorkerRuntimeOperations;
 };
 
 export type PublishFailedReportInput = TicketIdentity & {
   cwd: string;
   role: "implement" | "review";
   reason: string;
-  execution: LocalCloneExecution;
+  execution: WorkerExecution;
   now?: Date;
   crash?: CrashInjector;
-  resourceOperations?: LocalWorkerResourceOperations;
+  runtimeOperations?: WorkerRuntimeOperations;
 };
 
 export type PublishInterruptedReportInput = TicketIdentity & {
@@ -442,7 +443,7 @@ async function validateReviewSubmission(
 }
 
 function matchingExecution(
-  execution: LocalCloneExecution,
+  execution: WorkerExecution,
   identity: TicketIdentity,
   requireSuccessfulExit = true,
 ): void {
@@ -453,12 +454,10 @@ function matchingExecution(
   ) {
     throw new Error("local-clone execution belongs to a different Ticket");
   }
-  if (execution.adapter !== "local-clone" || execution.isolation !== "workspace") {
-    throw new Error("local-clone execution has mismatched adapter provenance");
-  }
-  if (!Number.isInteger(execution.exitCode)) throw new Error("local-clone execution has an invalid exit code");
+  if (!execution.adapter.trim()) throw new Error("Worker execution adapter must not be blank");
+  if (!Number.isInteger(execution.exitCode)) throw new Error("Worker execution has an invalid exit code");
   if (requireSuccessfulExit && execution.exitCode !== 0) throw new Error(`worker exited with code ${execution.exitCode}`);
-  if (!execution.startedAt || !execution.finishedAt) throw new Error("local-clone execution is missing timestamps");
+  if (!execution.startedAt || !execution.finishedAt) throw new Error("Worker execution is missing timestamps");
 }
 
 function matchingReportExecution(execution: ReportExecution, identity: TicketIdentity): void {
@@ -499,6 +498,39 @@ function matchingTicketModelSelection(
   }
 }
 
+/** Validate immutable Ticket provenance before an execution becomes a Report. */
+async function matchingTicketExecutionProvenance(
+  root: string,
+  ticket: Awaited<ReturnType<typeof loadTicket>>,
+  execution: Pick<ReportExecution, "adapter" | "isolation" | "worker">,
+  outcome: Report["metadata"]["outcome"],
+): Promise<void> {
+  if (execution.isolation !== ticket.metadata.executionPolicy.isolation) {
+    throw new Error("Report execution isolation does not match its Ticket execution policy");
+  }
+  if (execution.adapter === "host") {
+    if (outcome !== "stopped" && outcome !== "interrupted") {
+      throw new Error("host terminal execution is permitted only for stopped or interrupted Reports");
+    }
+    if (execution.worker !== "not-launched") {
+      throw new Error("host terminal execution must identify a not-launched worker");
+    }
+    // Host provenance is only true before any Worker adapter has durable launch evidence.
+    if (await loadRecordedWorkerIfPresent(root, {
+      goalId: ticket.metadata.goalId,
+      changeId: ticket.metadata.changeId,
+      ticketId: ticket.metadata.ticketId,
+    }) !== undefined) {
+      throw new Error("host terminal execution contradicts a recorded Worker launch");
+    }
+    return;
+  }
+  const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
+  if (execution.adapter !== adapter.adapter) {
+    throw new Error("Report execution adapter does not match its Ticket execution policy");
+  }
+}
+
 function requireTerminalReason(reason: string, outcome: "Failure" | "Interruption" | "Stop"): string {
   const normalized = reason.trim();
   if (!normalized) throw new Error(`${outcome} reason must not be blank`);
@@ -509,10 +541,10 @@ async function finalizePublishedWorker(
   root: string,
   identity: TicketIdentity,
   finishedAt: Date,
-  operations?: LocalWorkerResourceOperations,
+  operations?: WorkerRuntimeOperations,
 ): Promise<ReportPublicationCleanup> {
   if ((await loadRecordedWorkerIfPresent(root, identity)) === undefined) return { status: "finalized" };
-  const result = await stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations);
+  const result = await finalizeWorker(root, identity, finishedAt, operations);
   if (result.status === "failed") {
     return { status: "failed", phase: result.phase, message: result.message };
   }
@@ -539,6 +571,7 @@ async function loadReportDocument(root: string, goalId: string, changeId: string
     throw new Error(`Report ${goalId}/${changeId}/${ticketId} role does not match its Ticket`);
   }
   matchingTicketModelSelection(ticket, metadata.execution);
+  await matchingTicketExecutionProvenance(root, ticket, metadata.execution, metadata.outcome);
   if (metadata.outcome !== "completed" && !document.body.trim()) {
     throw new Error(`terminal Report ${goalId}/${changeId}/${ticketId} must explain its outcome`);
   }
@@ -756,6 +789,7 @@ export async function publishFailedReport(
   }
   matchingExecution(input.execution, identity, false);
   matchingTicketModelSelection(ticket, input.execution);
+  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "failed");
   const execution = executionMetadata(input.execution);
   const reason = requireTerminalReason(input.reason, "Failure");
   const metadata = terminalReportSchema.parse({
@@ -778,7 +812,7 @@ export async function publishFailedReport(
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
   return { root: repository.root, report, cleanup };
 }
 
@@ -799,9 +833,7 @@ async function publishHostTerminalReport(
   }
   matchingReportExecution(input.execution, identity);
   matchingTicketModelSelection(ticket, input.execution);
-  if (input.execution.isolation !== ticket.metadata.executionPolicy.isolation) {
-    throw new Error(`${outcome} Report execution isolation does not match its Ticket execution policy`);
-  }
+  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, outcome);
   const execution = executionMetadata(input.execution);
   const label = outcome === "interrupted" ? "Interruption" : "Stop";
   const reason = requireTerminalReason(input.reason, label);
@@ -856,6 +888,7 @@ export async function publishImplementationReport(
   ]);
   if (ticket.metadata.role !== "implement") throw new Error("implementation Report requires an implement Ticket");
   matchingTicketModelSelection(ticket, input.execution);
+  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "completed");
 
   const currentCandidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
   if (ticket.metadata.responseToReviewTicketId === undefined) {
@@ -914,7 +947,7 @@ export async function publishImplementationReport(
         serializeDocument(metadata, submission.body),
         commitCrashHooks(input.crash, "implementation-report-publication"),
       );
-      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
+      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
       return { root: repository.root, report, cleanup };
     },
   );
@@ -938,6 +971,7 @@ export async function publishReviewReport(
   ]);
   if (ticket.metadata.role !== "review") throw new Error("review Report requires a review Ticket");
   matchingTicketModelSelection(ticket, input.execution);
+  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "completed");
   if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
   if (
     ticket.metadata.inputRevision !== candidate.candidateRevision ||
@@ -989,6 +1023,6 @@ export async function publishReviewReport(
     serializeDocument(metadata, submission.body),
     commitCrashHooks(input.crash, "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
   return { root: repository.root, report, cleanup };
 }

@@ -18,8 +18,8 @@ import { loadTicket, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
   loadRecordedWorkerIfPresent,
-  stopAndFinalizeRecordedWorker,
-  type LocalWorkerResourceOperations,
+  finalizeWorker,
+  type WorkerRuntimeOperations,
   type TicketIdentity,
 } from "./worker.ts";
 
@@ -56,7 +56,7 @@ function interruptionReason(reason: string): string {
 
 export async function stopTicket(
   input: StopTicketInput,
-  resourceOperations?: LocalWorkerResourceOperations,
+  runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<StoppedTicket> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
@@ -92,7 +92,7 @@ export async function stopTicket(
       exitCode: -1,
     };
   } else {
-    const result = await stopAndFinalizeRecordedWorker(repository.root, identity, now, resourceOperations);
+    const result = await finalizeWorker(repository.root, identity, now, runtimeOperations);
     if (result.status === "failed" && result.phase === "stop") {
       throw new Error(`direct worker could not be stopped: ${result.message}`);
     }
@@ -128,7 +128,7 @@ export async function stopTicket(
 
 export async function recoverInterruptedTicket(
   input: RecoverInterruptedTicketInput,
-  resourceOperations?: LocalWorkerResourceOperations,
+  runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<InterruptedTicketRecovery> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
@@ -167,11 +167,11 @@ export async function recoverInterruptedTicket(
       exitCode: -1,
     };
   } else {
-    const result = await stopAndFinalizeRecordedWorker(
+    const result = await finalizeWorker(
       repository.root,
       identity,
       now,
-      resourceOperations,
+      runtimeOperations,
     );
     cleanup = result.status === "failed"
       ? { status: "failed", message: result.message }
@@ -342,7 +342,7 @@ async function rebuildIntegrationRef(root: string, goalId: string, changeIds: st
 
 export async function reconcileGoal(
   input: ReconcileRepositoryInput & { goalId: string },
-  resourceOperations?: LocalWorkerResourceOperations,
+  runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<ReconciledGoal> {
   const repository = await discoverRepository(input.cwd);
   await loadGoal(repository.root, input.goalId);
@@ -374,7 +374,7 @@ export async function reconcileGoal(
             reason,
             now,
           },
-          resourceOperations,
+          runtimeOperations,
         );
         interruptedTickets.push(recovered);
         if (recovered.cleanup.status === "failed") {
@@ -386,7 +386,7 @@ export async function reconcileGoal(
       }
 
       if (worker === undefined) continue;
-      const cleanup = await stopAndFinalizeRecordedWorker(repository.root, identity, now, resourceOperations);
+      const cleanup = await finalizeWorker(repository.root, identity, now, runtimeOperations);
       if (cleanup.status === "failed") {
         cleanupWarnings.push({ identity, message: cleanup.message });
         continue;
@@ -426,7 +426,7 @@ export async function reconcileGoal(
 
 export async function reconcileRepository(
   input: ReconcileRepositoryInput,
-  resourceOperations?: LocalWorkerResourceOperations,
+  runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<RepositoryReconciliation> {
   const repository = await discoverRepository(input.cwd);
   const goalsDirectory = join(repository.root, ".spike", "goals");
@@ -448,7 +448,7 @@ export async function reconcileRepository(
           ...(input.reason === undefined ? {} : { reason: input.reason }),
           ...(input.now === undefined ? {} : { now: input.now }),
         },
-        resourceOperations,
+        runtimeOperations,
       ),
     );
   }

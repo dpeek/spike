@@ -6,7 +6,7 @@ import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { publishImplementationReport } from "../../src/report.ts";
 import { reportPath } from "../../src/ticket.ts";
-import { dispatchPiTicket, loadFinishedLocalExecution, observeWorker } from "../../src/worker.ts";
+import { dispatchPiTicket, loadFinishedWorkerExecution, observeWorker } from "../../src/worker.ts";
 import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
@@ -183,20 +183,21 @@ describe("controlled Pi dispatch", () => {
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
 
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
-    const execution = await loadFinishedLocalExecution(repository.root, identity);
+    const execution = await loadFinishedWorkerExecution(repository.root, identity);
     expect(execution.exitCode).toBe(0);
     const publication = await publishImplementationReport({
       cwd: repository.root,
       ...identity,
       execution,
       commitMessage: { summary: "Complete headed Pi dispatch" },
-      resourceOperations: {
-        async stop(_pid, _identity, handles) {
-          expect(handles).toEqual({ tab: "headed-tab", pane: "headed-pane" });
+      runtimeOperations: {
+        async stop(runtime, _identity) {
+          expect(runtime).toMatchObject({ host: "herdr", tab: "headed-tab", pane: "headed-pane" });
           expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(true);
-          await herdr.closeTab(handles!.tab);
+          if ((runtime as { host: string }).host !== "herdr") throw new Error("expected Herdr runtime");
+          await herdr.closeTab((runtime as { tab: string }).tab);
         },
-        async removeWorkspace(path) { await rm(path, { recursive: true, force: true }); },
+        async cleanup(runtime) { await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true }); },
       },
     });
     expect(closes).toBe(1);

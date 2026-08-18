@@ -122,6 +122,9 @@ describe("failed Ticket replacement", () => {
     await expect(
       publishFailure({ execution: { ...failed.execution, thinking: "high" } }),
     ).rejects.toThrow("model selection does not match its Ticket assignment");
+    await expect(
+      publishFailure({ execution: { ...failed.execution, adapter: "not-the-selected-adapter" } }),
+    ).rejects.toThrow("adapter does not match its Ticket execution policy");
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
 
     const publication = await publishFailure();

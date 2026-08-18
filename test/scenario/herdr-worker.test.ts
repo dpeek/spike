@@ -8,12 +8,12 @@ import { publishImplementationReport } from "../../src/report.ts";
 import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
 import {
   dispatchHerdrTicket,
-  loadFinishedLocalExecution,
+  loadFinishedWorkerExecution,
   loadRecordedWorkerIfPresent,
   observeWorker,
   prepareTicketExchange,
   readWorkerTerminal,
-  recordLocalWorker,
+  recordLocalCloneWorker,
   stopAndFinalizeRecordedWorker,
   workerRecordPath,
   type TicketIdentity,
@@ -79,7 +79,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await prepareTicketExchange(repository.root, identity);
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     workspaces.push(workspace);
-    await recordLocalWorker(repository.root, {
+    await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: "implement",
       worker: "attended-worker",
@@ -93,10 +93,10 @@ describe("ephemeral Herdr worker hosting", () => {
     expect(await observeWorker(repository.root, identity, observationalHerdr("working", transcript))).toEqual({ hosting: "herdr", status: "working" });
     expect(await observeWorker(repository.root, identity, observationalHerdr("blocked", transcript))).toEqual({ hosting: "herdr", status: "blocked" });
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "working" });
-    await expect(loadFinishedLocalExecution(repository.root, identity)).rejects.toThrow("Worker has not finished");
+    await expect(loadFinishedWorkerExecution(repository.root, identity)).rejects.toThrow("Worker has not finished");
     await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":0,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
-    expect(await loadFinishedLocalExecution(repository.root, identity)).toMatchObject({ exitCode: 0 });
+    expect(await loadFinishedWorkerExecution(repository.root, identity)).toMatchObject({ exitCode: 0 });
     expect(await readWorkerTerminal(repository.root, identity, {}, herdr)).toBe(transcript);
     expect(await ticketStatus(repository.root, identity.goalId, identity.changeId, identity.ticketId)).toBe("open");
     expect(await Bun.file(reportPath(repository.root, identity.goalId, identity.changeId, identity.ticketId)).exists()).toBe(false);
@@ -106,7 +106,7 @@ describe("ephemeral Herdr worker hosting", () => {
     const { repository, identity } = await issuedTicket();
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     workspaces.push(workspace);
-    await recordLocalWorker(repository.root, {
+    await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: "implement",
       worker: "retry-worker",
@@ -117,15 +117,15 @@ describe("ephemeral Herdr worker hosting", () => {
 
     let closes = 0;
     let removals = 0;
-    const operations = {
-      async stop(_pid: number | undefined, _identity: TicketIdentity, handles?: { tab: string; pane: string }) {
-        expect(handles).toEqual({ tab: "opaque-tab", pane: "opaque-pane" });
+    const operations: import("../../src/worker.ts").WorkerRuntimeOperations = {
+      async stop(runtime, _identity) {
+        expect(runtime).toMatchObject({ host: "herdr", tab: "opaque-tab", pane: "opaque-pane" });
         closes++;
       },
-      async removeWorkspace(path: string) {
+      async cleanup(runtime) {
         removals++;
         if (removals === 1) throw new Error("controlled cleanup failure");
-        await rm(path, { recursive: true, force: true });
+        await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
       },
     };
 
@@ -188,7 +188,7 @@ console.log("terminal output is observational only");
       herdr: host,
     });
     expect(dispatched).toMatchObject({ hosting: "herdr", status: "working" });
-    const execution = await loadFinishedLocalExecution(repository.root, identity);
+    const execution = await loadFinishedWorkerExecution(repository.root, identity);
     expect(tabInput!.label).toMatch(/^spike-[0-9a-f]{8}-001-001$/);
     expect(tabInput!.environment).toMatchObject({
       SPIKE_GOAL_ID: identity.goalId,
@@ -200,10 +200,13 @@ console.log("terminal output is observational only");
     expect(transcript).toContain("observational only");
 
     const record = await loadRecordedWorkerIfPresent(repository.root, identity);
-    expect(record!.metadata.resource).toMatchObject({
-      host: "herdr",
-      tab: "opaque-tab-123",
-      pane: "opaque-pane-456",
+    expect(record!.metadata.runtime).toMatchObject({
+      adapter: "local-clone",
+      resource: {
+        host: "herdr",
+        tab: "opaque-tab-123",
+        pane: "opaque-pane-456",
+      },
     });
     const runtimeSource = await readFile(workerRecordPath(repository.root, identity), "utf8");
     expect(runtimeSource).not.toContain("terminal output is observational only");
@@ -215,16 +218,15 @@ console.log("terminal output is observational only");
       ...identity,
       execution,
       commitMessage: { summary: "Add attended Herdr hosting" },
-      resourceOperations: {
-        async stop(pid, stoppedIdentity, handles) {
+      runtimeOperations: {
+        async stop(runtime, stoppedIdentity) {
           closeAttempts++;
-          expect(pid).toBeUndefined();
+          expect(runtime).toMatchObject({ host: "herdr", tab: "opaque-tab-123", pane: "opaque-pane-456" });
           expect(stoppedIdentity).toEqual(identity);
-          expect(handles).toEqual({ tab: "opaque-tab-123", pane: "opaque-pane-456" });
           expect(await Bun.file(reportPath(repository.root, identity.goalId, "001", "001")).exists()).toBe(true);
         },
-        async removeWorkspace(path) {
-          await rm(path, { recursive: true, force: true });
+        async cleanup(runtime) {
+          await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
         },
       },
     });

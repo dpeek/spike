@@ -98,7 +98,7 @@ async function cleanupWarningsForChange(
     const report = await loadReportIfPresent(root, goalId, changeId, ticketId);
     if (report !== undefined) {
       warnings.push({ identity, message: "reported Ticket retains a Worker record requiring cleanup" });
-    } else if (worker.metadata.resource === undefined) {
+    } else if (worker.metadata.runtime === undefined) {
       warnings.push({ identity, message: "finalized Worker record awaits removal" });
     }
   }

@@ -30,9 +30,32 @@ export type TicketExchange = TicketIdentity & {
   outputDirectory: string;
 };
 
-export type LocalCloneExecution = TicketIdentity & {
-  adapter: "local-clone";
-  isolation: "workspace";
+/**
+ * The intentionally small Worker seam.  Selection is made from an immutable
+ * Ticket policy; adapters are passed directly rather than discovered from a
+ * registry.
+ */
+export type WorkerAdapter = {
+  adapter: string;
+  isolation: "workspace" | "container";
+  supports: (policy: { isolation: "workspace" | "container" }) => boolean;
+  dispatch: (input: DispatchWorkerTicketInput) => Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }>;
+  /** Optional attended dispatch remains adapter-owned (e.g. Herdr for workspace). */
+  dispatchAttended?: (input: DispatchHerdrTicketInput) => Promise<{ root: string; exchange: TicketExchange; hosting: string; status: "working" }>;
+  /** Adapter-owned runtime resource validation and lifecycle operations. */
+  validateRuntime: (resource: unknown) => void;
+  runtimeOperations?: WorkerRuntimeOperations;
+  observe: (root: string, identity: TicketIdentity, options?: unknown) => Promise<WorkerObservation>;
+  loadFinished: (root: string, identity: TicketIdentity) => Promise<WorkerExecution>;
+  readTerminal?: (root: string, identity: TicketIdentity, input?: unknown, options?: unknown) => Promise<string>;
+  attachTerminal?: (root: string, identity: TicketIdentity, options?: unknown) => Promise<number>;
+  finalize: (root: string, identity: TicketIdentity, finishedAt: Date, operations?: WorkerRuntimeOperations) => Promise<WorkerCleanup>;
+};
+
+export type WorkerExecution = TicketIdentity & {
+  /** Adapter-selected, immutable Ticket isolation provenance. */
+  adapter: string;
+  isolation: "workspace" | "container";
   worker: string;
   model: string;
   thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -44,7 +67,19 @@ export type LocalCloneExecution = TicketIdentity & {
   stderr: string;
 };
 
-export type DispatchLocalTicketInput = TicketIdentity & {
+
+export type DispatchWorkerTicketInput = TicketIdentity & {
+  cwd: string;
+  command: string[];
+  worker: string;
+  environmentDigest?: string;
+  clock?: () => Date;
+};
+
+/** @deprecated local-clone's command input; shared dispatch uses DispatchWorkerTicketInput. */
+export type DispatchLocalTicketInput = DispatchWorkerTicketInput;
+
+export type _DispatchLocalTicketInput = TicketIdentity & {
   cwd: string;
   command: string[];
   worker: string;
@@ -75,28 +110,18 @@ const workerRecordSchema = z
     changeId: nonBlankString,
     ticketId: nonBlankString,
     role: z.enum(["implement", "review"]),
-    adapter: z.literal("local-clone"),
-    isolation: z.literal("workspace"),
+    adapter: nonBlankString,
+    isolation: z.enum(["workspace", "container"]),
     worker: nonBlankString,
     model: nonBlankString,
     thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
     startedAt: timestamp,
     environmentDigest: nonBlankString.optional(),
-    resource: z
-      .discriminatedUnion("host", [
-        z.object({
-          host: z.literal("direct"),
-          workspace: nonBlankString,
-          pid: z.number().int().positive().optional(),
-        }).strict(),
-        z.object({
-          host: z.literal("herdr"),
-          workspace: nonBlankString,
-          tab: nonBlankString,
-          pane: nonBlankString,
-        }).strict(),
-      ])
-      .optional(),
+    /** One neutral envelope; only the selected adapter interprets resource. */
+    runtime: z.object({
+      adapter: nonBlankString,
+      resource: z.unknown(),
+    }).strict().optional(),
     finishedAt: timestamp.optional(),
     exitCode: z.number().int().optional(),
   })
@@ -146,11 +171,15 @@ export async function stopDirectProcess(
   }
 }
 
-type LocalWorkerResource = NonNullable<RecordedWorker["metadata"]["resource"]>;
+export type WorkerRuntimeEnvelope = NonNullable<RecordedWorker["metadata"]["runtime"]>;
+/** Opaque adapter-owned data. Shared workflow code must only pass it back to the selected adapter. */
+export type WorkerRuntimeResource = unknown;
+type LocalCloneRuntime = { host: "direct"; workspace: string; pid?: number } | { host: "herdr"; workspace: string; tab: string; pane: string };
 
-export type LocalWorkerResourceOperations = {
-  stop: (pid: number | undefined, identity: TicketIdentity, herdr?: HerdrHandles) => Promise<void>;
-  removeWorkspace: (workspace: string) => Promise<void>;
+/** Adapter-owned operations over its canonical runtime resource. */
+export type WorkerRuntimeOperations = {
+  stop: (runtime: WorkerRuntimeResource, identity: TicketIdentity) => Promise<void>;
+  cleanup: (runtime: WorkerRuntimeResource) => Promise<void>;
 };
 
 export type WorkerObservation = {
@@ -172,8 +201,28 @@ function workerKey(identity: TicketIdentity): string {
 }
 
 export type WorkerCleanup =
-  | { status: "finalized"; execution: LocalCloneExecution }
-  | { status: "failed"; phase: "stop" | "cleanup"; execution: LocalCloneExecution; message: string };
+  | { status: "finalized"; execution: WorkerExecution }
+  | { status: "failed"; phase: "stop" | "cleanup"; execution: WorkerExecution; message: string };
+
+/** The existing attended-workspace adapter, deliberately not a registry entry. */
+export const localCloneWorkerAdapter: WorkerAdapter = {
+  adapter: "local-clone",
+  isolation: "workspace",
+  supports: (policy) => policy.isolation === "workspace",
+  dispatch: (input) => dispatchLocalTicket(input),
+  dispatchAttended: (input) => dispatchHerdrTicket(input),
+  validateRuntime: validateLocalCloneRuntime,
+  observe: (root, identity, options) => observeLocalCloneWorker(root, identity, options as HerdrOperations | undefined),
+  loadFinished: (root, identity) => loadFinishedLocalCloneWorker(root, identity),
+  readTerminal: (root, identity, input, options) => readLocalCloneWorkerTerminal(root, identity, input as ReadHerdrTerminalInput, options as HerdrOperations | undefined),
+  attachTerminal: (root, identity, options) => attachLocalCloneWorkerTerminal(root, identity, options as HerdrOperations | undefined),
+  finalize: (root, identity, finishedAt, operations) => stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations),
+};
+
+export function selectWorkerAdapter(policy: { isolation: "workspace" | "container" }): WorkerAdapter {
+  if (localCloneWorkerAdapter.supports(policy)) return localCloneWorkerAdapter;
+  throw new Error(`no Worker adapter supports ${policy.isolation} isolation`);
+}
 
 export function exchangePath(root: string, identity: TicketIdentity): string {
   return join(
@@ -225,10 +274,10 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function localExecution(
+function recordedExecution(
   record: RecordedWorker["metadata"],
   finishedAt: string,
-): LocalCloneExecution {
+): WorkerExecution {
   return {
     goalId: record.goalId,
     changeId: record.changeId,
@@ -255,6 +304,14 @@ function validateWorkspace(workspace: string): void {
   }
 }
 
+function validateLocalCloneRuntime(resource: unknown): asserts resource is LocalCloneRuntime {
+  const runtime = z.discriminatedUnion("host", [
+    z.object({ host: z.literal("direct"), workspace: nonBlankString, pid: z.number().int().positive().optional() }).strict(),
+    z.object({ host: z.literal("herdr"), workspace: nonBlankString, tab: nonBlankString, pane: nonBlankString }).strict(),
+  ]).parse(resource);
+  validateWorkspace(runtime.workspace);
+}
+
 export async function loadRecordedWorkerIfPresent(
   root: string,
   identity: TicketIdentity,
@@ -277,63 +334,60 @@ export async function loadRecordedWorkerIfPresent(
   if (metadata.isolation !== ticket.metadata.executionPolicy.isolation) {
     throw new Error("Worker record isolation does not match its Ticket execution policy");
   }
+  if (metadata.adapter !== selectWorkerAdapter(ticket.metadata.executionPolicy).adapter) {
+    throw new Error("Worker record adapter does not match its Ticket execution policy");
+  }
   if (metadata.model !== ticket.metadata.model || metadata.thinking !== ticket.metadata.thinking) {
     throw new Error("Worker record model selection does not match its Ticket");
   }
   if (Date.parse(metadata.finishedAt ?? metadata.startedAt) < Date.parse(metadata.startedAt)) {
     throw new Error("Worker record finishedAt must not precede startedAt");
   }
-  if (metadata.resource !== undefined) validateWorkspace(metadata.resource.workspace);
+  if (metadata.runtime !== undefined) {
+    const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
+    if (metadata.runtime.adapter !== adapter.adapter) {
+      throw new Error("Worker runtime adapter does not match its Ticket execution policy");
+    }
+    adapter.validateRuntime(metadata.runtime.resource);
+  }
   return { metadata, body: document.body };
 }
 
-export async function recordLocalWorker(
+export async function recordWorker(
   root: string,
   input: TicketIdentity & {
-    role: "implement" | "review";
-    worker: string;
-    startedAt: string;
-    workspace: string;
-    pid?: number;
-    herdr?: HerdrHandles;
-    environmentDigest?: string;
+    role: "implement" | "review"; worker: string; startedAt: string;
+    runtime: WorkerRuntimeResource; environmentDigest?: string;
   },
 ): Promise<RecordedWorker> {
-  validateWorkspace(input.workspace);
   const ticket = await loadTicket(root, input.goalId, input.changeId, input.ticketId);
-  const metadata = workerRecordSchema.parse({
-    kind: "worker",
-    goalId: input.goalId,
-    changeId: input.changeId,
-    ticketId: input.ticketId,
-    role: input.role,
-    adapter: "local-clone",
-    isolation: "workspace",
-    worker: input.worker,
-    model: ticket.metadata.model,
-    thinking: ticket.metadata.thinking,
-    startedAt: input.startedAt,
-    ...(input.environmentDigest === undefined ? {} : { environmentDigest: input.environmentDigest }),
-    resource: input.herdr === undefined
-      ? {
-          host: "direct",
-          workspace: input.workspace,
-          ...(input.pid === undefined ? {} : { pid: input.pid }),
-        }
-      : {
-          host: "herdr",
-          workspace: input.workspace,
-          tab: input.herdr.tab,
-          pane: input.herdr.pane,
-        },
-  });
+  const selected = selectWorkerAdapter(ticket.metadata.executionPolicy);
   if (ticket.metadata.role !== input.role) throw new Error("Worker record role does not match its Ticket");
-  if (ticket.metadata.executionPolicy.isolation !== "workspace") {
-    throw new Error("local-clone Worker record requires workspace isolation");
-  }
-  const body = "# Local-clone worker runtime\n";
+  // The immutable Ticket selects the sole authority for accepting durable runtime data.
+  selected.validateRuntime(input.runtime);
+  const metadata = workerRecordSchema.parse({
+    kind: "worker", goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId, role: input.role,
+    adapter: selected.adapter, isolation: ticket.metadata.executionPolicy.isolation, worker: input.worker,
+    model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt: input.startedAt,
+    ...(input.environmentDigest === undefined ? {} : { environmentDigest: input.environmentDigest }),
+    runtime: { adapter: selected.adapter, resource: input.runtime },
+  });
+  const body = "# Worker runtime\n";
   await installImmutable(root, workerRecordPath(root, input), serializeDocument(metadata, body));
   return { metadata, body };
+}
+
+/** Local adapter's resource constructor; generic recording retains it opaquely. */
+export function recordLocalCloneWorker(
+  root: string,
+  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; workspace: string; pid?: number; herdr?: HerdrHandles; environmentDigest?: string },
+): Promise<RecordedWorker> {
+  return recordWorker(root, {
+    ...input,
+    runtime: input.herdr === undefined
+      ? { host: "direct", workspace: input.workspace, ...(input.pid === undefined ? {} : { pid: input.pid }) }
+      : { host: "herdr", workspace: input.workspace, tab: input.herdr.tab, pane: input.herdr.pane },
+  });
 }
 
 async function replaceWorkerRecord(root: string, record: RecordedWorker): Promise<void> {
@@ -349,12 +403,12 @@ const herdrExecutionSchema = z.object({
   finishedAt: timestamp,
 }).strict();
 
-function herdrExecutionPath(resource: Extract<LocalWorkerResource, { host: "herdr" }>): string {
+function herdrExecutionPath(resource: Extract<LocalCloneRuntime, { host: "herdr" }>): string {
   return join(resource.workspace, "herdr-execution.json");
 }
 
 async function refreshHerdrExecution(root: string, record: RecordedWorker): Promise<RecordedWorker> {
-  const resource = record.metadata.resource;
+  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
   if (record.metadata.finishedAt !== undefined || resource?.host !== "herdr") return record;
   const path = herdrExecutionPath(resource);
   try {
@@ -382,18 +436,19 @@ async function refreshHerdrExecution(root: string, record: RecordedWorker): Prom
   return refreshed;
 }
 
-const localWorkerResourceOperations: LocalWorkerResourceOperations = {
-  async stop(pid, identity, herdr) {
-    if (herdr !== undefined) {
-      await herdrOperations.closeTab(herdr.tab);
+const localCloneRuntimeOperations: WorkerRuntimeOperations = {
+  async stop(runtime, identity) {
+    const resource = runtime as LocalCloneRuntime;
+    if (resource.host === "herdr") {
+      await herdrOperations.closeTab(resource.tab);
       return;
     }
-    if (pid === undefined) return;
+    if (resource.pid === undefined) return;
     const live = liveDirectWorkers.get(workerKey(identity));
     if (live === undefined) {
       throw new Error("direct worker session is unavailable after restart; refusing to signal a persisted PID");
     }
-    if (live.process?.pid !== pid) {
+    if (live.process?.pid !== resource.pid) {
       throw new Error("recorded direct worker PID does not match the live owned process");
     }
 
@@ -401,28 +456,28 @@ const localWorkerResourceOperations: LocalWorkerResourceOperations = {
     if (live.process !== undefined) await stopDirectProcess(live.process);
     await live.completed;
   },
-  removeWorkspace: (workspace) => rm(workspace, { recursive: true, force: true }),
+  cleanup: (runtime) => rm((runtime as LocalCloneRuntime).workspace, { recursive: true, force: true }),
 };
+localCloneWorkerAdapter.runtimeOperations = localCloneRuntimeOperations;
 
 export async function stopAndFinalizeRecordedWorker(
   root: string,
   identity: TicketIdentity,
   finishedAt: Date,
-  operations: LocalWorkerResourceOperations = localWorkerResourceOperations,
+  operations?: WorkerRuntimeOperations,
 ): Promise<WorkerCleanup> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker record`);
   const finish = record.metadata.finishedAt ?? finishedAt.toISOString();
-  const execution = localExecution(record.metadata, finish);
-  if (record.metadata.resource === undefined) return { status: "finalized", execution };
+  const execution = recordedExecution(record.metadata, finish);
+  if (record.metadata.runtime === undefined) return { status: "finalized", execution };
 
-  const resource = record.metadata.resource;
+  const resource = record.metadata.runtime.resource as WorkerRuntimeResource;
+  const adapter = selectWorkerAdapter((await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId)).metadata.executionPolicy);
+  const runtimeOperations = operations ?? adapter.runtimeOperations;
+  if (runtimeOperations === undefined) throw new Error(`no runtime operations for Worker adapter ${adapter.adapter}`);
   try {
-    await operations.stop(
-      resource.host === "direct" ? resource.pid : undefined,
-      identity,
-      resource.host === "herdr" ? { tab: resource.tab, pane: resource.pane } : undefined,
-    );
+    await runtimeOperations.stop(resource, identity);
   } catch (error) {
     return {
       status: "failed",
@@ -432,7 +487,7 @@ export async function stopAndFinalizeRecordedWorker(
     };
   }
   try {
-    await operations.removeWorkspace(resource.workspace);
+    await runtimeOperations.cleanup(resource);
   } catch (error) {
     return {
       status: "failed",
@@ -444,7 +499,7 @@ export async function stopAndFinalizeRecordedWorker(
 
   const metadata = workerRecordSchema.parse({
     ...record.metadata,
-    resource: undefined,
+    runtime: undefined,
     finishedAt: finish,
   });
   try {
@@ -460,17 +515,28 @@ export async function stopAndFinalizeRecordedWorker(
   return { status: "finalized", execution };
 }
 
+/** Finalize through the adapter selected by immutable Ticket policy. */
+export async function finalizeWorker(
+  root: string,
+  identity: TicketIdentity,
+  finishedAt: Date,
+  operations?: WorkerRuntimeOperations,
+): Promise<WorkerCleanup> {
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  return selectWorkerAdapter(ticket.metadata.executionPolicy).finalize(root, identity, finishedAt, operations);
+}
+
 export async function forgetFinalizedWorker(root: string, identity: TicketIdentity): Promise<void> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) return;
-  if (record.metadata.resource !== undefined) throw new Error("cannot forget Worker record before resources are finalized");
+  if (record.metadata.runtime !== undefined) throw new Error("cannot forget Worker record before resources are finalized");
   await rm(workerRecordPath(root, identity));
 }
 
-export async function loadFinishedLocalExecution(
+async function loadFinishedLocalCloneWorker(
   root: string,
   identity: TicketIdentity,
-): Promise<LocalCloneExecution> {
+): Promise<WorkerExecution> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker execution evidence`);
@@ -479,13 +545,23 @@ export async function loadFinishedLocalExecution(
   if (record.metadata.finishedAt === undefined || record.metadata.exitCode === undefined) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker has not finished`);
   }
-  if (record.metadata.resource?.host === "direct" && record.metadata.resource.pid !== undefined) {
+  const runtime = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (runtime?.host === "direct" && runtime.pid !== undefined) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker still has a live process handle`);
   }
-  return localExecution(record.metadata, record.metadata.finishedAt);
+  return recordedExecution(record.metadata, record.metadata.finishedAt);
 }
 
-export async function observeWorker(
+/** Load completion evidence through the adapter selected by immutable Ticket policy. */
+export async function loadFinishedWorkerExecution(
+  root: string,
+  identity: TicketIdentity,
+): Promise<WorkerExecution> {
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  return selectWorkerAdapter(ticket.metadata.executionPolicy).loadFinished(root, identity);
+}
+
+export async function observeLocalCloneWorker(
   root: string,
   identity: TicketIdentity,
   herdr: HerdrOperations = herdrOperations,
@@ -493,7 +569,7 @@ export async function observeWorker(
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) return { hosting: null, status: "unavailable" };
   record = await refreshHerdrExecution(root, record);
-  const resource = record.metadata.resource;
+  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
   const hosting = resource?.host ?? "direct";
   if (record.metadata.finishedAt !== undefined) return { hosting, status: "done" };
   if (resource === undefined) return { hosting, status: "done" };
@@ -507,15 +583,49 @@ export async function observeWorker(
   return { hosting: "herdr", status: "unavailable" };
 }
 
-export async function readWorkerTerminal(
+/** Observe through the adapter selected by immutable Ticket policy. */
+export async function observeWorker(
+  root: string,
+  identity: TicketIdentity,
+  herdr?: HerdrOperations,
+): Promise<WorkerObservation> {
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  return selectWorkerAdapter(ticket.metadata.executionPolicy).observe(root, identity, herdr);
+}
+
+async function readLocalCloneWorkerTerminal(
   root: string,
   identity: TicketIdentity,
   input: ReadHerdrTerminalInput = {},
   herdr: HerdrOperations = herdrOperations,
 ): Promise<string> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
-  if (record?.metadata.resource?.host !== "herdr") throw new Error("Ticket has no Herdr-hosted terminal");
-  return herdr.read(record.metadata.resource.pane, input);
+  const runtime = record?.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (runtime?.host !== "herdr") throw new Error("Ticket has no Herdr-hosted terminal");
+  return herdr.read(runtime.pane, input);
+}
+
+async function attachLocalCloneWorkerTerminal(
+  root: string,
+  identity: TicketIdentity,
+  herdr: HerdrOperations = herdrOperations,
+): Promise<number> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  const runtime = record?.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (runtime?.host !== "herdr") throw new Error("Ticket has no Herdr-hosted terminal");
+  return herdr.attach(runtime.pane);
+}
+
+export async function readWorkerTerminal(
+  root: string,
+  identity: TicketIdentity,
+  input: ReadHerdrTerminalInput = {},
+  herdr: HerdrOperations = herdrOperations,
+): Promise<string> {
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
+  if (adapter.readTerminal === undefined) throw new Error(`Worker adapter ${adapter.adapter} has no attended terminal`);
+  return adapter.readTerminal(root, identity, input, herdr);
 }
 
 export async function attachWorkerTerminal(
@@ -523,9 +633,10 @@ export async function attachWorkerTerminal(
   identity: TicketIdentity,
   herdr: HerdrOperations = herdrOperations,
 ): Promise<number> {
-  const record = await loadRecordedWorkerIfPresent(root, identity);
-  if (record?.metadata.resource?.host !== "herdr") throw new Error("Ticket has no Herdr-hosted terminal");
-  return herdr.attach(record.metadata.resource.pane);
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
+  if (adapter.attachTerminal === undefined) throw new Error(`Worker adapter ${adapter.adapter} has no attended terminal`);
+  return adapter.attachTerminal(root, identity, herdr);
 }
 
 function contextBody(role: "implement" | "review", inputRevision: string): string {
@@ -645,6 +756,9 @@ export async function dispatchHerdrTicket(
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== localCloneWorkerAdapter) {
+    throw new Error("selected Worker adapter cannot host a local-clone Ticket");
+  }
   validateLocalPolicy(ticket);
 
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
@@ -675,7 +789,7 @@ export async function dispatchHerdrTicket(
       label: `spike-${input.goalId.slice(-8)}-${input.changeId}-${input.ticketId}`,
       environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket),
     });
-    workerRecord = await recordLocalWorker(repository.root, {
+    workerRecord = await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: ticket.metadata.role,
       worker,
@@ -698,11 +812,14 @@ export async function dispatchHerdrTicket(
 
 export async function dispatchLocalTicket(
   input: DispatchLocalTicketInput,
-): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== localCloneWorkerAdapter) {
+    throw new Error("selected Worker adapter cannot host a local-clone Ticket");
+  }
   validateLocalPolicy(ticket);
 
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
@@ -730,7 +847,7 @@ export async function dispatchLocalTicket(
 
   try {
     startedAt = clock().toISOString();
-    workerRecord = await recordLocalWorker(repository.root, {
+    workerRecord = await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: ticket.metadata.role,
       worker,
@@ -760,7 +877,7 @@ export async function dispatchLocalTicket(
       ...workerRecord,
       metadata: workerRecordSchema.parse({
         ...workerRecord.metadata,
-        resource: { host: "direct", workspace, pid: child.pid },
+        runtime: { adapter: "local-clone", resource: { host: "direct", workspace, pid: child.pid } },
       }),
     };
     await replaceWorkerRecord(repository.root, workerRecord);
@@ -778,7 +895,7 @@ export async function dispatchLocalTicket(
           ...workerRecord,
           metadata: workerRecordSchema.parse({
             ...workerRecord.metadata,
-            resource: { host: "direct", workspace },
+            runtime: { adapter: "local-clone", resource: { host: "direct", workspace } },
             finishedAt,
             exitCode,
           }),
@@ -832,7 +949,7 @@ export async function dispatchPiTicket(
       root: string;
       exchange: TicketExchange;
       hosting: "direct";
-      execution: LocalCloneExecution;
+      execution: WorkerExecution;
       classification: PiDispatchClassification;
     }
   | {
@@ -869,8 +986,10 @@ export async function dispatchPiTicket(
     `@${join(inputDirectory, "context.md")}`,
     `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish only with ${completionTool}.`,
   ];
+  const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
   if (input.host !== "direct") {
-    return dispatchHerdrTicket({
+    if (adapter.dispatchAttended === undefined) throw new Error(`Worker adapter ${adapter.adapter} does not support attended dispatch`);
+    const attended = await adapter.dispatchAttended({
       ...identity,
       cwd: repository.root,
       worker: input.worker,
@@ -878,9 +997,10 @@ export async function dispatchPiTicket(
       ...(input.clock === undefined ? {} : { clock: input.clock }),
       ...(input.herdr === undefined ? {} : { herdr: input.herdr }),
     });
+    return { ...attended, hosting: "herdr" as const };
   }
 
-  const dispatched = await dispatchLocalTicket({
+  const dispatched = await adapter.dispatch({
     ...identity,
     cwd: repository.root,
     worker: input.worker,
@@ -895,10 +1015,20 @@ export async function dispatchPiTicket(
   return { ...dispatched, hosting: "direct", classification };
 }
 
+/** Dispatch through the adapter selected by immutable Ticket capabilities. */
+export async function dispatchWorkerTicket(
+  input: DispatchLocalTicketInput,
+): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
+  const repository = await discoverRepository(input.cwd);
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
+  return adapter.dispatch(input);
+}
+
 async function dispatchLocalRole(
   input: DispatchLocalTicketInput,
   role: "implement" | "review",
-): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.role !== role) throw new Error(`local ${role} dispatch requires a ${role} Ticket`);
@@ -907,12 +1037,12 @@ async function dispatchLocalRole(
 
 export function dispatchLocalImplementation(
   input: DispatchLocalTicketInput,
-): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
   return dispatchLocalRole(input, "implement");
 }
 
 export function dispatchLocalReview(
   input: DispatchLocalTicketInput,
-): Promise<{ root: string; exchange: TicketExchange; execution: LocalCloneExecution }> {
+): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
   return dispatchLocalRole(input, "review");
 }

@@ -32,9 +32,9 @@ import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy }
 import { completeWorker, readWorkerPayload } from "./worker-completion.ts";
 import {
   attachWorkerTerminal,
-  dispatchLocalTicket,
+  dispatchWorkerTicket,
   dispatchPiTicket,
-  loadFinishedLocalExecution,
+  loadFinishedWorkerExecution,
   observeWorker,
   readWorkerTerminal,
 } from "./worker.ts";
@@ -732,7 +732,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "ticket" && args[1] === "dispatch-test") {
       const input = parseTestDispatch(args.slice(2));
-      const dispatched = await dispatchLocalTicket({ cwd, ...input });
+      const dispatched = await dispatchWorkerTicket({ cwd, ...input });
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       return success(
         json,
@@ -796,7 +796,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       const [ticket, execution] = await Promise.all([
         loadTicket(repository.root, input.goalId, input.changeId, input.ticketId),
-        loadFinishedLocalExecution(repository.root, identity),
+        loadFinishedWorkerExecution(repository.root, identity),
       ]);
 
       let publication;

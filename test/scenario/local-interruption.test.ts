@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { recoverInterruptedTicket } from "../../src/recovery.ts";
-import { deriveCurrentCandidate } from "../../src/report.ts";
+import { deriveCurrentCandidate, publishInterruptedReport } from "../../src/report.ts";
 import { issueReplacementTicket, issueTicket, reportPath, ticketPath, ticketStatus } from "../../src/ticket.ts";
-import { prepareTicketExchange, recordLocalWorker, workerRecordPath } from "../../src/worker.ts";
+import { prepareTicketExchange, recordLocalCloneWorker, workerRecordPath } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
@@ -66,7 +66,7 @@ describe("interrupted Ticket recovery", () => {
     await writeFile(join(exchange.outputDirectory, "worker.tmp"), "preserve for diagnosis\n");
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     await writeFile(join(workspace, "uncertain.txt"), "uncertain worker state\n");
-    await recordLocalWorker(repository.root, {
+    await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: "implement",
       worker: "interrupted-worker",
@@ -115,15 +115,27 @@ describe("interrupted Ticket recovery", () => {
     await expect(recover()).rejects.toThrow();
     await writeFile(runtimePath, validRuntimeRecord);
 
+    await expect(publishInterruptedReport({
+      cwd: repository.root,
+      ...identity,
+      role: "implement",
+      reason: "False host provenance.",
+      execution: {
+        ...identity, adapter: "host", isolation: "workspace", worker: "not-launched",
+        model: "controlled-model", thinking: "low", startedAt: first.ticket.metadata.issuedAt,
+        finishedAt: new Date("2026-03-24T10:05:00.000Z").toISOString(), exitCode: -1,
+      },
+    })).rejects.toThrow("contradicts a recorded Worker launch");
+
     let stopAttempts = 0;
     let removeAttempts = 0;
     const cleanupFailed = await recover(undefined, {
-      async stop(pid) {
-        expect(pid).toBe(424242);
+      async stop(runtime) {
+        expect(runtime).toMatchObject({ pid: 424242 });
         stopAttempts++;
       },
-      async removeWorkspace(path) {
-        expect(path).toBe(workspace);
+      async cleanup(runtime) {
+        expect((runtime as { workspace: string }).workspace).toBe(workspace);
         removeAttempts++;
         throw new Error("simulated adapter cleanup failure");
       },
@@ -183,9 +195,9 @@ describe("interrupted Ticket recovery", () => {
       async stop() {
         stopAttempts++;
       },
-      async removeWorkspace(path) {
+      async cleanup(runtime) {
         removeAttempts++;
-        await rm(path, { recursive: true, force: true });
+        await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
       },
     });
     expect(cleanupRetried.cleanup).toEqual({ status: "finalized" });
@@ -234,7 +246,7 @@ describe("interrupted Ticket recovery", () => {
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     const workspaceMarker = join(workspace, "stale-worker.txt");
     await writeFile(workspaceMarker, "stale direct worker state\n");
-    await recordLocalWorker(repository.root, {
+    await recordLocalCloneWorker(repository.root, {
       ...identity,
       role: "implement",
       worker: "stale-direct-worker",
@@ -275,11 +287,11 @@ describe("interrupted Ticket recovery", () => {
         now: new Date("2026-03-24T12:05:00.000Z"),
       },
       {
-        async stop(pid) {
-          expect(pid).toBe(2_147_483_647);
+        async stop(runtime) {
+          expect(runtime).toMatchObject({ pid: 2_147_483_647 });
         },
-        async removeWorkspace(path) {
-          await rm(path, { recursive: true, force: true });
+        async cleanup(runtime) {
+          await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
         },
       },
     );
