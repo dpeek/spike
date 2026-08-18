@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import { acceptanceCriteria } from "./acceptance.ts";
 import { changePath, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
@@ -378,15 +379,6 @@ function reviewStatement(body: string): string {
   const statement = match?.[1]?.trim() ?? "";
   if (!statement) throw new Error("completed review Submission is missing the Review statement section");
   return statement;
-}
-
-function acceptanceCriteria(body: string): string[] {
-  const section = body.match(/^## Acceptance criteria\s*\n([\s\S]*?)(?=^## |$)/m)?.[1] ?? "";
-  return section
-    .split("\n")
-    .filter((line) => line.startsWith("- "))
-    .map((line) => line.slice(2).trim())
-    .filter(Boolean);
 }
 
 function validateAcceptanceAssessment(

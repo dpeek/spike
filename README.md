@@ -7,6 +7,7 @@ Version 2 is starting from a deliberately small foundation.
 ## Documentation
 
 - [Workflow design](doc/workflow.md)
+- [Phase 2 dogfood procedure and evidence](doc/dogfood.md)
 
 ## Development
 

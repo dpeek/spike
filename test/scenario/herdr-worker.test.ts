@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChange } from "../../src/change.ts";
@@ -92,11 +92,14 @@ describe("ephemeral Herdr worker hosting", () => {
 
     expect(await observeWorker(repository.root, identity, observationalHerdr("working", transcript))).toEqual({ hosting: "herdr", status: "working" });
     expect(await observeWorker(repository.root, identity, observationalHerdr("blocked", transcript))).toEqual({ hosting: "herdr", status: "blocked" });
+    expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "working" });
+    await expect(loadFinishedLocalExecution(repository.root, identity)).rejects.toThrow("Worker has not finished");
+    await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":0,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
+    expect(await loadFinishedLocalExecution(repository.root, identity)).toMatchObject({ exitCode: 0 });
     expect(await readWorkerTerminal(repository.root, identity, {}, herdr)).toBe(transcript);
     expect(await ticketStatus(repository.root, identity.goalId, identity.changeId, identity.ticketId)).toBe("open");
     expect(await Bun.file(reportPath(repository.root, identity.goalId, identity.changeId, identity.ticketId)).exists()).toBe(false);
-    await expect(loadFinishedLocalExecution(repository.root, identity)).rejects.toThrow("Worker has not finished");
   });
 
   test("retries Herdr stop and cleanup idempotently", async () => {

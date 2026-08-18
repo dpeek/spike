@@ -501,8 +501,9 @@ export async function observeWorker(
 
   const status = await herdr.status(resource.pane);
   if (status === "blocked") return { hosting: "herdr", status: "blocked" };
-  if (status === "idle" || status === "done") return { hosting: "herdr", status: "done" };
-  if (status === "working" || status === "unknown") return { hosting: "herdr", status: "working" };
+  if (status === "idle" || status === "done" || status === "working" || status === "unknown") {
+    return { hosting: "herdr", status: "working" };
+  }
   return { hosting: "herdr", status: "unavailable" };
 }
 

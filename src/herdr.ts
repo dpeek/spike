@@ -128,6 +128,9 @@ export const herdrOperations: HerdrOperations = {
   },
 
   async attach(pane) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error("Herdr terminal attachment requires an interactive TTY");
+    }
     return (await command(["agent", "attach", pane], { inherit: true })).code;
   },
 

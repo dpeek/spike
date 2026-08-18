@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { link, lstat, open, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { acceptanceCriteria } from "./acceptance.ts";
 import { installImmutable, serializeDocument } from "./durable-state.ts";
 import { loadTicketDocument, type Ticket } from "./ticket.ts";
 
@@ -145,15 +146,6 @@ function assertEnvironmentMatchesTicket(ticket: Ticket): void {
       `actual worker selection ${actualModel}/${actualThinking} does not match Ticket assignment ${ticket.metadata.model}/${ticket.metadata.thinking}`,
     );
   }
-}
-
-function acceptanceCriteria(ticketBody: string): string[] {
-  const section = ticketBody.match(/^## Acceptance criteria\s*\n([\s\S]*?)(?=^## |$)/m)?.[1] ?? "";
-  return section
-    .split("\n")
-    .filter((line) => line.startsWith("- "))
-    .map((line) => line.slice(2).trim())
-    .filter(Boolean);
 }
 
 function validateReviewSemantics(
