@@ -1,10 +1,8 @@
-import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   abandonChange,
-  changeDecisionPath,
   changeStatus,
   createChange,
   loadChangeDecision,
@@ -280,61 +278,6 @@ describe("Change rejection and abandonment", () => {
       readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
     ))).toEqual(reportSources);
     expect(await readFile(artifactPath, "utf8")).toBe(artifact);
-    expect(await repository.git("rev-parse", candidateRef(goalId, "001", "001"))).toBe(candidateRevision);
-    await expectHostUnchanged(repository, host);
-
-    const second = await nextChange(repository, goalId);
-    expect(second.change.metadata.changeId).toBe("002");
-    expect(second.change.metadata.baseRevision).toBe(baseRevision);
-  });
-
-  test("abandons an active Change without review or integration", async () => {
-    const { repository, goalId, baseRevision, candidateRevision, artifactPath } = await implementedChange();
-    const ticketSource = await readFile(ticketPath(repository.root, goalId, "001", "001"), "utf8");
-    const reportSource = await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8");
-    const artifactDigest = createHash("sha256").update(await readFile(artifactPath)).digest("hex");
-    const host = await dirtyHost(repository);
-
-    await expect(
-      abandonChange({ cwd: repository.root, goalId, changeId: "999", statement: "Wrong identity." }),
-    ).rejects.toThrow();
-    await expect(
-      abandonChange({ cwd: repository.root, goalId, changeId: "001", statement: "\n\t" }),
-    ).rejects.toThrow("Change decision statement must not be blank");
-    expect(await Bun.file(changeDecisionPath(repository.root, goalId, "001")).exists()).toBe(false);
-
-    const abandoned = await abandonChange({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      statement: "Operator stopped this direction before review.",
-      now: new Date("2026-03-23T11:00:00.000Z"),
-    });
-    expect(abandoned.decision.metadata).toEqual({
-      kind: "change-decision",
-      goalId,
-      changeId: "001",
-      decidedAt: "2026-03-23T11:00:00.000Z",
-      disposition: "abandon",
-    });
-    expect(await changeStatus(repository.root, goalId, "001")).toBe("resolved");
-    expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(baseRevision);
-    await expect(
-      issueTicket({
-        cwd: repository.root,
-        goalId,
-        changeId: "001",
-        instruction: "Attempt work after abandonment.",
-        executionPolicy: policy,
-      }),
-    ).rejects.toThrow("is resolved");
-    await expect(
-      abandonChange({ cwd: repository.root, goalId, changeId: "001", statement: "Decide twice." }),
-    ).rejects.toThrow("already has a terminal decision");
-
-    expect(await readFile(ticketPath(repository.root, goalId, "001", "001"), "utf8")).toBe(ticketSource);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8")).toBe(reportSource);
-    expect(createHash("sha256").update(await readFile(artifactPath)).digest("hex")).toBe(artifactDigest);
     expect(await repository.git("rev-parse", candidateRef(goalId, "001", "001"))).toBe(candidateRevision);
     await expectHostUnchanged(repository, host);
 

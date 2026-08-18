@@ -10,7 +10,12 @@ import {
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
-import { deriveCurrentApproval, deriveCurrentCandidate, deriveCurrentRejection } from "./report.ts";
+import {
+  deriveCurrentApproval,
+  deriveCurrentCandidate,
+  deriveCurrentRejection,
+  loadChangeReportHistory,
+} from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -121,6 +126,17 @@ function requireItems(values: string[], label: string): string[] {
   return values.map((value) => requireText(value, label));
 }
 
+function requireAcceptanceCriteria(values: string[]): string[] {
+  const criteria = requireItems(values, "Acceptance criterion");
+  if (criteria.some((criterion) => /[\r\n]/.test(criterion))) {
+    throw new Error("Acceptance criterion must be one line");
+  }
+  if (new Set(criteria).size !== criteria.length) {
+    throw new Error("Acceptance criteria must be unique");
+  }
+  return criteria;
+}
+
 function list(items: string[]): string {
   return items.length === 0 ? "None." : items.map((item) => `- ${item}`).join("\n");
 }
@@ -212,6 +228,13 @@ export async function changeStatus(root: string, goalId: string, changeId: strin
   return (await loadChangeDecisionIfPresent(root, goalId, changeId)) === undefined ? "active" : "resolved";
 }
 
+async function assertNoOpenTicket(root: string, goalId: string, changeId: string): Promise<void> {
+  const history = await loadChangeReportHistory(root, goalId, changeId);
+  if (history.reports.length !== history.ticketCount) {
+    throw new Error(`Change ${goalId}/${changeId} has an open Ticket`);
+  }
+}
+
 export async function landChange(input: LandChangeInput): Promise<LandedChange> {
   const repository = await discoverRepository(input.cwd);
   const decisionDocumentPath = changeDecisionPath(repository.root, input.goalId, input.changeId);
@@ -221,6 +244,7 @@ export async function landChange(input: LandChangeInput): Promise<LandedChange> 
 
   await loadGoal(repository.root, input.goalId);
   const change = await loadChange(repository.root, input.goalId, input.changeId);
+  await assertNoOpenTicket(repository.root, input.goalId, input.changeId);
   const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
   if (candidate === undefined) {
     throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
@@ -305,6 +329,7 @@ async function resolveChangeWithoutLanding(
 
   await loadGoal(repository.root, input.goalId);
   await loadChange(repository.root, input.goalId, input.changeId);
+  await assertNoOpenTicket(repository.root, input.goalId, input.changeId);
   const statement = requireText(input.statement, "Change decision statement");
 
   if (disposition === "reject") {
@@ -363,7 +388,7 @@ export async function createChange(input: CreateChangeInput): Promise<CreatedCha
   const title = requireText(input.title, "Change title");
   const intent = requireText(input.intent, "Change intent");
   const rationale = requireText(input.rationale, "Change rationale");
-  const acceptanceCriteria = requireItems(input.acceptanceCriteria, "Acceptance criterion");
+  const acceptanceCriteria = requireAcceptanceCriteria(input.acceptanceCriteria);
   if (acceptanceCriteria.length === 0) throw new Error("Change must have at least one acceptance criterion");
   const nonGoals = requireItems(input.nonGoals ?? [], "Non-goal");
   const dependencies = requireItems(input.dependencies ?? [], "Dependency");

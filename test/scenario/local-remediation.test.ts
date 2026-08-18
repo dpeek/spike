@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createChange, landChange, loadChangeDecision } from "../../src/change.ts";
 import { candidateRef } from "../../src/git-change.ts";
 import { createGoal, integratedRef } from "../../src/goal.ts";
+import { stopTicket } from "../../src/recovery.ts";
 import {
   deriveCurrentApproval,
   deriveCurrentCandidate,
@@ -409,7 +410,28 @@ describe("Candidate remediation and landing", () => {
     });
     await expect(publishApproval()).rejects.toThrow("immutable Report already exists");
 
-    const reportSources = await Promise.all(["001", "002", "003", "004"].map((ticketId) =>
+    const openReview = await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      role: "review",
+      instruction: "Perform an additional review before landing.",
+      executionPolicy: policy,
+    });
+    expect(openReview.ticket.metadata.ticketId).toBe("005");
+    await expect(
+      landChange({ cwd: repository.root, goalId, changeId: "001" }),
+    ).rejects.toThrow("has an open Ticket");
+    await stopTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      ticketId: "005",
+      role: "review",
+      reason: "Planner stopped the additional review before landing.",
+    });
+
+    const reportSources = await Promise.all(["001", "002", "003", "004", "005"].map((ticketId) =>
       readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
     ));
     await repository.git("update-ref", integratedRef(goalId), hostHead, baseRevision);
@@ -444,12 +466,12 @@ describe("Candidate remediation and landing", () => {
 
     expect(await repository.git("rev-parse", candidateRef(goalId, "001", "001"))).toBe(candidateA);
     expect(await repository.git("rev-parse", candidateRef(goalId, "001", "003"))).toBe(candidateB);
-    expect(await Promise.all(["001", "002", "003", "004"].map((ticketId) =>
+    expect(await Promise.all(["001", "002", "003", "004", "005"].map((ticketId) =>
       readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
     ))).toEqual(reportSources);
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);
     expect(await repository.git("write-tree")).toBe(hostIndex);
     expect(await repository.git("diff", "--", "README.md")).toBe(hostDiff);
     expect(await readFile(join(repository.root, "README.md"), "utf8")).toBe("dirty host state\n");
-  });
+  }, 30_000);
 });

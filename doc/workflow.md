@@ -133,7 +133,7 @@ The exchange importer treats all worker output as untrusted. It accepts only dec
 
 Ticket execution policy describes required capabilities rather than selecting an adapter. Credential grants contain identifiers, never secret values; the selected adapter resolves them at launch. An adapter must refuse a Ticket whose isolation, network, or credential policy it cannot satisfy.
 
-The local-clone adapter provides workspace separation only and may run controlled prototype workers. It is not security isolation. Autonomous workers must use the Docker adapter before Spike is used against valuable repositories.
+The local-clone adapter provides workspace separation only and may run controlled prototype workers. It is not security isolation. While the direct supervisor owns the live process handle, stopping waits for graceful exit and escalates to forced termination before finalization. After supervisor restart, the adapter never signals a persisted PID because PID identity is unsafe; it publishes interruption evidence and surfaces orphan cleanup as a health warning. Durable cross-restart session reclamation belongs to Herdr. Autonomous workers must use the Docker adapter before Spike is used against valuable repositories.
 
 ### Sequential work and nested identity
 
@@ -219,13 +219,15 @@ A Change owns:
 - current candidate revision and review verdict, derived from that history;
 - terminal Change decision, when resolved.
 
+Acceptance criteria are distinct, canonical single-line assertions. Review Reports identify and assess them by their exact text, so blank, multiline, or duplicate criteria are invalid.
+
 The full identity of a Change is its Goal ID plus Change ID. A Change exists before its first candidate commit, so its identity cannot be a commit hash.
 
 ### Derived status and terminal decision
 
 Spike does not persist a Change state enum or transition graph. It derives status for presentation from the latest candidate-producing Ticket, the review verdict for that exact revision, any active runtime Ticket, and the terminal Change decision.
 
-One immutable `decision.md` resolves a Change with a disposition of `land`, `reject`, or `abandon`. A landing decision records the exact approved commit and advances the Goal's integrated revision. Rejection and abandonment record a statement without advancing it. A resolved Change is never reopened; later work receives the next Change ID.
+One immutable `decision.md` resolves a Change with a disposition of `land`, `reject`, or `abandon`. A terminal decision is permitted only when every issued Ticket has a published Report. A landing decision records the exact approved commit and advances the Goal's integrated revision. Rejection and abandonment record a statement without advancing it. To abandon active work, the planner first stops the worker and publishes a `stopped` Ticket Report, then records the `abandon` decision. A resolved Change is never reopened; later work receives the next Change ID.
 
 ### Candidate revisions
 
@@ -532,9 +534,10 @@ On planner or supervisor restart:
 4. stop and finalize its worker resources;
 5. ignore or quarantine its Submission and other staged output;
 6. publish its host-generated Report with outcome `interrupted`;
-7. issue the next sequential Ticket from the latest committed Candidate when the Plan still calls for that work.
+7. return control to the planner without issuing another Ticket;
+8. let the planner explicitly issue the next sequential Ticket from the latest committed Candidate only when the Plan still calls for that work.
 
-Spike never reconnects to an interrupted session, resumes its conversation, imports its uncommitted output automatically, or retries an ambiguous prompt. The replacement Ticket may repeat work.
+Spike never reconnects to an interrupted session, resumes its conversation, imports its uncommitted output automatically, or retries an ambiguous prompt. Recovery and replacement issuance are separate operations; an explicitly issued replacement Ticket may repeat work.
 
 Cleanup is idempotent and independent from workflow progress. A failed adapter cleanup produces a visible health warning and can be retried, but does not make interrupted worker output authoritative.
 
@@ -770,7 +773,7 @@ The default Bun suite should remain fast enough for frequent use and contain no 
 
 Filesystem and Git behavior uses temporary directories and the real Git CLI. Do not introduce an in-memory filesystem or Git implementation: atomic rename, exclusive creation, symlink handling, bundles, refs, and commit identity are part of the production behavior under test. Use Git plumbing, deterministic scripted workers, injected clocks and crash points, and the production modules. Do not sleep or poll in default tests.
 
-Repository scenarios remain isolated and are not globally concurrent unless measurements show that parallelism improves total time. Docker tests run explicitly from `test/docker/`; Herdr and real model execution remain manual smoke tests initially.
+Repository scenarios remain isolated and use bounded file-level parallelism; measurement of the Phase 1 suite showed that eight workers reduce default runtime without shared-state failures. Tests within each repository scenario remain sequential. Docker tests run explicitly from `test/docker/`; Herdr and real model execution remain manual smoke tests initially.
 
 ### Scenarios
 

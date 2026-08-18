@@ -8,7 +8,7 @@
   },
   "scripts": {
     "spike": "bun src/cli.ts",
-    "test": "bun test --path-ignore-patterns test/docker",
+    "test": "bun test --path-ignore-patterns test/docker --parallel=8",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run test && bun build src/cli.ts --target=bun --outfile=/tmp/spike-check.js"
   },

@@ -10,7 +10,6 @@ import {
   deriveCurrentRemediation,
   loadReport,
   publishFailedReport,
-  publishImplementationReport,
 } from "../../src/report.ts";
 import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
 import { dispatchLocalImplementation } from "../../src/worker.ts";
@@ -32,32 +31,6 @@ await writeFile("abandoned-worker-edit.txt", "never submitted\n");
 await writeFile(join(output, "partial-output.tmp"), "incomplete worker output\n");
 await writeFile(join(output, "diagnostic.log"), "worker failed after staging output\n");
 process.exit(23);
-`;
-
-const successfulWorker = String.raw`
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
-async function git(...args) {
-  const child = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  if (code !== 0) throw new Error(stderr);
-  return stdout.trim();
-}
-await git("config", "user.name", "Replacement Worker");
-await git("config", "user.email", "replacement@example.test");
-await writeFile("candidate.txt", "candidate A\n");
-await git("add", "candidate.txt");
-await git("commit", "--quiet", "-m", "replacement checkpoint");
-const workerRevision = await git("rev-parse", "HEAD");
-const metadata = {
-  kind: "submission", goalId: process.env.SPIKE_GOAL_ID, changeId: process.env.SPIKE_CHANGE_ID,
-  ticketId: process.env.SPIKE_TICKET_ID, outcome: "completed", workerRevision, artifacts: [],
-};
-const body = "# Implementation evidence\n\n## Summary\n\nProduced Candidate A.\n\n## Verification\n\nControlled check passed.\n\n## Assumptions\n\nNone.\n\n## Limitations\n\nNone.\n\n## Risks\n\nNone.\n\n## Follow-up\n\nIndependent review.\n";
-await writeFile(join(process.env.SPIKE_OUTPUT_DIR, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
-const bundle = Bun.spawn(["git", "bundle", "create", join(process.env.SPIKE_OUTPUT_DIR, "repository.bundle"), "HEAD"], { cwd: process.cwd(), stdout: "ignore", stderr: "pipe" });
-const [code, stderr] = await Promise.all([bundle.exited, new Response(bundle.stderr).text()]);
-if (code !== 0) throw new Error(stderr);
 `;
 
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
@@ -194,35 +167,6 @@ describe("failed Ticket replacement", () => {
       role: "implement",
       inputRevision: baseRevision,
     });
-
-    const replacementExecution = await dispatchLocalImplementation({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      ticketId: "002",
-      command: ["bun", "-e", successfulWorker],
-      worker: "controlled-replacement-worker",
-      model: "none",
-      clock: clock("2026-03-23T10:03:00.000Z", "2026-03-23T10:04:00.000Z"),
-    });
-    const completed = await publishImplementationReport({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      ticketId: "002",
-      execution: replacementExecution.execution,
-      commitMessage: { summary: "Publish Candidate A" },
-      now: new Date("2026-03-23T10:05:00.000Z"),
-    });
-    const candidateA = completed.report.metadata.candidateRevision;
-    expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toMatchObject({
-      candidateRevision: candidateA,
-      producingImplementationTicketId: "002",
-    });
-    expect(await repository.git("show", `${candidateA}:candidate.txt`)).toBe("candidate A");
-    expect(await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8")).toBe(failedReportSource);
-    expect(await readFile(join(failed.exchange.outputDirectory, "partial-output.tmp"), "utf8")).toBe(stagedPartialOutput);
-    expect(await readFile(join(failed.exchange.outputDirectory, "diagnostic.log"), "utf8")).toBe(stagedDiagnostic);
 
     expect(await repository.git("symbolic-ref", "HEAD")).toBe(hostBranch);
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);

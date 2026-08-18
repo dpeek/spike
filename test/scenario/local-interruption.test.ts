@@ -5,14 +5,9 @@ import { join } from "node:path";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { recoverInterruptedTicket } from "../../src/recovery.ts";
-import { deriveCurrentCandidate, publishImplementationReport } from "../../src/report.ts";
-import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
-import {
-  prepareTicketExchange,
-  recordLocalWorker,
-  workerRecordPath,
-  dispatchLocalImplementation,
-} from "../../src/worker.ts";
+import { deriveCurrentCandidate } from "../../src/report.ts";
+import { issueReplacementTicket, issueTicket, reportPath, ticketPath, ticketStatus } from "../../src/ticket.ts";
+import { prepareTicketExchange, recordLocalWorker, workerRecordPath } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
@@ -23,36 +18,10 @@ afterEach(async () => {
   }
 });
 
-const replacementWorker = String.raw`
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
-async function git(...args) {
-  const child = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  if (code !== 0) throw new Error(stderr);
-  return stdout.trim();
-}
-await git("config", "user.name", "Replacement Worker");
-await git("config", "user.email", "replacement@example.test");
-await writeFile("candidate.txt", "candidate A\n");
-await git("add", "candidate.txt");
-await git("commit", "--quiet", "-m", "candidate A checkpoint");
-const workerRevision = await git("rev-parse", "HEAD");
-const metadata = {
-  kind: "submission", goalId: process.env.SPIKE_GOAL_ID, changeId: process.env.SPIKE_CHANGE_ID,
-  ticketId: process.env.SPIKE_TICKET_ID, outcome: "completed", workerRevision, artifacts: [],
-};
-const body = "# Implementation evidence\n\n## Summary\n\nProduced Candidate A.\n\n## Verification\n\nControlled check passed.\n\n## Assumptions\n\nNone.\n\n## Limitations\n\nNone.\n\n## Risks\n\nNone.\n\n## Follow-up\n\nIndependent review.\n";
-await writeFile(join(process.env.SPIKE_OUTPUT_DIR, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
-const bundle = Bun.spawn(["git", "bundle", "create", join(process.env.SPIKE_OUTPUT_DIR, "repository.bundle"), "HEAD"], { cwd: process.cwd(), stdout: "ignore", stderr: "pipe" });
-const [code, stderr] = await Promise.all([bundle.exited, new Response(bundle.stderr).text()]);
-if (code !== 0) throw new Error(stderr);
-`;
-
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 
 describe("interrupted Ticket recovery", () => {
-  test("finalizes recorded resources, publishes interruption evidence, and issues 002 from the Change base", async () => {
+  test("finalizes recorded resources, publishes interruption evidence, and lets the planner issue 002", async () => {
     const repository = await temporaryRepository();
     repositories.push(repository);
     const goal = await createGoal({
@@ -173,15 +142,25 @@ describe("interrupted Ticket recovery", () => {
       },
     });
     expect(cleanupFailed.report.body).toContain("Supervisor restarted while Ticket 001 was running.");
-    expect(cleanupFailed.replacement.metadata).toMatchObject({
+    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    const replacement = (
+      await issueReplacementTicket({
+        cwd: repository.root,
+        goalId,
+        changeId: "001",
+        interruptedTicketId: "001",
+        now: new Date("2026-03-24T10:05:00.000Z"),
+      })
+    ).ticket;
+    expect(replacement.metadata).toMatchObject({
       ticketId: "002",
       role: "implement",
       inputRevision: baseRevision,
       replacesTicketId: "001",
       executionPolicy: policy,
     });
-    expect(cleanupFailed.replacement.body).toContain("## Instruction\n\nProduce Candidate A.");
-    expect(cleanupFailed.replacement.body).toContain("Discard uncertain progress after interruption.");
+    expect(replacement.body).toContain("## Instruction\n\nProduce Candidate A.");
+    expect(replacement.body).toContain("Discard uncertain progress after interruption.");
     expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
     expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toBeUndefined();
     expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(true);
@@ -198,7 +177,6 @@ describe("interrupted Ticket recovery", () => {
       },
     });
     expect(cleanupRetried.cleanup).toEqual({ status: "finalized" });
-    expect(cleanupRetried.replacement.metadata.ticketId).toBe("002");
     expect(stopAttempts).toBe(2);
     expect(removeAttempts).toBe(2);
     expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(false);
@@ -207,33 +185,94 @@ describe("interrupted Ticket recovery", () => {
     expect(await readFile(join(exchange.outputDirectory, "submission.md"), "utf8")).toBe("incomplete, untrusted output\n");
     expect(await readFile(join(exchange.outputDirectory, "worker.tmp"), "utf8")).toBe("preserve for diagnosis\n");
 
-    const replacementExecution = await dispatchLocalImplementation({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      ticketId: "002",
-      command: ["bun", "-e", replacementWorker],
-      worker: "replacement-worker",
-      model: "controlled-model",
-    });
-    const completed = await publishImplementationReport({
-      cwd: repository.root,
-      goalId,
-      changeId: "001",
-      ticketId: "002",
-      execution: replacementExecution.execution,
-      commitMessage: { summary: "Produce Candidate A" },
-    });
-    expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toMatchObject({
-      candidateRevision: completed.report.metadata.candidateRevision,
-      producingImplementationTicketId: "002",
-    });
-    expect(await repository.git("show", `${completed.report.metadata.candidateRevision}:candidate.txt`)).toBe("candidate A");
-
     expect(await repository.git("symbolic-ref", "HEAD")).toBe(hostBranch);
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);
     expect(await repository.git("write-tree")).toBe(hostIndex);
     expect(await repository.git("diff", "HEAD")).toBe(hostDiff);
     expect(await readFile(join(repository.root, "README.md"), "utf8")).toBe("dirty host state\n");
+  });
+
+  test("refuses to signal a persisted direct-worker PID after restart", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const goal = await createGoal({
+      cwd: repository.root,
+      title: "Recover a stale direct worker",
+      outcome: "Publish interruption evidence without signalling an unowned PID.",
+      approval: "Approved.",
+    });
+    const goalId = goal.goal.metadata.goalId;
+    await createChange({
+      cwd: repository.root,
+      goalId,
+      title: "Interrupt stale direct work",
+      intent: "Treat persisted direct runtime state as unsafe to signal.",
+      rationale: "A PID does not prove process identity after restart.",
+      acceptanceCriteria: ["Recovery surfaces a cleanup warning without signalling the persisted PID."],
+    });
+    await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      instruction: "Remain interrupted across supervisor restart.",
+      executionPolicy: policy,
+    });
+
+    const identity = { goalId, changeId: "001", ticketId: "001" };
+    const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
+    const workspaceMarker = join(workspace, "stale-worker.txt");
+    await writeFile(workspaceMarker, "stale direct worker state\n");
+    await recordLocalWorker(repository.root, {
+      ...identity,
+      role: "implement",
+      worker: "stale-direct-worker",
+      model: "controlled-model",
+      startedAt: "2026-03-24T12:00:00.000Z",
+      workspace,
+      pid: 2_147_483_647,
+    });
+
+    const recovered = await recoverInterruptedTicket({
+      cwd: repository.root,
+      ...identity,
+      role: "implement",
+      reason: "Supervisor restarted and no longer owns the direct process handle.",
+      now: new Date("2026-03-24T12:05:00.000Z"),
+    });
+    expect(recovered.cleanup).toEqual({
+      status: "failed",
+      message: "direct worker session is unavailable after restart; refusing to signal a persisted PID",
+    });
+    expect(recovered.report.metadata.outcome).toBe("interrupted");
+    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    const replacement = await issueReplacementTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      interruptedTicketId: "001",
+      now: new Date("2026-03-24T12:05:00.000Z"),
+    });
+    expect(replacement.ticket.metadata.ticketId).toBe("002");
+    expect(await Bun.file(workspaceMarker).exists()).toBe(true);
+
+    const cleanupRetried = await recoverInterruptedTicket(
+      {
+        cwd: repository.root,
+        ...identity,
+        role: "implement",
+        reason: "Supervisor restarted and no longer owns the direct process handle.",
+        now: new Date("2026-03-24T12:05:00.000Z"),
+      },
+      {
+        async stop(pid) {
+          expect(pid).toBe(2_147_483_647);
+        },
+        async removeWorkspace(path) {
+          await rm(path, { recursive: true, force: true });
+        },
+      },
+    );
+    expect(cleanupRetried.cleanup).toEqual({ status: "finalized" });
+    expect(await Bun.file(workspaceMarker).exists()).toBe(false);
   });
 });

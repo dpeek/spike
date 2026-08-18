@@ -11,7 +11,7 @@ import {
   publishImplementationReport,
   publishReviewReport,
 } from "../../src/report.ts";
-import { issueTicket, reportPath, ticketPath } from "../../src/ticket.ts";
+import { issueReplacementTicket, issueTicket, reportPath, ticketPath } from "../../src/ticket.ts";
 import {
   dispatchLocalImplementation,
   dispatchLocalReview,
@@ -147,7 +147,14 @@ describe("crash-point recovery", () => {
       outcome: "interrupted",
       execution: { adapter: "host", worker: "not-launched", model: "not-launched" },
     });
-    expect(issuedRecovery.goals[0]?.replacementTickets[0]?.metadata).toMatchObject({
+    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    const replacement002 = await issueReplacementTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      interruptedTicketId: "001",
+    });
+    expect(replacement002.ticket.metadata).toMatchObject({
       ticketId: "002",
       replacesTicketId: "001",
       inputRevision: repository.head,
@@ -185,7 +192,14 @@ describe("crash-point recovery", () => {
       expect.arrayContaining([unpublishedCandidateRef, quarantineRef]),
     );
     expect(implementationBeforeRecovery.goals[0]?.ignoredOutputPaths).toContain(implementationBefore.exchange.outputDirectory);
-    expect(implementationBeforeRecovery.goals[0]?.replacementTickets.at(-1)?.metadata.ticketId).toBe("003");
+    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "003")).exists()).toBe(false);
+    const replacement003 = await issueReplacementTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      interruptedTicketId: "002",
+    });
+    expect(replacement003.ticket.metadata.ticketId).toBe("003");
     expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toBeUndefined();
     expect(await readFile(join(implementationBefore.exchange.outputDirectory, "submission.md"), "utf8")).toBe(unpublishedSubmission);
     expect(await Bun.file(join(implementationBefore.exchange.outputDirectory, "repository.bundle")).exists()).toBe(true);
@@ -249,8 +263,15 @@ describe("crash-point recovery", () => {
         crash: crashAt("review-report-publication", "before"),
       }),
     ).rejects.toThrow("injected crash before review-report-publication");
-    const reviewBeforeRecovery = await reconcileRepository({ cwd: repository.root });
-    expect(reviewBeforeRecovery.goals[0]?.replacementTickets.at(-1)?.metadata).toMatchObject({
+    await reconcileRepository({ cwd: repository.root });
+    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "005")).exists()).toBe(false);
+    const replacement005 = await issueReplacementTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      interruptedTicketId: "004",
+    });
+    expect(replacement005.ticket.metadata).toMatchObject({
       ticketId: "005",
       replacesTicketId: "004",
       inputRevision: candidate?.candidateRevision,

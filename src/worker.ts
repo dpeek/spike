@@ -78,14 +78,66 @@ export type RecordedWorker = {
   body: string;
 };
 
+export type DirectProcess = {
+  pid: number;
+  exited: Promise<number>;
+  kill: (signal: NodeJS.Signals) => void;
+};
+
+export type StopDirectProcessOptions = {
+  graceMilliseconds?: number;
+  graceExpired?: Promise<void>;
+};
+
+export async function stopDirectProcess(
+  process: DirectProcess,
+  options: StopDirectProcessOptions = {},
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const graceExpired =
+    options.graceExpired ??
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, options.graceMilliseconds ?? 1_000);
+    });
+  let exited = false;
+  const exit = process.exited.then(() => {
+    exited = true;
+  });
+
+  try {
+    process.kill("SIGTERM");
+    const result = await Promise.race([
+      exit.then(() => "exited" as const),
+      graceExpired.then(() => "expired" as const),
+    ]);
+    if (result === "expired" && !exited) process.kill("SIGKILL");
+    await exit;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export type LocalWorkerResourceOperations = {
-  stop: (pid: number) => Promise<void>;
+  stop: (pid: number | undefined, identity: TicketIdentity) => Promise<void>;
   removeWorkspace: (workspace: string) => Promise<void>;
 };
 
+type LiveDirectWorker = {
+  process?: DirectProcess;
+  stopRequested: boolean;
+  completed: Promise<void>;
+  complete: () => void;
+};
+
+const liveDirectWorkers = new Map<string, LiveDirectWorker>();
+
+function workerKey(identity: TicketIdentity): string {
+  return `${identity.goalId}/${identity.changeId}/${identity.ticketId}`;
+}
+
 export type WorkerCleanup =
   | { status: "finalized"; execution: LocalCloneExecution }
-  | { status: "failed"; execution: LocalCloneExecution; message: string };
+  | { status: "failed"; phase: "stop" | "cleanup"; execution: LocalCloneExecution; message: string };
 
 export function exchangePath(root: string, identity: TicketIdentity): string {
   return join(
@@ -244,12 +296,18 @@ async function replaceWorkerRecord(root: string, record: RecordedWorker): Promis
 }
 
 const localWorkerResourceOperations: LocalWorkerResourceOperations = {
-  async stop(pid) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  async stop(pid, identity) {
+    const live = liveDirectWorkers.get(workerKey(identity));
+    if (live === undefined) {
+      throw new Error("direct worker session is unavailable after restart; refusing to signal a persisted PID");
     }
+    if (pid !== undefined && live.process?.pid !== pid) {
+      throw new Error("recorded direct worker PID does not match the live owned process");
+    }
+
+    live.stopRequested = true;
+    if (live.process !== undefined) await stopDirectProcess(live.process);
+    await live.completed;
   },
   removeWorkspace: (workspace) => rm(workspace, { recursive: true, force: true }),
 };
@@ -267,11 +325,21 @@ export async function stopAndFinalizeRecordedWorker(
   if (record.metadata.resource === undefined) return { status: "finalized", execution };
 
   try {
-    if (record.metadata.resource.pid !== undefined) await operations.stop(record.metadata.resource.pid);
+    await operations.stop(record.metadata.resource.pid, identity);
+  } catch (error) {
+    return {
+      status: "failed",
+      phase: "stop",
+      execution,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  try {
     await operations.removeWorkspace(record.metadata.resource.workspace);
   } catch (error) {
     return {
       status: "failed",
+      phase: "cleanup",
       execution,
       message: error instanceof Error ? error.message : String(error),
     };
@@ -287,6 +355,7 @@ export async function stopAndFinalizeRecordedWorker(
   } catch (error) {
     return {
       status: "failed",
+      phase: "cleanup",
       execution,
       message: error instanceof Error ? error.message : String(error),
     };
@@ -402,6 +471,17 @@ export async function dispatchLocalTicket(
   let stdout = "";
   let stderr = "";
   let workerRecord: RecordedWorker | undefined;
+  let completeLiveWorker!: () => void;
+  const liveWorker: LiveDirectWorker = {
+    stopRequested: false,
+    completed: new Promise<void>((resolve) => {
+      completeLiveWorker = resolve;
+    }),
+    complete: () => completeLiveWorker(),
+  };
+  const liveWorkerKey = workerKey(identity);
+  if (liveDirectWorkers.has(liveWorkerKey)) throw new Error(`direct worker is already live for Ticket ${liveWorkerKey}`);
+  liveDirectWorkers.set(liveWorkerKey, liveWorker);
 
   try {
     startedAt = clock().toISOString();
@@ -423,6 +503,7 @@ export async function dispatchLocalTicket(
       throw new Error(`local clone started at ${checkoutRevision}, expected ${ticket.metadata.inputRevision}`);
     }
 
+    if (liveWorker.stopRequested) throw new Error("direct worker was stopped before launch");
     const child = Bun.spawn(input.command, {
       cwd: checkout,
       env: {
@@ -438,6 +519,7 @@ export async function dispatchLocalTicket(
       stdout: "pipe",
       stderr: "pipe",
     });
+    liveWorker.process = child;
     workerRecord = {
       ...workerRecord,
       metadata: workerRecordSchema.parse({
@@ -453,19 +535,24 @@ export async function dispatchLocalTicket(
     ]);
     finishedAt = clock().toISOString();
   } finally {
-    await rm(workspace, { recursive: true, force: true });
-    if (workerRecord !== undefined) {
-      finishedAt ||= new Date().toISOString();
-      workerRecord = {
-        ...workerRecord,
-        metadata: workerRecordSchema.parse({
-          ...workerRecord.metadata,
-          resource: undefined,
-          finishedAt,
-          exitCode,
-        }),
-      };
-      await replaceWorkerRecord(repository.root, workerRecord);
+    try {
+      await rm(workspace, { recursive: true, force: true });
+      if (workerRecord !== undefined) {
+        finishedAt ||= new Date().toISOString();
+        workerRecord = {
+          ...workerRecord,
+          metadata: workerRecordSchema.parse({
+            ...workerRecord.metadata,
+            resource: undefined,
+            finishedAt,
+            exitCode,
+          }),
+        };
+        await replaceWorkerRecord(repository.root, workerRecord);
+      }
+    } finally {
+      liveDirectWorkers.delete(liveWorkerKey);
+      liveWorker.complete();
     }
   }
 

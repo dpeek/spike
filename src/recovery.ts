@@ -1,11 +1,6 @@
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import {
-  changeDecisionPath,
-  changePath,
-  loadChange,
-  loadChangeDecisionIfPresent,
-} from "./change.ts";
+import { changePath, loadChange, loadChangeDecisionIfPresent } from "./change.ts";
 import { documentExists, listDirectoryNames } from "./durable-state.ts";
 import { candidateRef } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
@@ -15,16 +10,11 @@ import {
   deriveCurrentCandidate,
   loadReportIfPresent,
   publishInterruptedReport,
+  publishStoppedReport,
   type ReportExecution,
   type TerminalReport,
 } from "./report.ts";
-import {
-  issueReplacementTicket,
-  loadReplacementTicketIfPresent,
-  loadTicket,
-  ticketPath,
-  type IssuedTicket,
-} from "./ticket.ts";
+import { loadTicket, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
   loadRecordedWorkerIfPresent,
@@ -33,24 +23,106 @@ import {
   type TicketIdentity,
 } from "./worker.ts";
 
-export type RecoverInterruptedTicketInput = TicketIdentity & {
+export type StopTicketInput = TicketIdentity & {
   cwd: string;
   role: "implement" | "review";
   reason: string;
   now?: Date;
 };
 
-export type InterruptedTicketRecovery = {
+export type StoppedTicket = {
   root: string;
   report: TerminalReport;
-  replacement: IssuedTicket["ticket"];
   cleanup: { status: "finalized" } | { status: "failed"; message: string };
 };
 
-function interruptionReason(reason: string): string {
+export type RecoverInterruptedTicketInput = StopTicketInput;
+
+export type InterruptedTicketRecovery = {
+  root: string;
+  report: TerminalReport;
+  cleanup: { status: "finalized" } | { status: "failed"; message: string };
+};
+
+function terminalReason(reason: string, label: "Interruption" | "Stop"): string {
   const normalized = reason.trim();
-  if (!normalized) throw new Error("Interruption reason must not be blank");
+  if (!normalized) throw new Error(`${label} reason must not be blank`);
   return normalized;
+}
+
+function interruptionReason(reason: string): string {
+  return terminalReason(reason, "Interruption");
+}
+
+export async function stopTicket(
+  input: StopTicketInput,
+  resourceOperations?: LocalWorkerResourceOperations,
+): Promise<StoppedTicket> {
+  const repository = await discoverRepository(input.cwd);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const reason = terminalReason(input.reason, "Stop");
+  const now = input.now ?? new Date();
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (ticket.metadata.role !== input.role) {
+    throw new Error(`stop role ${input.role} does not match Ticket role ${ticket.metadata.role}`);
+  }
+
+  let report = await loadReportIfPresent(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (report !== undefined && report.metadata.outcome !== "stopped") {
+    throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.ticketId} is already reported as ${report.metadata.outcome}`);
+  }
+  if (report !== undefined && report.body !== `# Ticket stopped\n\n${reason}\n`) {
+    throw new Error("immutable stopped Report records a different stop reason");
+  }
+
+  const recordedWorker = await loadRecordedWorkerIfPresent(repository.root, identity);
+  let cleanup: StoppedTicket["cleanup"] = { status: "finalized" };
+  let execution: ReportExecution;
+  if (recordedWorker === undefined) {
+    const finishedAt = now.toISOString();
+    execution = {
+      ...identity,
+      adapter: "host",
+      isolation: ticket.metadata.executionPolicy.isolation,
+      worker: "not-launched",
+      model: "not-launched",
+      startedAt: ticket.metadata.issuedAt,
+      finishedAt: Date.parse(finishedAt) < Date.parse(ticket.metadata.issuedAt) ? ticket.metadata.issuedAt : finishedAt,
+      exitCode: -1,
+    };
+  } else {
+    const result = await stopAndFinalizeRecordedWorker(repository.root, identity, now, resourceOperations);
+    if (result.status === "failed" && result.phase === "stop") {
+      throw new Error(`direct worker could not be stopped: ${result.message}`);
+    }
+    cleanup = result.status === "failed"
+      ? { status: "failed", message: result.message }
+      : { status: "finalized" };
+    execution = result.execution;
+  }
+
+  if (report === undefined) {
+    report = (
+      await publishStoppedReport({
+        cwd: repository.root,
+        ...identity,
+        role: input.role,
+        reason,
+        execution,
+        now,
+      })
+    ).report;
+  }
+  const stoppedReport = report as TerminalReport;
+
+  if (cleanup.status === "finalized") {
+    try {
+      await forgetFinalizedWorker(repository.root, identity);
+    } catch (error) {
+      cleanup = { status: "failed", message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return { root: repository.root, report: stoppedReport, cleanup };
 }
 
 export async function recoverInterruptedTicket(
@@ -133,17 +205,7 @@ export async function recoverInterruptedTicket(
     }
   }
 
-  const replacement = (
-    await issueReplacementTicket({
-      cwd: repository.root,
-      goalId: input.goalId,
-      changeId: input.changeId,
-      interruptedTicketId: input.ticketId,
-      now,
-    })
-  ).ticket;
-
-  return { root: repository.root, report: interruptedReport, replacement, cleanup };
+  return { root: repository.root, report: interruptedReport, cleanup };
 }
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
@@ -160,7 +222,6 @@ export type ReconciledGoal = {
   integratedRevision: string;
   currentCandidates: Array<{ changeId: string; candidateRevision: string; producingImplementationTicketId: string }>;
   interruptedTickets: Array<InterruptedTicketRecovery>;
-  replacementTickets: IssuedTicket["ticket"][];
   finalizedWorkers: TicketIdentity[];
   cleanupWarnings: Array<{ identity: TicketIdentity; message: string }>;
   discardedRefs: string[];
@@ -289,7 +350,6 @@ export async function reconcileGoal(
   const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
   const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId, changeIds);
   const interruptedTickets: InterruptedTicketRecovery[] = [];
-  const replacementTickets: IssuedTicket["ticket"][] = [];
   const finalizedWorkers: TicketIdentity[] = [];
   const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];
   const ignoredOutputPaths: string[] = [];
@@ -315,7 +375,6 @@ export async function reconcileGoal(
           resourceOperations,
         );
         interruptedTickets.push(recovered);
-        replacementTickets.push(recovered.replacement);
         if (recovered.cleanup.status === "failed") {
           cleanupWarnings.push({ identity, message: recovered.cleanup.message });
         } else if (worker !== undefined) {
@@ -337,22 +396,6 @@ export async function reconcileGoal(
         cleanupWarnings.push({ identity, message: error instanceof Error ? error.message : String(error) });
       }
     }
-
-    if (await documentExists(repository.root, changeDecisionPath(repository.root, input.goalId, changeId))) continue;
-    const refreshedTicketIds = await publishedTicketIds(repository.root, input.goalId, changeId);
-    const latestTicketId = refreshedTicketIds.at(-1);
-    if (latestTicketId === undefined) continue;
-    const latestReport = await loadReportIfPresent(repository.root, input.goalId, changeId, latestTicketId);
-    if (latestReport?.metadata.outcome !== "interrupted") continue;
-    if (await loadReplacementTicketIfPresent(repository.root, input.goalId, changeId, latestTicketId)) continue;
-    const replacement = await issueReplacementTicket({
-      cwd: repository.root,
-      goalId: input.goalId,
-      changeId,
-      interruptedTicketId: latestTicketId,
-      now,
-    });
-    replacementTickets.push(replacement.ticket);
   }
 
   const currentCandidates: ReconciledGoal["currentCandidates"] = [];
@@ -372,7 +415,6 @@ export async function reconcileGoal(
     integratedRevision,
     currentCandidates,
     interruptedTickets,
-    replacementTickets,
     finalizedWorkers,
     cleanupWarnings,
     discardedRefs,

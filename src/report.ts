@@ -225,6 +225,8 @@ export type PublishInterruptedReportInput = TicketIdentity & {
   crash?: CrashInjector;
 };
 
+export type PublishStoppedReportInput = PublishInterruptedReportInput;
+
 const maximumBundleBytes = 100 * 1024 * 1024;
 const maximumArtifactBytes = 16 * 1024 * 1024;
 const maximumArtifactsBytes = 64 * 1024 * 1024;
@@ -483,7 +485,7 @@ function executionMetadata(execution: ReportExecution): z.infer<typeof execution
   return metadata;
 }
 
-function requireTerminalReason(reason: string, outcome: "Failure" | "Interruption"): string {
+function requireTerminalReason(reason: string, outcome: "Failure" | "Interruption" | "Stop"): string {
   const normalized = reason.trim();
   if (!normalized) throw new Error(`${outcome} reason must not be blank`);
   return normalized;
@@ -734,8 +736,9 @@ export async function publishFailedReport(
   return { root: repository.root, report };
 }
 
-export async function publishInterruptedReport(
+async function publishHostTerminalReport(
   input: PublishInterruptedReportInput,
+  outcome: "interrupted" | "stopped",
 ): Promise<{ root: string; report: TerminalReport }> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
@@ -746,26 +749,27 @@ export async function publishInterruptedReport(
 
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   if (input.role !== ticket.metadata.role) {
-    throw new Error(`interrupted Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
+    throw new Error(`${outcome} Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
   matchingReportExecution(input.execution, identity);
   if (input.execution.isolation !== ticket.metadata.executionPolicy.isolation) {
-    throw new Error("interrupted Report execution isolation does not match its Ticket execution policy");
+    throw new Error(`${outcome} Report execution isolation does not match its Ticket execution policy`);
   }
   const execution = executionMetadata(input.execution);
-  const reason = requireTerminalReason(input.reason, "Interruption");
+  const label = outcome === "interrupted" ? "Interruption" : "Stop";
+  const reason = requireTerminalReason(input.reason, label);
   const metadata = terminalReportSchema.parse({
     kind: "report",
     goalId: input.goalId,
     changeId: input.changeId,
     ticketId: input.ticketId,
     role: input.role,
-    outcome: "interrupted",
+    outcome,
     publishedAt: (input.now ?? new Date()).toISOString(),
     artifacts: [],
     execution,
   });
-  const body = `# Ticket interrupted\n\n${reason}\n`;
+  const body = `# Ticket ${outcome}\n\n${reason}\n`;
   const report = { metadata, body };
   await installImmutable(
     repository.root,
@@ -774,6 +778,18 @@ export async function publishInterruptedReport(
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
   return { root: repository.root, report };
+}
+
+export function publishInterruptedReport(
+  input: PublishInterruptedReportInput,
+): Promise<{ root: string; report: TerminalReport }> {
+  return publishHostTerminalReport(input, "interrupted");
+}
+
+export function publishStoppedReport(
+  input: PublishStoppedReportInput,
+): Promise<{ root: string; report: TerminalReport }> {
+  return publishHostTerminalReport(input, "stopped");
 }
 
 export async function publishImplementationReport(
