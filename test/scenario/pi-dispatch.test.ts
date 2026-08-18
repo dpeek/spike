@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
+import { publishImplementationReport } from "../../src/report.ts";
 import { reportPath } from "../../src/ticket.ts";
+import { dispatchPiTicket, loadFinishedLocalExecution, observeWorker } from "../../src/worker.ts";
+import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
@@ -31,7 +34,9 @@ const value = (name) => args[args.indexOf(name) + 1];
 const role = process.env.SPIKE_TICKET_ROLE;
 const completion = role === "implement" ? "spike_complete_implementation" : "spike_complete_review";
 const other = role === "implement" ? "spike_complete_review" : "spike_complete_implementation";
-if (!args.includes("--print") || !args.includes("--no-session") || !args.includes("--no-approve")) throw new Error("Pi session is not fresh");
+const headed = process.env.FAKE_PI_HOST === "herdr";
+if (headed ? args.includes("--print") : !args.includes("--print")) throw new Error("Pi mode does not match its host");
+if (!args.includes("--no-session") || !args.includes("--no-approve")) throw new Error("Pi session is not fresh");
 if (!args.includes("--no-extensions") || !args.includes("--no-context-files") || !args.includes("--no-skills") || !args.includes("--no-prompt-templates")) throw new Error("Pi discovery is not disabled");
 if (value("--model") !== process.env.SPIKE_MODEL || value("--thinking") !== process.env.SPIKE_THINKING) throw new Error("Pi selection is not frozen");
 if (value("--tools") !== "read,bash,edit,write," + completion || value("--tools").includes(other)) throw new Error("wrong completion tool exposure");
@@ -106,6 +111,106 @@ async function issuedRepository() {
 }
 
 describe("controlled Pi dispatch", () => {
+  test("uses headed Pi in Herdr with the immutable prompt and publishes through the standard exchange", async () => {
+    const { repository, goalId } = await issuedRepository();
+    const pi = await fakePi();
+    const argsPath = join(directories[0]!, "headed-args.json");
+    const identity = { goalId, changeId: "001", ticketId: "001" };
+    const issued = await spike(repository.root, [
+      "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Implement through headed Pi.",
+      "--network-access", "unrestricted", "--model", "frozen-headed-model", "--thinking", "high",
+    ]);
+    expect(issued.exitCode).toBe(0);
+
+    let tabInput: CreateHerdrTabInput | undefined;
+    let closes = 0;
+    const herdr: HerdrOperations = {
+      async createTab(input) {
+        tabInput = input;
+        return { tab: "headed-tab", pane: "headed-pane" };
+      },
+      async run(pane, command) {
+        expect(pane).toBe("headed-pane");
+        const child = Bun.spawn([command], {
+          cwd: tabInput!.cwd,
+          env: {
+            ...process.env,
+            ...tabInput!.environment,
+            FAKE_PI_ARGS: argsPath,
+            FAKE_PI_HOST: "herdr",
+          },
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+        expect(stderr).toBe("");
+        expect(code).toBe(0);
+      },
+      async status() { return "done"; },
+      async read() { return "headed Pi transcript"; },
+      async attach() { return 0; },
+      async closeTab() { closes++; },
+    };
+
+    const dispatched = await dispatchPiTicket({
+      cwd: repository.root,
+      ...identity,
+      worker: "headed-pi-implementer",
+      host: "herdr",
+      piExecutable: pi,
+      herdr,
+    });
+    expect(dispatched).toMatchObject({ hosting: "herdr", status: "working" });
+    const headedArgs = JSON.parse(await readFile(argsPath, "utf8")) as string[];
+    expect(headedArgs).not.toContain("--print");
+    expect(headedArgs).toContain("--no-session");
+    expect(headedArgs).toContain("--no-approve");
+    expect(headedArgs).toContain("--no-extensions");
+    expect(headedArgs).toContain("--no-skills");
+    expect(headedArgs).toContain("--no-prompt-templates");
+    expect(headedArgs).toContain("--no-context-files");
+    expect(headedArgs[headedArgs.indexOf("--model") + 1]).toBe("frozen-headed-model");
+    expect(headedArgs[headedArgs.indexOf("--thinking") + 1]).toBe("high");
+    expect(headedArgs[headedArgs.indexOf("--tools") + 1]).toBe("read,bash,edit,write,spike_complete_implementation");
+    expect(headedArgs.filter((arg) => arg === "--extension")).toHaveLength(1);
+    expect(headedArgs[headedArgs.indexOf("--extension") + 1]).toEndWith("/src/pi-worker-extension.ts");
+    expect(headedArgs.at(-1)).toBe(
+      "Execute the attached immutable implement Ticket in this exact checkout. Finish only with spike_complete_implementation.",
+    );
+    expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/ticket.md`);
+    expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/context.md`);
+    expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
+
+    expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
+    const execution = await loadFinishedLocalExecution(repository.root, identity);
+    expect(execution.exitCode).toBe(0);
+    const publication = await publishImplementationReport({
+      cwd: repository.root,
+      ...identity,
+      execution,
+      commitMessage: { summary: "Complete headed Pi dispatch" },
+      resourceOperations: {
+        async stop(_pid, _identity, handles) {
+          expect(handles).toEqual({ tab: "headed-tab", pane: "headed-pane" });
+          expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(true);
+          await herdr.closeTab(handles!.tab);
+        },
+        async removeWorkspace(path) { await rm(path, { recursive: true, force: true }); },
+      },
+    });
+    expect(closes).toBe(1);
+    expect(publication.cleanup).toEqual({ status: "finalized" });
+    expect(publication.report.metadata).toMatchObject({
+      role: "implement",
+      outcome: "completed",
+      inputRevision: issued.output.data.ticket.inputRevision,
+      execution: { model: "frozen-headed-model", thinking: "high" },
+    });
+    expect(await repository.git("show", `${publication.report.metadata.candidateRevision}:pi-dispatched.txt`))
+      .toBe("completed by controlled Pi dispatch");
+  }, 30_000);
+
   test("uses the immutable Ticket selection and role tools, then leaves publication explicit", async () => {
     const { repository, goalId } = await issuedRepository();
     const pi = await fakePi();
@@ -141,6 +246,8 @@ describe("controlled Pi dispatch", () => {
       },
     });
     const implementationArgs = JSON.parse(await readFile(argsPath, "utf8")) as string[];
+    expect(implementationArgs).toContain("--print");
+    expect(implementationArgs).toContain("--no-session");
     expect(implementationArgs.join(" ")).toContain("spike_complete_implementation");
     expect(implementationArgs).not.toContain("--continue");
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);

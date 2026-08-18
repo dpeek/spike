@@ -57,12 +57,15 @@ describe("Pi worker extension", () => {
       followUp: "Review independently.",
       artifacts: [],
     };
+    let shutdowns = 0;
     const result = await tool.execute("call-1", payload, undefined, undefined, {
       cwd: "/worker/repository",
       model: { provider: "openai-codex", id: "gpt-5.6-terra" },
       thinkingLevel: "medium",
+      shutdown: () => shutdowns++,
     });
 
+    expect(shutdowns).toBe(1);
     expect(received).toEqual({
       cwd: "/worker/repository",
       payload,
@@ -78,7 +81,7 @@ describe("Pi worker extension", () => {
 
   test("registers only the role-specific terminating review tool and remains retryable after rejection", async () => {
     const rejected = new Error("Spike rejected worker completion: every criterion must be assessed");
-    let shouldReject = false;
+    let shouldReject = true;
     const tool = captureTool("review", async () => {
       if (shouldReject) throw rejected;
       return {
@@ -98,14 +101,19 @@ describe("Pi worker extension", () => {
       additionalProperties: false,
       required: ["reviewStatement", "findings", "acceptanceAssessment", "verdict", "artifacts"],
     });
+    let shutdowns = 0;
     const context = {
       cwd: "/worker/repository",
       model: { provider: "openai-codex", id: "gpt-5.6-sol" },
       thinkingLevel: "high" as const,
+      shutdown: () => shutdowns++,
     };
-    expect((await tool.execute("call-2", {}, undefined, undefined, context)).terminate).toBe(true);
-    shouldReject = true;
-    await expect(tool.execute("call-3", {}, undefined, undefined, context)).rejects.toBe(rejected);
+    await expect(tool.execute("call-2", {}, undefined, undefined, context)).rejects.toBe(rejected);
+    expect(shutdowns).toBe(0);
+
+    shouldReject = false;
+    expect((await tool.execute("call-3", {}, undefined, undefined, context)).terminate).toBe(true);
+    expect(shutdowns).toBe(1);
   });
 
   test("rejects a completion response for a different Ticket role", async () => {
@@ -121,6 +129,7 @@ describe("Pi worker extension", () => {
       cwd: "/worker/repository",
       model: { provider: "openai-codex", id: "gpt-5.6-sol" },
       thinkingLevel: "high",
+      shutdown: () => undefined,
     })).rejects.toThrow("Spike completed a different Ticket role");
   });
 

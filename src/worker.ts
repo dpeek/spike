@@ -850,7 +850,7 @@ export async function dispatchPiTicket(
   const extension = resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
     input.piExecutable ?? "pi",
-    "--print",
+    ...(input.host === "direct" ? ["--print"] : []),
     "--no-session",
     "--no-approve",
     "--model",

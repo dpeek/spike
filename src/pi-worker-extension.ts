@@ -23,6 +23,7 @@ type ToolContext = {
   cwd: string;
   model?: { provider?: string; id?: string };
   thinkingLevel?: string;
+  shutdown: () => void;
 };
 type ToolDefinition = {
   name: string;
@@ -278,6 +279,7 @@ function toolForRole(
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       });
       if (completion.role !== role) throw new Error("Spike completed a different Ticket role than the active worker tool");
+      context.shutdown();
       return {
         content: [{
           type: "text",

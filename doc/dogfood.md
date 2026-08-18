@@ -24,12 +24,13 @@ From a Herdr-managed planner pane:
      --instruction "..." --network-access unrestricted --json
    ```
    Confirm `ticket.md` freezes the configured implementation model/thinking and exact Change base.
-5. Dispatch a fresh real Pi worker in Herdr:
+5. Dispatch a fresh headed real Pi worker in Herdr:
    ```sh
    spike ticket dispatch-pi --goal <goal> --change 001 --ticket 001 \
      --worker pi-implementer --json
    ```
-6. Observe with `spike worker status` and `spike worker read`. Treat these as operational observations only. Wait for Spike to report `done`, which requires the local execution marker; terminal or Herdr agent state does not complete the Ticket.
+   Confirm the ephemeral tab shows Pi's interactive TUI and that the immutable Ticket/context prompt was submitted automatically. The launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
+6. Observe with `spike worker status` and `spike worker read`, then exercise `spike worker attach` from a real TTY and detach without ending the worker. Treat all terminal interaction as operational only. A rejected completion remains in the same headed Ticket for retry. An accepted completion ends the turn and asks Pi to shut down gracefully. Wait for Spike to report `done`, which still requires the wrapper execution marker with Pi's exit result; terminal or Herdr agent state does not complete the Ticket.
 7. Publish the implementation Report and normalized Candidate:
    ```sh
    spike report publish --goal <goal> --change 001 --ticket 001 \
@@ -128,7 +129,7 @@ Terminal attachment was exercised on live review Ticket `006` through the exact 
 
 Spike's real Herdr projection returned `working`, `blocked`, `working`, then marker-backed `done` for Ticket `006`. The blocked state was induced through Herdr's real `pane.report_agent` socket API with a temporary lifecycle source and observed through both `herdr agent get` and `spike worker status`.
 
-This proves the Herdr-to-Spike blocked-state seam, but it is not a naturally occurring Pi worker prompt. Spike launches workers in headless `--print` mode, while Herdr's installed Pi lifecycle extension deliberately emits blocked events only for interactive TUI root sessions. The current completion extension has no approval or question UI, so a natural blocked event is not reachable in the supported worker path. Treat this as a documented capability boundary unless a real blocking worker interaction is introduced.
+This proves the Herdr-to-Spike blocked-state seam, but it was not a naturally occurring Pi worker prompt. At the time of this historical run Spike launched workers in headless `--print` mode, and Herdr's installed Pi lifecycle extension emitted blocked events only for interactive TUI root sessions. The headed-worker run below supersedes that launch mode. The completion extension still has no approval or question UI, so natural `blocked` remains reachable only if Pi itself enters a supported interactive blocking condition.
 
 ### Attachment failure handling
 
@@ -142,3 +143,39 @@ Final evidence:
 - final Spike status reported healthy cleanup;
 - host `HEAD` remained unchanged;
 - the Goal integration ref equals the exact approved one-parent Candidate.
+
+## Evidence: 2026-08-18 headed Pi lifecycle
+
+Environment:
+
+- disposable repository: `/tmp/spike-headed-dogfood.SyBuT4`
+- Bun `1.4.0`
+- Node `v24.19.0`
+- Pi `0.84.2`
+- Herdr `0.8.0`
+- implementer: `openai-codex/gpt-5.6-terra`, thinking `medium`
+- no Ticket credential grants
+
+Exact workflow evidence:
+
+- Goal: `goal-372237dcaec7d121ba90c31c2c6b84b1`
+- Change/Ticket: `001/001`
+- initial and Ticket input revision: `edfe19906cfc05e2406998d21da2b7a3ba21ccea`
+- ephemeral tab/pane: `w6:tE` / `w6:pE`
+- worker revision: `f7fbb4a219fb078dd5e9d48d5cbb65fbe4b20e98`
+- normalized Candidate: `e0551633fcf1f3ae766140b3d5de15503d0060cc`
+- Report SHA-256: `cde570db794a25811402b529c9df9f4e7e7d90fb4d641dd347713541d1bdd139`
+- artifact SHA-256: `f755a29501902024be4321752151f09b1694c32b925e8d74d7b1b0afc7876684`
+
+The Herdr tab visibly rendered Pi's headed TUI, the attached Ticket/context, live reasoning, built-in tool calls, and the frozen model/thinking footer. The initial prompt was submitted without planner input. `spike worker read` returned live progress while status was naturally `working`. A pseudo-TTY invocation of the exact `spike worker attach` command attached and detached with Herdr's `Ctrl+B`, `q` binding and exit code zero; the worker continued.
+
+Pi created `greet.ts` and `greet.test.ts`, ran `bun test` with one pass and zero failures, and called `spike_complete_implementation`. Spike accepted the structured completion. The tool returned a terminating result and requested `ctx.shutdown()`; Pi exited cleanly to the tab shell, the wrapper wrote a zero-exit execution marker, and only then did Spike report `done`. Before publication, the Submission and marker existed while the Ticket remained open and tab `w6:tE` remained present.
+
+Report publication validated the standard exchange, installed the immutable Report, normalized the exact worker tree, and only then closed `w6:tE` and removed the runtime workspace. The Candidate's sole parent is the Ticket input revision, its `greet.ts` exports `greet(name)` returning `Hello, name!`, host `HEAD` remained `edfe19906cfc05e2406998d21da2b7a3ba21ccea`, final cleanup was healthy, and no worker runtime record remained.
+
+### Capability boundaries
+
+- Natural `working` and marker-backed `done` were observed. Natural `blocked` was not reached: this Ticket required no approval, question UI, or other supported interactive blocking condition. The headed TUI makes such a state observable when Pi emits it, but Spike does not manufacture one.
+- Terminal read and attachment are operational surfaces only; neither changed the Submission, Report, or Ticket status.
+- A focused deterministic extension test proves a rejected completion does not request shutdown and a corrected accepted retry does. The attended model completed validly on its first completion call, so rejection was not artificially induced in the live run.
+- Direct Pi remains headless `--print --no-session`; Docker was not exercised and remains Phase 3.

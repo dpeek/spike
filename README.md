@@ -54,14 +54,16 @@ Ticket uses its role's `implement` or `review` selection from `spike.json`.
 `--network-access unrestricted` is the explicit acknowledgement required by the
 Phase 2 local-clone adapter, which provides workspace separation but cannot
 restrict host networking.
-Pi dispatch accepts no model, thinking, role, prompt, or extension overrides. It
-launches one fresh non-interactive Pi process with the immutable selection from
-`ticket.md`, the role-specific completion extension, and the exact Ticket input
-revision. Attended dispatch defaults to one named ephemeral Herdr tab. Spike
-persists only its opaque tab and pane handles as Herdr state; status and terminal
-text remain observational. Dispatch returns after launch so the planner can
-observe `working` or `blocked` workers. Exchange output remains staging until a
-separate publication command:
+Pi dispatch accepts no model, thinking, role, prompt, or extension overrides.
+Attended dispatch defaults to one headed interactive Pi TUI in a named ephemeral
+Herdr tab. It uses the immutable selection from `ticket.md`, automatically
+submits the Ticket/context prompt, disables extension, skill, prompt-template,
+and context-file discovery, explicitly loads only the role-specific completion
+extension, and starts at the exact Ticket
+input revision. Spike persists only opaque tab and pane handles as Herdr state;
+status and terminal text remain observational. Dispatch returns after launch so
+the planner can observe `working` or `blocked` workers. Exchange output remains
+staging until a separate publication command:
 
 ```bash
 spike ticket dispatch-pi \
@@ -85,7 +87,7 @@ Herdr `working`, `blocked`, `done`, or unavailable status and terminal output
 cannot complete the Ticket or publish a Report. Report publication validates only
 the standard exchange and then closes the tab; stop and cleanup can be retried.
 
-Direct Pi launch is an explicit controlled-test fallback:
+Direct Pi launch is an explicit headless `--print --no-session` controlled-test fallback:
 
 ```bash
 spike ticket dispatch-pi \
@@ -121,8 +123,9 @@ The Pi worker extension is `src/pi-worker-extension.ts`. Ticket launchers load
 it with exactly one terminating tool selected by the immutable Ticket role:
 `spike_complete_implementation` or `spike_complete_review`. The extension sends
 tool arguments to `spike worker complete --json`; it does not import Spike
-internals or format durable files. A rejected payload remains retryable and
-only an accepted completion terminates the agent turn.
+internals or format durable files. A rejected payload remains retryable. An
+accepted completion terminates the agent turn and requests Pi's supported
+graceful shutdown; the Herdr wrapper then records the process exit.
 
 A completed review Report needs no commit message options. To seal a worker
 failure instead, use `--failure "<reason>"`. Report publication returns worker

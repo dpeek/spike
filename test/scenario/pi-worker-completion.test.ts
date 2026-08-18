@@ -26,6 +26,7 @@ if (tools.length !== 1 || tools[0].name !== "spike_complete_implementation") {
   throw new Error("implementation completion tool was not selected");
 }
 await writeFile("pi-completed.txt", "completed through the Pi extension\\n");
+let shutdowns = 0;
 const result = await tools[0].execute("completion-1", {
   summary: "Completed through the Pi extension.",
   verification: "The focused extension scenario passed.",
@@ -38,8 +39,10 @@ const result = await tools[0].execute("completion-1", {
   cwd: process.cwd(),
   model: { provider: "openai-codex", id: "gpt-5.6-terra" },
   thinkingLevel: "medium",
+  shutdown: () => shutdowns++,
 });
 if (result.terminate !== true) throw new Error("accepted completion did not terminate the agent turn");
+if (shutdowns !== 1) throw new Error("accepted completion did not request graceful shutdown");
 `;
 
 describe("Pi worker completion boundary", () => {
