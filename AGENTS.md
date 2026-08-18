@@ -1,5 +1,3 @@
-# Spike
-
 Minimalism and simplicity above all else. Follow `doc/workflow.md` and use its domain terms consistently.
 
 ## Runtime and tooling
@@ -27,3 +25,11 @@ Minimalism and simplicity above all else. Follow `doc/workflow.md` and use its d
 - Use real temporary filesystems and real Git. Do not add in-memory filesystem or Git implementations.
 - No sleeps, network, Docker, Pi, Herdr, or model calls in the default suite.
 - Keep Docker and external integration smoke tests explicit and minimal.
+
+# Rules
+
+- Keep responses concise
+- Prefer Bun over Node + NPM
+- Automate using Bun scripts
+- Preserve user changes
+- Tests + checks should be fast + useful
