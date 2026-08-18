@@ -14,6 +14,7 @@ import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { planPath, revisePlan } from "./plan.ts";
+import { launchPlanner } from "./planner.ts";
 import {
   publishFailedReport,
   publishImplementationReport,
@@ -37,6 +38,7 @@ export function usage(): string {
   return `spike ${version}
 
 Usage:
+  spike planner
   spike status [--goal <goal-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
@@ -533,6 +535,15 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     }
     if (args.length === 1 && ["--version", "-V"].includes(args[0]!)) {
       return success(json, "version", { version }, `${version}\n`);
+    }
+
+    if (args[0] === "planner") {
+      if (args.length !== 1) throw new UsageError(`unknown planner option: ${args[1]}`);
+      if (json) throw new UsageError("planner does not support --json");
+      return launchPlanner({
+        cwd,
+        ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
+      });
     }
 
     if (args[0] === "status") {

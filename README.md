@@ -99,6 +99,21 @@ A completed review Report needs no commit message options. To seal a worker
 failure instead, use `--failure "<reason>"`. Report publication returns worker
 cleanup status and retains a warning when finalization must be retried.
 
+The direct planner launcher starts interactive Pi with the configured `planner`
+model and thinking level. It disables extension discovery, explicitly loads only
+`src/pi-supervisor-extension.ts`, and passes Spike's executable to that extension:
+
+```bash
+spike planner
+```
+
+The supervisor extension exposes sequential structured tools for status, Plan
+revision, Change creation and decisions, Ticket issuance and Pi dispatch, Report
+publication, and recovery. Every tool invokes Spike with an argument array and
+parses its single `--json` response. Planner prose, worker terminal output, and
+Pi exit status never become workflow facts; a successful Report publication or
+Change decision remains the relevant immutable commit point.
+
 Planner-facing commands derive status from durable documents, atomically revise
 the Plan, resolve Changes, and reconcile interrupted repository state:
 
