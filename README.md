@@ -18,7 +18,7 @@ bun run check
 bin/spike --help
 ```
 
-The Phase 1 prototype can create an approved Goal and Plan, allocate a Change,
+The Phase 1 foundation can create an approved Goal and Plan, allocate a Change,
 and issue its first implementation Ticket in any Git repository with a commit:
 
 ```bash

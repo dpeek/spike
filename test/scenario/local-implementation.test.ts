@@ -134,7 +134,7 @@ async function makeInputRemovable(inputDirectory: string): Promise<void> {
 }
 
 describe("host-local implementation exchange", () => {
-  test("validates exchange output, then publishes exact Git evidence after the disposable worker exits", async () => {
+  test("validates exchange output, then publishes exact Git evidence after the ephemeral worker exits", async () => {
     const fixtureValue = await fixture();
     const { repository, goalId, ticketId, baseRevision, hostHead, dirtyDiff, indexTree, dispatched } = fixtureValue;
     expect(dispatched.execution.exitCode).toBe(0);
