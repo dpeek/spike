@@ -191,6 +191,17 @@ async function unresolvedChangeId(root: string, goalId: string): Promise<string 
   return undefined;
 }
 
+export async function listChangeIds(root: string, goalId: string): Promise<string[]> {
+  const changeIds = await allocatedChangeIds(root, goalId);
+  const published: string[] = [];
+  for (const changeId of changeIds) {
+    if (!(await documentExists(root, changePath(root, goalId, changeId)))) continue;
+    await loadChange(root, goalId, changeId);
+    published.push(changeId);
+  }
+  return published;
+}
+
 export async function loadChange(root: string, goalId: string, changeId: string): Promise<Change> {
   const document = await readDocument(root, changePath(root, goalId, changeId));
   const metadata = changeSchema.parse(document.metadata);

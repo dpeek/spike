@@ -2,7 +2,13 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
-import { installImmutable, readDocument, serializeDocument } from "./durable-state.ts";
+import {
+  documentExists,
+  installImmutable,
+  listDirectoryNames,
+  readDocument,
+  serializeDocument,
+} from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { createInitialPlan, type Plan } from "./plan.ts";
 
@@ -112,6 +118,18 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   await git(repository.root, ["update-ref", integratedRef(goalId), repository.head]);
 
   return { root: repository.root, goal: { metadata, body }, plan };
+}
+
+export async function listGoalIds(root: string): Promise<string[]> {
+  const goals = join(root, ".spike", "goals");
+  const goalIds = (await listDirectoryNames(root, goals)).filter((name) => goalIdPattern.test(name)).sort();
+  const published: string[] = [];
+  for (const goalId of goalIds) {
+    if (!(await documentExists(root, goalPath(root, goalId)))) continue;
+    await loadGoal(root, goalId);
+    published.push(goalId);
+  }
+  return published;
 }
 
 export async function loadGoal(root: string, goalId: string): Promise<Goal> {

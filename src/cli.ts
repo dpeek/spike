@@ -1,10 +1,26 @@
 #!/usr/bin/env bun
 
-import { relative } from "node:path";
-import { changePath, createChange } from "./change.ts";
+import { readFile } from "node:fs/promises";
+import { relative, resolve } from "node:path";
+import {
+  abandonChange,
+  changePath,
+  createChange,
+  landChange,
+  rejectChange,
+  type ChangeDecision,
+} from "./change.ts";
 import type { ThinkingLevel } from "./config.ts";
+import { discoverRepository } from "./git.ts";
 import { createGoal, goalPath } from "./goal.ts";
-import { planPath } from "./plan.ts";
+import { planPath, revisePlan } from "./plan.ts";
+import { reconcileGoal, reconcileRepository, type ReconciledGoal } from "./recovery.ts";
+import {
+  deriveGoalStatus,
+  deriveRepositoryStatus,
+  type DerivedGoalStatus,
+  type DerivedRepositoryStatus,
+} from "./status.ts";
 import { issueTicket, ticketPath, type ExecutionPolicy } from "./ticket.ts";
 
 export const version = "2.0.0-dev";
@@ -13,35 +29,81 @@ export function usage(): string {
   return `spike ${version}
 
 Usage:
+  spike status [--goal <goal-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
+  spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike change create --goal <goal-id> --title <title> --intent <intent> --rationale <rationale> --acceptance <criterion> [options]
+  spike change land --goal <goal-id> --change <change-id> [--statement <statement>] [--json]
+  spike change reject --goal <goal-id> --change <change-id> --statement <statement> [--json]
+  spike change abandon --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
+  spike recover [--goal <goal-id>] [--reason <reason>] [--json]
   spike --help
   spike --version
 
+Global options:
+  --json                         Emit one JSON object on success or failure
+
+Plan revision options:
+  --file <path>                  Read the Plan body from a file; omit or use - for stdin
+
 Goal creation options:
-  --constraint <constraint>       Repeat for each constraint
-  --repository-id <identity>      Override the inferred repository identity
+  --constraint <constraint>      Repeat for each constraint
+  --repository-id <identity>     Override the inferred repository identity
 
 Change creation options:
-  --acceptance <criterion>        Repeat for each acceptance criterion
-  --non-goal <non-goal>           Repeat for each non-goal
-  --dependency <dependency>       Repeat for each dependency
+  --acceptance <criterion>       Repeat for each acceptance criterion
+  --non-goal <non-goal>          Repeat for each non-goal
+  --dependency <dependency>      Repeat for each dependency
 
 Ticket issuance options:
   --role <role>                  implement (default) or review
   --implementation-ticket <id>   Producing Ticket; derived for review when omitted
-  --remediation-review <id>       Remediate review Ticket; derived for implementation
-  --context <context>             Additional planner-curated context
-  --isolation <level>             workspace (default) or container
-  --network-access <access>       none (default), restricted, or unrestricted
-  --credential <grant-id>         Repeat for each credential grant identifier
-  --model <model>                 Override the role's configured model for this Ticket
-  --thinking <level>              Override thinking: off, minimal, low, medium, high, or xhigh
+  --remediation-review <id>      Remediate review Ticket; derived for implementation
+  --context <context>            Additional planner-curated context
+  --isolation <level>            workspace (default) or container
+  --network-access <access>      none (default), restricted, or unrestricted
+  --credential <grant-id>        Repeat for each credential grant identifier
+  --model <model>                Override the role's configured model for this Ticket
+  --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
 `;
 }
 
 class UsageError extends Error {}
+
+type JsonSuccess = { ok: true; command: string; data: unknown };
+type JsonFailure = { ok: false; command: string; error: { code: "usage" | "workflow"; message: string } };
+
+function emitJson(value: JsonSuccess | JsonFailure): void {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function success(json: boolean, command: string, data: unknown, human: string): number {
+  if (json) emitJson({ ok: true, command, data });
+  else process.stdout.write(human);
+  return 0;
+}
+
+function failure(json: boolean, command: string, error: unknown): number {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error instanceof UsageError ? "usage" : "workflow";
+  if (json) emitJson({ ok: false, command, error: { code, message } });
+  else process.stderr.write(`spike: ${message}\n`);
+  return code === "usage" ? 2 : 1;
+}
+
+function extractJson(args: string[]): { args: string[]; json: boolean } {
+  const count = args.filter((arg) => arg === "--json").length;
+  if (count > 1) throw new UsageError("--json may be specified only once");
+  return { args: args.filter((arg) => arg !== "--json"), json: count === 1 };
+}
+
+function commandName(args: string[]): string {
+  if (args.length === 0 || ["--help", "-h"].includes(args[0]!)) return "help";
+  if (["--version", "-V"].includes(args[0]!)) return "version";
+  if (args[0] === "status" || args[0] === "recover") return args[0];
+  return args.slice(0, 2).join(" ");
+}
 
 function valueAfter(args: string[], index: number, option: string): string {
   const value = args[index + 1];
@@ -66,23 +128,12 @@ function parseGoalCreate(args: string[]): {
     const option = args[index]!;
     const value = valueAfter(args, index, option);
     switch (option) {
-      case "--title":
-        title = value;
-        break;
-      case "--outcome":
-        outcome = value;
-        break;
-      case "--approval":
-        approval = value;
-        break;
-      case "--constraint":
-        constraints.push(value);
-        break;
-      case "--repository-id":
-        repositoryIdentity = value;
-        break;
-      default:
-        throw new UsageError(`unknown option: ${option}`);
+      case "--title": title = value; break;
+      case "--outcome": outcome = value; break;
+      case "--approval": approval = value; break;
+      case "--constraint": constraints.push(value); break;
+      case "--repository-id": repositoryIdentity = value; break;
+      default: throw new UsageError(`unknown option: ${option}`);
     }
   }
 
@@ -113,29 +164,14 @@ function parseChangeCreate(args: string[]): {
     const option = args[index]!;
     const value = valueAfter(args, index, option);
     switch (option) {
-      case "--goal":
-        goalId = value;
-        break;
-      case "--title":
-        title = value;
-        break;
-      case "--intent":
-        intent = value;
-        break;
-      case "--rationale":
-        rationale = value;
-        break;
-      case "--acceptance":
-        acceptanceCriteria.push(value);
-        break;
-      case "--non-goal":
-        nonGoals.push(value);
-        break;
-      case "--dependency":
-        dependencies.push(value);
-        break;
-      default:
-        throw new UsageError(`unknown option: ${option}`);
+      case "--goal": goalId = value; break;
+      case "--title": title = value; break;
+      case "--intent": intent = value; break;
+      case "--rationale": rationale = value; break;
+      case "--acceptance": acceptanceCriteria.push(value); break;
+      case "--non-goal": nonGoals.push(value); break;
+      case "--dependency": dependencies.push(value); break;
+      default: throw new UsageError(`unknown option: ${option}`);
     }
   }
 
@@ -176,28 +212,16 @@ function parseTicketIssue(args: string[]): {
     const option = args[index]!;
     const value = valueAfter(args, index, option);
     switch (option) {
-      case "--goal":
-        goalId = value;
-        break;
-      case "--change":
-        changeId = value;
-        break;
-      case "--instruction":
-        instruction = value;
-        break;
-      case "--context":
-        curatedContext = value;
-        break;
+      case "--goal": goalId = value; break;
+      case "--change": changeId = value; break;
+      case "--instruction": instruction = value; break;
+      case "--context": curatedContext = value; break;
       case "--role":
         if (value !== "implement" && value !== "review") throw new UsageError(`unsupported Ticket role: ${value}`);
         role = value;
         break;
-      case "--implementation-ticket":
-        producingImplementationTicketId = value;
-        break;
-      case "--remediation-review":
-        remediationReviewTicketId = value;
-        break;
+      case "--implementation-ticket": producingImplementationTicketId = value; break;
+      case "--remediation-review": remediationReviewTicketId = value; break;
       case "--isolation":
         if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
         isolation = value;
@@ -208,20 +232,15 @@ function parseTicketIssue(args: string[]): {
         }
         networkAccess = value;
         break;
-      case "--credential":
-        credentialGrants.push(value);
-        break;
-      case "--model":
-        model = value;
-        break;
+      case "--credential": credentialGrants.push(value); break;
+      case "--model": model = value; break;
       case "--thinking":
         if (!["off", "minimal", "low", "medium", "high", "xhigh"].includes(value)) {
           throw new UsageError(`invalid thinking level: ${value}`);
         }
         thinking = value as ThinkingLevel;
         break;
-      default:
-        throw new UsageError(`unknown option: ${option}`);
+      default: throw new UsageError(`unknown option: ${option}`);
     }
   }
 
@@ -242,58 +261,239 @@ function parseTicketIssue(args: string[]): {
   };
 }
 
-export async function run(args = process.argv.slice(2), cwd = process.cwd()): Promise<number> {
-  if (args.length === 0 || (args.length === 1 && ["--help", "-h"].includes(args[0]!))) {
-    process.stdout.write(usage());
-    return 0;
-  }
+function parseStatus(args: string[]): { goalId?: string } {
+  if (args.length === 0) return {};
+  if (args.length !== 2 || args[0] !== "--goal") throw new UsageError(`unknown status option: ${args[0]}`);
+  return { goalId: valueAfter(args, 0, "--goal") };
+}
 
-  if (args.length === 1 && ["--version", "-V"].includes(args[0]!)) {
-    process.stdout.write(`${version}\n`);
-    return 0;
+function parsePlanRevise(args: string[]): { goalId: string; file?: string } {
+  let goalId: string | undefined;
+  let file: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--file") file = value;
+    else throw new UsageError(`unknown option: ${option}`);
   }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  return { goalId, ...(file === undefined ? {} : { file }) };
+}
 
+function parseChangeDecision(
+  args: string[],
+  disposition: "land" | "reject" | "abandon",
+): { goalId: string; changeId: string; statement?: string } {
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let statement: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else if (option === "--statement") statement = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (disposition !== "land" && statement === undefined) throw new UsageError("--statement is required");
+  return { goalId, changeId, ...(statement === undefined ? {} : { statement }) };
+}
+
+function parseRecover(args: string[]): { goalId?: string; reason?: string } {
+  let goalId: string | undefined;
+  let reason: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--reason") reason = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  return {
+    ...(goalId === undefined ? {} : { goalId }),
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+async function stdinText(): Promise<string> {
+  process.stdin.setEncoding("utf8");
+  let source = "";
+  for await (const chunk of process.stdin) source += chunk;
+  return source;
+}
+
+async function planBody(cwd: string, file: string | undefined): Promise<string> {
+  return file === undefined || file === "-" ? stdinText() : readFile(resolve(cwd, file), "utf8");
+}
+
+function humanGoalStatus(status: DerivedGoalStatus): string {
+  const lines = [`Goal ${status.goalId}`, `  Integrated ${status.integratedRevision}`];
+  const change = status.currentChange;
+  if (change === null) lines.push("  Current Change none");
+  else {
+    lines.push(`  Current Change ${change.changeId}`);
+    lines.push(`  Candidate ${change.candidate?.revision ?? "none"}`);
+    lines.push(change.review === null ? "  Review none" : `  Review ${change.review.verdict} (Ticket ${change.review.ticketId})`);
+    lines.push(change.openTicket === null ? "  Open Ticket none" : `  Open Ticket ${change.openTicket.ticketId} (${change.openTicket.role})`);
+    if (change.churnWarnings.length > 0) lines.push(`  Churn warnings ${change.churnWarnings.length}`);
+  }
+  for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
+  lines.push(status.cleanup.healthy ? "  Cleanup healthy" : `  Cleanup warnings ${status.cleanup.warnings.length}`);
+  return `${lines.join("\n")}\n`;
+}
+
+function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
+  if (status.goals.length === 0) return `Repository ${status.root}\n  No Goals\n  Cleanup healthy\n`;
+  return `Repository ${status.root}\n${status.goals.map(humanGoalStatus).join("")}`;
+}
+
+function decisionData(decision: ChangeDecision): unknown {
+  return { ...decision.metadata, statement: decision.body.trim() };
+}
+
+function humanReconciliation(goals: ReconciledGoal[], ignored = 0): string {
+  const lines = [`Reconciled ${goals.length} Goal${goals.length === 1 ? "" : "s"}`];
+  for (const goal of goals) {
+    lines.push(
+      `  ${goal.goalId}: ${goal.integratedRevision}; interrupted ${goal.interruptedTickets.length}; cleanup warnings ${goal.cleanupWarnings.length}`,
+    );
+  }
+  if (ignored > 0) lines.push(`Ignored unpublished Goals ${ignored}`);
+  return `${lines.join("\n")}\n`;
+}
+
+export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()): Promise<number> {
+  let args = rawArgs.filter((arg) => arg !== "--json");
+  let json = rawArgs.includes("--json");
+  let command = commandName(args);
   try {
+    ({ args, json } = extractJson(rawArgs));
+    command = commandName(args);
+
+    if (args.length === 0 || (args.length === 1 && ["--help", "-h"].includes(args[0]!))) {
+      return success(json, "help", { version, usage: usage() }, usage());
+    }
+    if (args.length === 1 && ["--version", "-V"].includes(args[0]!)) {
+      return success(json, "version", { version }, `${version}\n`);
+    }
+
+    if (args[0] === "status") {
+      const input = parseStatus(args.slice(1));
+      const status = input.goalId === undefined
+        ? await deriveRepositoryStatus(cwd)
+        : await deriveGoalStatus(cwd, input.goalId);
+      return success(
+        json,
+        "status",
+        status,
+        input.goalId === undefined
+          ? humanRepositoryStatus(status as DerivedRepositoryStatus)
+          : humanGoalStatus(status as DerivedGoalStatus),
+      );
+    }
+
     if (args[0] === "goal" && args[1] === "create") {
       const input = parseGoalCreate(args.slice(2));
       const created = await createGoal({ cwd, ...input });
       const goalId = created.goal.metadata.goalId;
-      process.stdout.write(
+      return success(
+        json,
+        "goal create",
+        {
+          goal: created.goal.metadata,
+          paths: {
+            goal: relative(created.root, goalPath(created.root, goalId)),
+            plan: relative(created.root, planPath(created.root, goalId)),
+          },
+        },
         `Created Goal ${goalId}\n` +
           `  ${relative(created.root, goalPath(created.root, goalId))}\n` +
           `  ${relative(created.root, planPath(created.root, goalId))}\n`,
       );
-      return 0;
+    }
+
+    if (args[0] === "plan" && args[1] === "revise") {
+      const input = parsePlanRevise(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      const revised = await revisePlan(repository.root, input.goalId, await planBody(cwd, input.file));
+      return success(
+        json,
+        "plan revise",
+        { metadata: revised.metadata, body: revised.body },
+        `Revised Plan ${input.goalId}\n`,
+      );
     }
 
     if (args[0] === "change" && args[1] === "create") {
       const input = parseChangeCreate(args.slice(2));
       const created = await createChange({ cwd, ...input });
       const { goalId, changeId } = created.change.metadata;
-      process.stdout.write(
+      return success(
+        json,
+        "change create",
+        {
+          change: created.change.metadata,
+          path: relative(created.root, changePath(created.root, goalId, changeId)),
+        },
         `Created Change ${goalId}/${changeId}\n` +
           `  ${relative(created.root, changePath(created.root, goalId, changeId))}\n`,
       );
-      return 0;
+    }
+
+    if (args[0] === "change" && ["land", "reject", "abandon"].includes(args[1] ?? "")) {
+      const disposition = args[1] as "land" | "reject" | "abandon";
+      const input = parseChangeDecision(args.slice(2), disposition);
+      const resolved = disposition === "land"
+        ? await landChange({ cwd, goalId: input.goalId, changeId: input.changeId, ...(input.statement === undefined ? {} : { statement: input.statement }) })
+        : disposition === "reject"
+          ? await rejectChange({ cwd, goalId: input.goalId, changeId: input.changeId, statement: input.statement! })
+          : await abandonChange({ cwd, goalId: input.goalId, changeId: input.changeId, statement: input.statement! });
+      return success(
+        json,
+        `change ${disposition}`,
+        decisionData(resolved.decision),
+        `${disposition === "land" ? "Landed" : disposition === "reject" ? "Rejected" : "Abandoned"} Change ${input.goalId}/${input.changeId}\n`,
+      );
     }
 
     if (args[0] === "ticket" && args[1] === "issue") {
       const input = parseTicketIssue(args.slice(2));
       const issued = await issueTicket({ cwd, ...input });
       const { goalId, changeId, ticketId } = issued.ticket.metadata;
-      process.stdout.write(
+      return success(
+        json,
+        "ticket issue",
+        {
+          ticket: issued.ticket.metadata,
+          path: relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId)),
+        },
         `Issued Ticket ${goalId}/${changeId}/${ticketId}\n` +
           `  ${relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId))}\n`,
       );
-      return 0;
     }
-  } catch (error) {
-    process.stderr.write(`spike: ${error instanceof Error ? error.message : String(error)}\n`);
-    return error instanceof UsageError ? 2 : 1;
-  }
 
-  process.stderr.write(`spike: unknown command: ${args.join(" ")}\n`);
-  return 2;
+    if (args[0] === "recover") {
+      const input = parseRecover(args.slice(1));
+      if (input.goalId === undefined) {
+        const reconciled = await reconcileRepository({ cwd, ...(input.reason === undefined ? {} : { reason: input.reason }) });
+        return success(
+          json,
+          "recover",
+          reconciled,
+          humanReconciliation(reconciled.goals, reconciled.ignoredUnpublishedGoalIds.length),
+        );
+      }
+      const reconciled = await reconcileGoal({ cwd, goalId: input.goalId, ...(input.reason === undefined ? {} : { reason: input.reason }) });
+      return success(json, "recover", reconciled, humanReconciliation([reconciled]));
+    }
+
+    throw new UsageError(`unknown command: ${args.join(" ")}`);
+  } catch (error) {
+    return failure(json, command, error);
+  }
 }
 
 if (import.meta.main) process.exit(await run());

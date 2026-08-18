@@ -170,6 +170,17 @@ ${context === undefined || !context.trim() ? "None." : context.trim()}
 ${relevantReport === undefined ? "" : `### ${relevantReport.heading}\n\n${relevantReport.document.trimEnd()}\n`}`;
 }
 
+export async function listTicketIds(root: string, goalId: string, changeId: string): Promise<string[]> {
+  const ticketIds = await allocatedTicketIds(root, goalId, changeId);
+  const published: string[] = [];
+  for (const ticketId of ticketIds) {
+    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    await loadTicket(root, goalId, changeId, ticketId);
+    published.push(ticketId);
+  }
+  return published;
+}
+
 export async function loadTicket(root: string, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
   const document = await readDocument(root, ticketPath(root, goalId, changeId, ticketId));
   const metadata = ticketSchema.parse(document.metadata);
@@ -189,6 +200,15 @@ export async function ticketStatus(
 ): Promise<TicketStatus> {
   await loadTicket(root, goalId, changeId, ticketId);
   return (await loadReportIfPresent(root, goalId, changeId, ticketId)) === undefined ? "open" : "reported";
+}
+
+export async function loadOpenTicket(
+  root: string,
+  goalId: string,
+  changeId: string,
+): Promise<Ticket | undefined> {
+  const ticketId = await openTicketId(root, goalId, changeId);
+  return ticketId === undefined ? undefined : loadTicket(root, goalId, changeId, ticketId);
 }
 
 export async function loadReplacementTicketIfPresent(

@@ -49,3 +49,18 @@ spike ticket issue \
 
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
+
+Planner-facing commands derive status from durable documents, atomically revise
+the Plan, resolve Changes, and reconcile interrupted repository state:
+
+```bash
+spike status [--goal <goal-id>] [--json]
+spike plan revise --goal <goal-id> [--file plan.md] [--json] # stdin when omitted
+spike change land --goal <goal-id> --change 001 [--json]
+spike change reject --goal <goal-id> --change 001 --statement "..." [--json]
+spike change abandon --goal <goal-id> --change 001 --statement "..." [--json]
+spike recover [--goal <goal-id>] [--json]
+```
+
+JSON mode emits exactly one `{ ok, command, data }` success object or one
+`{ ok, command, error }` failure object.
