@@ -30,7 +30,14 @@ import {
 } from "./status.ts";
 import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
 import { completeWorker, readWorkerPayload } from "./worker-completion.ts";
-import { dispatchLocalTicket, dispatchPiTicket, loadFinishedLocalExecution } from "./worker.ts";
+import {
+  attachWorkerTerminal,
+  dispatchLocalTicket,
+  dispatchPiTicket,
+  loadFinishedLocalExecution,
+  observeWorker,
+  readWorkerTerminal,
+} from "./worker.ts";
 
 export const version = "2.0.0-dev";
 
@@ -47,8 +54,11 @@ Usage:
   spike change reject --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike change abandon --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
-  spike ticket dispatch-pi --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity>
+  spike ticket dispatch-pi --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> [--host herdr|direct]
   spike ticket dispatch-test --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
+  spike worker status --goal <goal-id> --change <change-id> --ticket <ticket-id> [--json]
+  spike worker read --goal <goal-id> --change <change-id> --ticket <ticket-id> [--lines <count>] [--ansi] [--json]
+  spike worker attach --goal <goal-id> --change <change-id> --ticket <ticket-id>
   spike worker complete [--file <payload.json>] [--json]
   spike report publish --goal <goal-id> --change <change-id> --ticket <ticket-id> [options]
   spike recover [--goal <goal-id>] [--reason <reason>] [--json]
@@ -83,6 +93,11 @@ Ticket issuance options:
 
 Pi dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
+  --host <herdr|direct>           Herdr (default); direct is the controlled-test fallback
+
+Worker observation options:
+  --lines <count>                 Terminal rows to read (default 120)
+  --ansi                          Preserve terminal styling when reading
 
 Controlled-test dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
@@ -302,11 +317,13 @@ function parsePiDispatch(args: string[]): {
   changeId: string;
   ticketId: string;
   worker: string;
+  host?: "herdr" | "direct";
 } {
   let goalId: string | undefined;
   let changeId: string | undefined;
   let ticketId: string | undefined;
   let worker: string | undefined;
+  let host: "herdr" | "direct" | undefined;
   for (let index = 0; index < args.length; index += 2) {
     const option = args[index]!;
     const value = valueAfter(args, index, option);
@@ -314,13 +331,16 @@ function parsePiDispatch(args: string[]): {
     else if (option === "--change") changeId = value;
     else if (option === "--ticket") ticketId = value;
     else if (option === "--worker") worker = value;
-    else throw new UsageError(`unknown option: ${option}`);
+    else if (option === "--host") {
+      if (value !== "herdr" && value !== "direct") throw new UsageError(`unsupported Pi worker host: ${value}`);
+      host = value;
+    } else throw new UsageError(`unknown option: ${option}`);
   }
   if (goalId === undefined) throw new UsageError("--goal is required");
   if (changeId === undefined) throw new UsageError("--change is required");
   if (ticketId === undefined) throw new UsageError("--ticket is required");
   if (worker === undefined) throw new UsageError("--worker is required");
-  return { goalId, changeId, ticketId, worker };
+  return { goalId, changeId, ticketId, worker, ...(host === undefined ? {} : { host }) };
 }
 
 function parseTestDispatch(args: string[]): {
@@ -364,6 +384,47 @@ function parseTestDispatch(args: string[]): {
     command,
     ...(environmentDigest === undefined ? {} : { environmentDigest }),
   };
+}
+
+function parseWorkerIdentity(args: string[]): { goalId: string; changeId: string; ticketId: string } {
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let ticketId: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else if (option === "--ticket") ticketId = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (ticketId === undefined) throw new UsageError("--ticket is required");
+  return { goalId, changeId, ticketId };
+}
+
+function parseWorkerRead(args: string[]): { goalId: string; changeId: string; ticketId: string; lines?: number; ansi?: boolean } {
+  const identity: string[] = [];
+  let lines: number | undefined;
+  let ansi = false;
+  for (let index = 0; index < args.length;) {
+    const option = args[index]!;
+    if (option === "--ansi") {
+      ansi = true;
+      index++;
+      continue;
+    }
+    const value = valueAfter(args, index, option);
+    if (option === "--lines") {
+      lines = Number(value);
+      if (!Number.isInteger(lines) || lines < 1 || lines > 10_000) throw new UsageError("--lines must be an integer from 1 to 10000");
+    } else if (["--goal", "--change", "--ticket"].includes(option)) {
+      identity.push(option, value);
+    } else throw new UsageError(`unknown option: ${option}`);
+    index += 2;
+  }
+  return { ...parseWorkerIdentity(identity), ...(lines === undefined ? {} : { lines }), ...(ansi ? { ansi: true } : {}) };
 }
 
 function parseWorkerComplete(args: string[]): { file?: string } {
@@ -650,21 +711,23 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
       });
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-      return success(
-        json,
-        "ticket dispatch-pi",
-        {
-          ticket: identity,
-          classification: dispatched.classification,
-          execution: dispatched.execution,
-          paths: {
-            input: relative(dispatched.root, dispatched.exchange.inputDirectory),
-            output: relative(dispatched.root, dispatched.exchange.outputDirectory),
-          },
-        },
-        `Dispatched Pi Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
-          `  ${dispatched.classification}\n`,
-      );
+      const paths = {
+        input: relative(dispatched.root, dispatched.exchange.inputDirectory),
+        output: relative(dispatched.root, dispatched.exchange.outputDirectory),
+      };
+      return dispatched.hosting === "herdr"
+        ? success(
+            json,
+            "ticket dispatch-pi",
+            { ticket: identity, hosting: "herdr", status: dispatched.status, paths },
+            `Dispatched Pi Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n  working in Herdr\n`,
+          )
+        : success(
+            json,
+            "ticket dispatch-pi",
+            { ticket: identity, hosting: "direct", classification: dispatched.classification, execution: dispatched.execution, paths },
+            `Dispatched Pi Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n  ${dispatched.classification}\n`,
+          );
     }
 
     if (args[0] === "ticket" && args[1] === "dispatch-test") {
@@ -685,6 +748,35 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         `Dispatched controlled-test Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
           `  Worker exited ${dispatched.execution.exitCode}\n`,
       );
+    }
+
+    if (args[0] === "worker" && args[1] === "status") {
+      const identity = parseWorkerIdentity(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      const observation = await observeWorker(repository.root, identity);
+      return success(
+        json,
+        "worker status",
+        { ticket: identity, ...observation },
+        `Worker ${identity.goalId}/${identity.changeId}/${identity.ticketId}: ${observation.status}\n`,
+      );
+    }
+
+    if (args[0] === "worker" && args[1] === "read") {
+      const input = parseWorkerRead(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      const terminal = await readWorkerTerminal(repository.root, input, {
+        ...(input.lines === undefined ? {} : { lines: input.lines }),
+        ...(input.ansi === undefined ? {} : { ansi: input.ansi }),
+      });
+      return success(json, "worker read", { ticket: { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId }, terminal }, terminal);
+    }
+
+    if (args[0] === "worker" && args[1] === "attach") {
+      if (json) throw new UsageError("worker attach does not support --json");
+      const identity = parseWorkerIdentity(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      return attachWorkerTerminal(repository.root, identity);
     }
 
     if (args[0] === "worker" && args[1] === "complete") {

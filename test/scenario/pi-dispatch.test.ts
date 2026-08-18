@@ -128,7 +128,7 @@ describe("controlled Pi dispatch", () => {
     }
 
     const implemented = await spike(repository.root, [
-      "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", "pi-implementer",
+      "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", "pi-implementer", "--host", "direct",
     ], environment);
     expect(implemented.exitCode).toBe(0);
     expect(implemented.stderr).toBe("");
@@ -160,7 +160,7 @@ describe("controlled Pi dispatch", () => {
     await writeFile(join(repository.root, "spike.json"), '{"models":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off"},"review":{"model":"later","thinking":"off"}}}\n');
 
     const reviewed = await spike(repository.root, [
-      "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer",
+      "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer", "--host", "direct",
     ], environment);
     expect(reviewed.output).toMatchObject({
       ok: true,
@@ -185,7 +185,7 @@ describe("controlled Pi dispatch", () => {
         "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Do not complete.", "--network-access", "unrestricted",
       ]);
       const dispatched = await spike(repository.root, [
-        "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", `pi-${mode}`,
+        "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", `pi-${mode}`, "--host", "direct",
       ], { SPIKE_PI_BIN: pi, FAKE_PI_ARGS: join(directories.at(-1)!, "args.json"), FAKE_PI_MODE: mode });
       expect(dispatched.exitCode).toBe(0);
       expect(dispatched.output).toMatchObject({

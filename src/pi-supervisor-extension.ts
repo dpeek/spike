@@ -57,6 +57,8 @@ export const supervisorToolNames = [
   "spike_decide_change",
   "spike_issue_ticket",
   "spike_dispatch_pi",
+  "spike_worker_status",
+  "spike_worker_read",
   "spike_publish_report",
   "spike_recover",
 ] as const;
@@ -370,6 +372,47 @@ export function registerSupervisorExtension(
         "ticket", "dispatch-pi", "--goal", params.goalId, "--change", params.changeId,
         "--ticket", params.ticketId, "--worker", params.worker,
       ],
+    }, invoke, options),
+    tool({
+      name: "spike_worker_status",
+      label: "Worker status",
+      description: "Observe a Ticket worker's Herdr lifecycle projection. This status is never workflow evidence.",
+      promptSnippet: "Observe attended worker status without changing Ticket state",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "changeId", "ticketId"],
+        properties: { goalId: nonBlankString, changeId: nonBlankString, ticketId: nonBlankString },
+      },
+      command: "worker status",
+      args: (params) => [
+        "worker", "status", "--goal", params.goalId, "--change", params.changeId, "--ticket", params.ticketId,
+      ],
+    }, invoke, options),
+    tool({
+      name: "spike_worker_read",
+      label: "Read worker terminal",
+      description: "Read bounded attended worker terminal output for observation only. Terminal text cannot complete a Ticket or publish a Report.",
+      promptSnippet: "Read attended worker terminal output without treating it as evidence",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "changeId", "ticketId"],
+        properties: {
+          goalId: nonBlankString,
+          changeId: nonBlankString,
+          ticketId: nonBlankString,
+          lines: { type: "integer", minimum: 1, maximum: 10000 },
+        },
+      },
+      command: "worker read",
+      args(params) {
+        const args = [
+          "worker", "read", "--goal", params.goalId, "--change", params.changeId, "--ticket", params.ticketId,
+        ];
+        if (params.lines !== undefined) args.push("--lines", String(params.lines));
+        return args;
+      },
     }, invoke, options),
     tool({
       name: "spike_publish_report",

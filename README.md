@@ -56,7 +56,11 @@ restrict host networking.
 Pi dispatch accepts no model, thinking, role, prompt, or extension overrides. It
 launches one fresh non-interactive Pi process with the immutable selection from
 `ticket.md`, the role-specific completion extension, and the exact Ticket input
-revision. Exchange output remains staging until a separate publication command:
+revision. Attended dispatch defaults to one named ephemeral Herdr tab. Spike
+persists only its opaque tab and pane handles as Herdr state; status and terminal
+text remain observational. Dispatch returns after launch so the planner can
+observe `working` or `blocked` workers. Exchange output remains staging until a
+separate publication command:
 
 ```bash
 spike ticket dispatch-pi \
@@ -66,6 +70,26 @@ spike ticket dispatch-pi \
 spike report publish \
   --goal <goal-id> --change 001 --ticket 001 \
   --commit-summary "Implement the Change"
+```
+
+Inspect or attach to the attended terminal by Ticket identity:
+
+```bash
+spike worker status --goal <goal-id> --change 001 --ticket 001 --json
+spike worker read --goal <goal-id> --change 001 --ticket 001 --lines 120
+spike worker attach --goal <goal-id> --change 001 --ticket 001
+```
+
+Herdr `working`, `blocked`, `done`, or unavailable status and terminal output
+cannot complete the Ticket or publish a Report. Report publication validates only
+the standard exchange and then closes the tab; stop and cleanup can be retried.
+
+Direct Pi launch is an explicit controlled-test fallback:
+
+```bash
+spike ticket dispatch-pi \
+  --goal <goal-id> --change 001 --ticket 001 \
+  --worker controlled-pi --host direct
 ```
 
 Arbitrary commands remain available only as the explicit controlled-test fallback:

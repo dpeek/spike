@@ -20,6 +20,7 @@ import {
   stopAndFinalizeRecordedWorker,
   ticketOutputPath,
   type LocalCloneExecution,
+  type LocalWorkerResourceOperations,
   type TicketIdentity,
 } from "./worker.ts";
 
@@ -202,6 +203,7 @@ export type PublishImplementationReportInput = TicketIdentity & {
   };
   now?: Date;
   crash?: CrashInjector;
+  resourceOperations?: LocalWorkerResourceOperations;
 };
 
 export type PublishReviewReportInput = TicketIdentity & {
@@ -209,6 +211,7 @@ export type PublishReviewReportInput = TicketIdentity & {
   execution: LocalCloneExecution;
   now?: Date;
   crash?: CrashInjector;
+  resourceOperations?: LocalWorkerResourceOperations;
 };
 
 export type PublishFailedReportInput = TicketIdentity & {
@@ -218,6 +221,7 @@ export type PublishFailedReportInput = TicketIdentity & {
   execution: LocalCloneExecution;
   now?: Date;
   crash?: CrashInjector;
+  resourceOperations?: LocalWorkerResourceOperations;
 };
 
 export type PublishInterruptedReportInput = TicketIdentity & {
@@ -513,9 +517,10 @@ async function finalizePublishedWorker(
   root: string,
   identity: TicketIdentity,
   finishedAt: Date,
+  operations?: LocalWorkerResourceOperations,
 ): Promise<ReportPublicationCleanup> {
   if ((await loadRecordedWorkerIfPresent(root, identity)) === undefined) return { status: "finalized" };
-  const result = await stopAndFinalizeRecordedWorker(root, identity, finishedAt);
+  const result = await stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations);
   if (result.status === "failed") {
     return { status: "failed", phase: result.phase, message: result.message };
   }
@@ -781,7 +786,7 @@ export async function publishFailedReport(
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
   return { root: repository.root, report, cleanup };
 }
 
@@ -917,7 +922,7 @@ export async function publishImplementationReport(
         serializeDocument(metadata, submission.body),
         commitCrashHooks(input.crash, "implementation-report-publication"),
       );
-      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
       return { root: repository.root, report, cleanup };
     },
   );
@@ -992,6 +997,6 @@ export async function publishReviewReport(
     serializeDocument(metadata, submission.body),
     commitCrashHooks(input.crash, "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.resourceOperations);
   return { root: repository.root, report, cleanup };
 }

@@ -81,6 +81,8 @@ describe("Pi supervisor extension", () => {
         thinking: "medium",
       }],
       ["spike_dispatch_pi", { goalId: "goal-1", changeId: "001", ticketId: "003", worker: "pi-worker" }],
+      ["spike_worker_status", { goalId: "goal-1", changeId: "001", ticketId: "003" }],
+      ["spike_worker_read", { goalId: "goal-1", changeId: "001", ticketId: "003", lines: 80 }],
       ["spike_publish_report", {
         goalId: "goal-1",
         changeId: "001",
@@ -98,7 +100,7 @@ describe("Pi supervisor extension", () => {
     }
 
     const invocations = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    expect(invocations).toHaveLength(8);
+    expect(invocations).toHaveLength(10);
     expect(invocations.every((call) => call.args.at(-1) === "--json")).toBe(true);
     expect(invocations[0].args).toEqual(["status", "--goal", "goal-1", "--json"]);
     expect(invocations[1]).toMatchObject({
@@ -113,8 +115,12 @@ describe("Pi supervisor extension", () => {
     expect(invocations[3].args.slice(0, 4)).toEqual(["change", "abandon", "--goal", "goal-1"]);
     expect(invocations[4].args).toContain("worker-model");
     expect(invocations[5].args.slice(0, 2)).toEqual(["ticket", "dispatch-pi"]);
-    expect(invocations[6].args.slice(0, 2)).toEqual(["report", "publish"]);
+    expect(invocations[6].args.slice(0, 2)).toEqual(["worker", "status"]);
     expect(invocations[7].args).toEqual([
+      "worker", "read", "--goal", "goal-1", "--change", "001", "--ticket", "003", "--lines", "80", "--json",
+    ]);
+    expect(invocations[8].args.slice(0, 2)).toEqual(["report", "publish"]);
+    expect(invocations[9].args).toEqual([
       "recover", "--goal", "goal-1", "--reason", "Supervisor restarted.", "--json",
     ]);
   });
