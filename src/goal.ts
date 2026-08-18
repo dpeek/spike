@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
+import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import { installImmutable, readDocument, serializeDocument } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { createInitialPlan, type Plan } from "./plan.ts";
@@ -41,6 +42,7 @@ export type CreateGoalInput = {
   constraints?: string[];
   repositoryIdentity?: string;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export function goalPath(root: string, goalId: string): string {
@@ -101,7 +103,12 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   // The Goal document is the authoritative commit point. The Plan prepared
   // before it is staging; the integration ref written after it is rebuildable.
   const plan = await createInitialPlan(repository.root, goalId, title, outcome, approvedAt);
-  await installImmutable(repository.root, goalPath(repository.root, goalId), serializeDocument(metadata, body));
+  await installImmutable(
+    repository.root,
+    goalPath(repository.root, goalId),
+    serializeDocument(metadata, body),
+    commitCrashHooks(input.crash, "goal-publication"),
+  );
   await git(repository.root, ["update-ref", integratedRef(goalId), repository.head]);
 
   return { root: repository.root, goal: { metadata, body }, plan };

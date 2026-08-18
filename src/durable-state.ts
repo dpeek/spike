@@ -89,11 +89,22 @@ async function writeSynced(path: string, contents: string): Promise<void> {
   }
 }
 
-export async function installImmutable(root: string, path: string, contents: string): Promise<void> {
+export type ImmutableInstallHooks = {
+  beforePublish?: () => void | Promise<void>;
+  afterPublish?: () => void | Promise<void>;
+};
+
+export async function installImmutable(
+  root: string,
+  path: string,
+  contents: string,
+  hooks?: ImmutableInstallHooks,
+): Promise<void> {
   await prepareParent(root, path);
   const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   try {
     await writeSynced(temporary, contents);
+    await hooks?.beforePublish?.();
     try {
       // A same-directory hard link publishes the fully synced file without
       // replacing an existing immutable document.
@@ -106,6 +117,7 @@ export async function installImmutable(root: string, path: string, contents: str
     }
     await rm(temporary);
     await syncDirectory(dirname(path));
+    await hooks?.afterPublish?.();
   } finally {
     await rm(temporary, { force: true });
   }

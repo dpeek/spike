@@ -3,6 +3,7 @@ import { lstat, readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { changePath, loadChange } from "./change.ts";
+import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
   documentExists,
   installImmutable,
@@ -177,6 +178,17 @@ export type CurrentRemediation = CurrentReview;
 export type CurrentApproval = CurrentReview;
 export type CurrentRejection = CurrentReview;
 
+export type ReportExecution = TicketIdentity & {
+  adapter: string;
+  isolation: "workspace" | "container";
+  worker: string;
+  model: string;
+  startedAt: string;
+  finishedAt: string;
+  exitCode: number;
+  environmentDigest?: string;
+};
+
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
   execution: LocalCloneExecution;
@@ -185,12 +197,14 @@ export type PublishImplementationReportInput = TicketIdentity & {
     body?: string;
   };
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type PublishReviewReportInput = TicketIdentity & {
   cwd: string;
   execution: LocalCloneExecution;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type PublishFailedReportInput = TicketIdentity & {
@@ -199,14 +213,16 @@ export type PublishFailedReportInput = TicketIdentity & {
   reason: string;
   execution: LocalCloneExecution;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type PublishInterruptedReportInput = TicketIdentity & {
   cwd: string;
   role: "implement" | "review";
   reason: string;
-  execution: LocalCloneExecution;
+  execution: ReportExecution;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 const maximumBundleBytes = 100 * 1024 * 1024;
@@ -439,7 +455,19 @@ function matchingExecution(
   if (!execution.startedAt || !execution.finishedAt) throw new Error("local-clone execution is missing timestamps");
 }
 
-function executionMetadata(execution: LocalCloneExecution): z.infer<typeof executionSchema> {
+function matchingReportExecution(execution: ReportExecution, identity: TicketIdentity): void {
+  if (
+    execution.goalId !== identity.goalId ||
+    execution.changeId !== identity.changeId ||
+    execution.ticketId !== identity.ticketId
+  ) {
+    throw new Error("Report execution belongs to a different Ticket");
+  }
+  if (!Number.isInteger(execution.exitCode)) throw new Error("Report execution has an invalid exit code");
+  if (!execution.startedAt || !execution.finishedAt) throw new Error("Report execution is missing timestamps");
+}
+
+function executionMetadata(execution: ReportExecution): z.infer<typeof executionSchema> {
   const metadata = executionSchema.parse({
     adapter: execution.adapter,
     isolation: execution.isolation,
@@ -696,7 +724,12 @@ export async function publishFailedReport(
   const body = `# Ticket failed\n\n${reason}\n`;
   const report = { metadata, body };
 
-  await installImmutable(repository.root, path, serializeDocument(metadata, body));
+  await installImmutable(
+    repository.root,
+    path,
+    serializeDocument(metadata, body),
+    commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
+  );
   await forgetFinalizedWorker(repository.root, identity);
   return { root: repository.root, report };
 }
@@ -715,7 +748,7 @@ export async function publishInterruptedReport(
   if (input.role !== ticket.metadata.role) {
     throw new Error(`interrupted Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
-  matchingExecution(input.execution, identity, false);
+  matchingReportExecution(input.execution, identity);
   if (input.execution.isolation !== ticket.metadata.executionPolicy.isolation) {
     throw new Error("interrupted Report execution isolation does not match its Ticket execution policy");
   }
@@ -734,7 +767,12 @@ export async function publishInterruptedReport(
   });
   const body = `# Ticket interrupted\n\n${reason}\n`;
   const report = { metadata, body };
-  await installImmutable(repository.root, path, serializeDocument(metadata, body));
+  await installImmutable(
+    repository.root,
+    path,
+    serializeDocument(metadata, body),
+    commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
+  );
   return { root: repository.root, report };
 }
 
@@ -805,7 +843,12 @@ export async function publishImplementationReport(
       const report = { metadata, body: submission.body };
 
       await retainCandidate(repository.root, input.goalId, input.changeId, input.ticketId, candidateRevision);
-      await installImmutable(repository.root, path, serializeDocument(metadata, submission.body));
+      await installImmutable(
+        repository.root,
+        path,
+        serializeDocument(metadata, submission.body),
+        commitCrashHooks(input.crash, "implementation-report-publication"),
+      );
       await forgetFinalizedWorker(repository.root, identity);
       return { root: repository.root, report };
     },
@@ -874,7 +917,12 @@ export async function publishReviewReport(
     execution: executionMetadata(input.execution),
   });
   const report = { metadata, body: submission.body };
-  await installImmutable(repository.root, path, serializeDocument(metadata, submission.body));
+  await installImmutable(
+    repository.root,
+    path,
+    serializeDocument(metadata, submission.body),
+    commitCrashHooks(input.crash, "review-report-publication"),
+  );
   await forgetFinalizedWorker(repository.root, identity);
   return { root: repository.root, report };
 }

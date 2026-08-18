@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { changePath, changeStatus, loadChange } from "./change.ts";
+import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
   documentExists,
   installImmutable,
@@ -69,6 +70,7 @@ export type IssueTicketInput = {
   curatedContext?: string;
   executionPolicy: ExecutionPolicy;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type IssuedTicket = {
@@ -82,6 +84,7 @@ export type IssueReplacementTicketInput = {
   changeId: string;
   interruptedTicketId: string;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 function ticketsPath(root: string, goalId: string, changeId: string): string {
@@ -291,6 +294,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
     repository.root,
     ticketPath(repository.root, input.goalId, input.changeId, ticketId),
     serializeDocument(metadata, interrupted.body),
+    commitCrashHooks(input.crash, "ticket-issuance"),
   );
   return { root: repository.root, ticket: { metadata, body: interrupted.body } };
 }
@@ -393,6 +397,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     repository.root,
     ticketPath(repository.root, input.goalId, input.changeId, ticketId),
     serializeDocument(metadata, body),
+    commitCrashHooks(input.crash, "ticket-issuance"),
   );
   return { root: repository.root, ticket: { metadata, body } };
 }

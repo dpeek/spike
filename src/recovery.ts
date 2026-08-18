@@ -1,10 +1,30 @@
-import { discoverRepository } from "./git.ts";
+import { lstat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
+  changeDecisionPath,
+  changePath,
+  loadChange,
+  loadChangeDecisionIfPresent,
+} from "./change.ts";
+import { documentExists, listDirectoryNames } from "./durable-state.ts";
+import { candidateRef } from "./git-change.ts";
+import { discoverRepository, git } from "./git.ts";
+import { goalPath, integratedRef, loadGoal } from "./goal.ts";
+import {
+  deriveCurrentApproval,
+  deriveCurrentCandidate,
   loadReportIfPresent,
   publishInterruptedReport,
+  type ReportExecution,
   type TerminalReport,
 } from "./report.ts";
-import { issueReplacementTicket, loadTicket, type IssuedTicket } from "./ticket.ts";
+import {
+  issueReplacementTicket,
+  loadReplacementTicketIfPresent,
+  loadTicket,
+  ticketPath,
+  type IssuedTicket,
+} from "./ticket.ts";
 import {
   forgetFinalizedWorker,
   loadRecordedWorkerIfPresent,
@@ -58,12 +78,21 @@ export async function recoverInterruptedTicket(
   }
 
   const recordedWorker = await loadRecordedWorkerIfPresent(repository.root, identity);
-  if (report === undefined && recordedWorker === undefined) {
-    throw new Error(`open Ticket ${input.goalId}/${input.changeId}/${input.ticketId} has no recorded execution provenance`);
-  }
-
   let cleanup: InterruptedTicketRecovery["cleanup"] = { status: "finalized" };
-  if (recordedWorker !== undefined) {
+  let execution: ReportExecution;
+  if (recordedWorker === undefined) {
+    const finishedAt = now.toISOString();
+    execution = {
+      ...identity,
+      adapter: "host",
+      isolation: ticket.metadata.executionPolicy.isolation,
+      worker: "not-launched",
+      model: "not-launched",
+      startedAt: ticket.metadata.issuedAt,
+      finishedAt: Date.parse(finishedAt) < Date.parse(ticket.metadata.issuedAt) ? ticket.metadata.issuedAt : finishedAt,
+      exitCode: -1,
+    };
+  } else {
     const result = await stopAndFinalizeRecordedWorker(
       repository.root,
       identity,
@@ -73,19 +102,20 @@ export async function recoverInterruptedTicket(
     cleanup = result.status === "failed"
       ? { status: "failed", message: result.message }
       : { status: "finalized" };
+    execution = result.execution;
+  }
 
-    if (report === undefined) {
-      report = (
-        await publishInterruptedReport({
-          cwd: repository.root,
-          ...identity,
-          role: input.role,
-          reason,
-          execution: result.execution,
-          now,
-        })
-      ).report;
-    }
+  if (report === undefined) {
+    report = (
+      await publishInterruptedReport({
+        cwd: repository.root,
+        ...identity,
+        role: input.role,
+        reason,
+        execution,
+        now,
+      })
+    ).report;
   }
 
   if (report === undefined || report.metadata.outcome !== "interrupted") {
@@ -114,4 +144,269 @@ export async function recoverInterruptedTicket(
   ).ticket;
 
   return { root: repository.root, report: interruptedReport, replacement, cleanup };
+}
+
+const goalIdPattern = /^goal-[0-9a-f]{32}$/;
+const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
+
+export type ReconcileRepositoryInput = {
+  cwd: string;
+  reason?: string;
+  now?: Date;
+};
+
+export type ReconciledGoal = {
+  goalId: string;
+  integratedRevision: string;
+  currentCandidates: Array<{ changeId: string; candidateRevision: string; producingImplementationTicketId: string }>;
+  interruptedTickets: Array<InterruptedTicketRecovery>;
+  replacementTickets: IssuedTicket["ticket"][];
+  finalizedWorkers: TicketIdentity[];
+  cleanupWarnings: Array<{ identity: TicketIdentity; message: string }>;
+  discardedRefs: string[];
+  ignoredOutputPaths: string[];
+};
+
+export type RepositoryReconciliation = {
+  root: string;
+  goals: ReconciledGoal[];
+  ignoredUnpublishedGoalIds: string[];
+};
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function publishedChangeIds(root: string, goalId: string): Promise<string[]> {
+  const directory = join(root, ".spike", "goals", goalId, "changes");
+  const ids = (await listDirectoryNames(root, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
+  const published: string[] = [];
+  for (const changeId of ids) {
+    if (await documentExists(root, changePath(root, goalId, changeId))) published.push(changeId);
+  }
+  return published;
+}
+
+async function publishedTicketIds(root: string, goalId: string, changeId: string): Promise<string[]> {
+  const directory = join(dirname(changePath(root, goalId, changeId)), "tickets");
+  const ids = (await listDirectoryNames(root, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
+  const published: string[] = [];
+  for (const ticketId of ids) {
+    if (await documentExists(root, ticketPath(root, goalId, changeId, ticketId))) published.push(ticketId);
+  }
+  return published;
+}
+
+async function refsBelow(root: string, prefix: string): Promise<string[]> {
+  const source = await git(root, ["for-each-ref", "--format=%(refname)", prefix]);
+  return source ? source.split("\n").filter(Boolean) : [];
+}
+
+async function reconcileCandidateRefs(root: string, goalId: string, changeIds: string[]): Promise<string[]> {
+  const expected = new Map<string, string>();
+  for (const changeId of changeIds) {
+    for (const ticketId of await publishedTicketIds(root, goalId, changeId)) {
+      const report = await loadReportIfPresent(root, goalId, changeId, ticketId);
+      if (report?.metadata.outcome === "completed" && report.metadata.role === "implement") {
+        expected.set(candidateRef(goalId, changeId, ticketId), report.metadata.candidateRevision);
+      }
+    }
+  }
+
+  const discarded: string[] = [];
+  const candidatePrefix = `refs/spike/goals/${goalId}/changes/`;
+  for (const ref of await refsBelow(root, candidatePrefix)) {
+    if (!expected.has(ref)) {
+      await git(root, ["update-ref", "-d", ref]);
+      discarded.push(ref);
+    }
+  }
+  for (const [ref, revision] of expected) {
+    await git(root, ["update-ref", "--no-deref", ref, revision]);
+  }
+
+  const quarantinePrefix = `refs/spike/quarantine/goals/${goalId}/`;
+  for (const ref of await refsBelow(root, quarantinePrefix)) {
+    await git(root, ["update-ref", "-d", ref]);
+    discarded.push(ref);
+  }
+  return discarded;
+}
+
+async function rebuildIntegrationRef(root: string, goalId: string, changeIds: string[]): Promise<string> {
+  const goal = await loadGoal(root, goalId);
+  let integratedRevision = goal.metadata.repository.initialRevision;
+
+  for (const changeId of changeIds) {
+    const change = await loadChange(root, goalId, changeId);
+    if (change.metadata.baseRevision !== integratedRevision) {
+      throw new Error(
+        `Change ${goalId}/${changeId} base ${change.metadata.baseRevision} does not match rebuilt Goal integrated revision ${integratedRevision}`,
+      );
+    }
+    const decision = await loadChangeDecisionIfPresent(root, goalId, changeId);
+    if (decision?.metadata.disposition !== "land") continue;
+
+    const [candidate, approval] = await Promise.all([
+      deriveCurrentCandidate(root, goalId, changeId),
+      deriveCurrentApproval(root, goalId, changeId),
+    ]);
+    if (
+      candidate === undefined ||
+      approval === undefined ||
+      decision.metadata.approvedRevision !== candidate.candidateRevision ||
+      approval.candidateRevision !== candidate.candidateRevision ||
+      approval.producingImplementationTicketId !== candidate.producingImplementationTicketId
+    ) {
+      throw new Error(`land decision ${goalId}/${changeId} does not select the latest exactly approved Candidate`);
+    }
+    const commit = (await git(root, ["rev-list", "--parents", "-n", "1", decision.metadata.approvedRevision])).split(/\s+/);
+    if (commit.length !== 2 || commit[1] !== integratedRevision) {
+      throw new Error(`land decision ${goalId}/${changeId} does not select a one-commit Change on its base`);
+    }
+    integratedRevision = decision.metadata.approvedRevision;
+  }
+
+  await git(root, ["update-ref", "--no-deref", integratedRef(goalId), integratedRevision]);
+  return integratedRevision;
+}
+
+export async function reconcileGoal(
+  input: ReconcileRepositoryInput & { goalId: string },
+  resourceOperations?: LocalWorkerResourceOperations,
+): Promise<ReconciledGoal> {
+  const repository = await discoverRepository(input.cwd);
+  await loadGoal(repository.root, input.goalId);
+  const now = input.now ?? new Date();
+  const reason = interruptionReason(input.reason ?? "Supervisor restart interrupted an open Ticket before its Report was published.");
+  const changeIds = await publishedChangeIds(repository.root, input.goalId);
+  const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
+  const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId, changeIds);
+  const interruptedTickets: InterruptedTicketRecovery[] = [];
+  const replacementTickets: IssuedTicket["ticket"][] = [];
+  const finalizedWorkers: TicketIdentity[] = [];
+  const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];
+  const ignoredOutputPaths: string[] = [];
+
+  for (const changeId of changeIds) {
+    const ticketIds = await publishedTicketIds(repository.root, input.goalId, changeId);
+    for (const ticketId of ticketIds) {
+      const identity = { goalId: input.goalId, changeId, ticketId };
+      const report = await loadReportIfPresent(repository.root, input.goalId, changeId, ticketId);
+      const worker = await loadRecordedWorkerIfPresent(repository.root, identity);
+      if (report === undefined) {
+        const output = join(repository.root, ".spike", "exchange", "goals", input.goalId, "changes", changeId, "tickets", ticketId, "output");
+        if (await pathExists(output)) ignoredOutputPaths.push(output);
+        const ticket = await loadTicket(repository.root, input.goalId, changeId, ticketId);
+        const recovered = await recoverInterruptedTicket(
+          {
+            cwd: repository.root,
+            ...identity,
+            role: ticket.metadata.role,
+            reason,
+            now,
+          },
+          resourceOperations,
+        );
+        interruptedTickets.push(recovered);
+        replacementTickets.push(recovered.replacement);
+        if (recovered.cleanup.status === "failed") {
+          cleanupWarnings.push({ identity, message: recovered.cleanup.message });
+        } else if (worker !== undefined) {
+          finalizedWorkers.push(identity);
+        }
+        continue;
+      }
+
+      if (worker === undefined) continue;
+      const cleanup = await stopAndFinalizeRecordedWorker(repository.root, identity, now, resourceOperations);
+      if (cleanup.status === "failed") {
+        cleanupWarnings.push({ identity, message: cleanup.message });
+        continue;
+      }
+      try {
+        await forgetFinalizedWorker(repository.root, identity);
+        finalizedWorkers.push(identity);
+      } catch (error) {
+        cleanupWarnings.push({ identity, message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    if (await documentExists(repository.root, changeDecisionPath(repository.root, input.goalId, changeId))) continue;
+    const refreshedTicketIds = await publishedTicketIds(repository.root, input.goalId, changeId);
+    const latestTicketId = refreshedTicketIds.at(-1);
+    if (latestTicketId === undefined) continue;
+    const latestReport = await loadReportIfPresent(repository.root, input.goalId, changeId, latestTicketId);
+    if (latestReport?.metadata.outcome !== "interrupted") continue;
+    if (await loadReplacementTicketIfPresent(repository.root, input.goalId, changeId, latestTicketId)) continue;
+    const replacement = await issueReplacementTicket({
+      cwd: repository.root,
+      goalId: input.goalId,
+      changeId,
+      interruptedTicketId: latestTicketId,
+      now,
+    });
+    replacementTickets.push(replacement.ticket);
+  }
+
+  const currentCandidates: ReconciledGoal["currentCandidates"] = [];
+  for (const changeId of changeIds) {
+    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, changeId);
+    if (candidate !== undefined) {
+      currentCandidates.push({
+        changeId,
+        candidateRevision: candidate.candidateRevision,
+        producingImplementationTicketId: candidate.producingImplementationTicketId,
+      });
+    }
+  }
+
+  return {
+    goalId: input.goalId,
+    integratedRevision,
+    currentCandidates,
+    interruptedTickets,
+    replacementTickets,
+    finalizedWorkers,
+    cleanupWarnings,
+    discardedRefs,
+    ignoredOutputPaths,
+  };
+}
+
+export async function reconcileRepository(
+  input: ReconcileRepositoryInput,
+  resourceOperations?: LocalWorkerResourceOperations,
+): Promise<RepositoryReconciliation> {
+  const repository = await discoverRepository(input.cwd);
+  const goalsDirectory = join(repository.root, ".spike", "goals");
+  const goalIds = (await listDirectoryNames(repository.root, goalsDirectory))
+    .filter((name) => goalIdPattern.test(name))
+    .sort();
+  const goals: ReconciledGoal[] = [];
+  const ignoredUnpublishedGoalIds: string[] = [];
+  for (const goalId of goalIds) {
+    if (!(await documentExists(repository.root, goalPath(repository.root, goalId)))) {
+      ignoredUnpublishedGoalIds.push(goalId);
+      continue;
+    }
+    goals.push(
+      await reconcileGoal(
+        {
+          cwd: repository.root,
+          goalId,
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+          ...(input.now === undefined ? {} : { now: input.now }),
+        },
+        resourceOperations,
+      ),
+    );
+  }
+  return { root: repository.root, goals, ignoredUnpublishedGoalIds };
 }

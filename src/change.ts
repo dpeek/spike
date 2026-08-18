@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { z } from "zod";
+import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
   documentExists,
   installImmutable,
@@ -76,6 +77,7 @@ export type LandChangeInput = {
   changeId: string;
   statement?: string;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type LandedChange = {
@@ -89,6 +91,7 @@ export type ResolveChangeInput = {
   changeId: string;
   statement: string;
   now?: Date;
+  crash?: CrashInjector;
 };
 
 export type ResolvedChange = {
@@ -280,7 +283,12 @@ export async function landChange(input: LandChangeInput): Promise<LandedChange> 
       : `${requireText(input.statement, "Change decision statement")}\n`;
   const decision = { metadata, body };
 
-  await installImmutable(repository.root, decisionDocumentPath, serializeDocument(metadata, body));
+  await installImmutable(
+    repository.root,
+    decisionDocumentPath,
+    serializeDocument(metadata, body),
+    commitCrashHooks(input.crash, "change-decision-publication"),
+  );
   await git(repository.root, ["update-ref", "--no-deref", ref, candidate.candidateRevision, change.metadata.baseRevision]);
   return { root: repository.root, decision };
 }
@@ -326,7 +334,12 @@ async function resolveChangeWithoutLanding(
     disposition,
   });
   const decision = { metadata, body: `${statement}\n` };
-  await installImmutable(repository.root, decisionDocumentPath, serializeDocument(metadata, decision.body));
+  await installImmutable(
+    repository.root,
+    decisionDocumentPath,
+    serializeDocument(metadata, decision.body),
+    commitCrashHooks(input.crash, "change-decision-publication"),
+  );
   return { root: repository.root, decision };
 }
 
