@@ -28,6 +28,7 @@ import {
   type DerivedRepositoryStatus,
 } from "./status.ts";
 import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
+import { completeWorker, readWorkerPayload } from "./worker-completion.ts";
 import { dispatchLocalTicket, loadFinishedLocalExecution } from "./worker.ts";
 
 export const version = "2.0.0-dev";
@@ -45,6 +46,7 @@ Usage:
   spike change abandon --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
   spike ticket dispatch --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
+  spike worker complete [--file <payload.json>] [--json]
   spike report publish --goal <goal-id> --change <change-id> --ticket <ticket-id> [options]
   spike recover [--goal <goal-id>] [--reason <reason>] [--json]
   spike --help
@@ -80,6 +82,9 @@ Ticket dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
   --environment-digest <digest>  Optional immutable environment identity
   -- <command> [args...]          Controlled direct worker command
+
+Worker completion options:
+  --file <path>                  Read JSON payload from a file; omit or use - for stdin
 
 Report publication options:
   --commit-summary <summary>      Required for a completed implementation Report
@@ -326,6 +331,12 @@ function parseTicketDispatch(args: string[]): {
     command,
     ...(environmentDigest === undefined ? {} : { environmentDigest }),
   };
+}
+
+function parseWorkerComplete(args: string[]): { file?: string } {
+  if (args.length === 0) return {};
+  if (args.length !== 2 || args[0] !== "--file") throw new UsageError(`unknown worker complete option: ${args[0]}`);
+  return { file: valueAfter(args, 0, "--file") };
 }
 
 function parseReportPublish(args: string[]): {
@@ -610,6 +621,17 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         },
         `Dispatched Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
           `  Worker exited ${dispatched.execution.exitCode}\n`,
+      );
+    }
+
+    if (args[0] === "worker" && args[1] === "complete") {
+      const input = parseWorkerComplete(args.slice(2));
+      const completion = await completeWorker(cwd, await readWorkerPayload(cwd, input.file, stdinText));
+      return success(
+        json,
+        "worker complete",
+        completion,
+        `Completed ${completion.role} Ticket ${completion.goalId}/${completion.changeId}/${completion.ticketId}\n`,
       );
     }
 

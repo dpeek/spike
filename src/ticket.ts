@@ -13,6 +13,7 @@ import {
   listDirectoryNames,
   readDocument,
   serializeDocument,
+  type MarkdownDocument,
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { loadGoal } from "./goal.ts";
@@ -181,15 +182,23 @@ export async function listTicketIds(root: string, goalId: string, changeId: stri
   return published;
 }
 
+export function parseTicketDocument(document: MarkdownDocument): Ticket {
+  return { metadata: ticketSchema.parse(document.metadata), body: document.body };
+}
+
+export async function loadTicketDocument(root: string, path: string): Promise<Ticket> {
+  return parseTicketDocument(await readDocument(root, path));
+}
+
 export async function loadTicket(root: string, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
-  const document = await readDocument(root, ticketPath(root, goalId, changeId, ticketId));
-  const metadata = ticketSchema.parse(document.metadata);
+  const ticket = await loadTicketDocument(root, ticketPath(root, goalId, changeId, ticketId));
+  const { metadata } = ticket;
   if (metadata.goalId !== goalId || metadata.changeId !== changeId || metadata.ticketId !== ticketId) {
     throw new Error(
       `Ticket document belongs to a different Ticket: ${metadata.goalId}/${metadata.changeId}/${metadata.ticketId}`,
     );
   }
-  return { metadata, body: document.body };
+  return ticket;
 }
 
 export async function ticketStatus(

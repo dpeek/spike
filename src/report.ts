@@ -75,7 +75,7 @@ const reviewSubmissionSchema = commonSubmissionSchema
     producingImplementationTicketId: z.string().regex(sequenceIdPattern),
     findings: z.array(reviewFindingSchema),
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
-    verdict: z.enum(["remediate", "approve", "reject"]),
+    verdict: z.enum(["remediate", "approve", "reject", "ask-operator"]),
   })
   .strict();
 const reportArtifactSchema = submittedArtifactSchema.extend({ bytes: z.number().int().nonnegative() }).strict();
@@ -119,7 +119,7 @@ const reviewReportSchema = completedReportSchema
     acceptanceAssessment: z.array(acceptanceAssessmentSchema).min(1),
     reviewStatement: z.string().trim().min(1),
     reviewer: z.string().trim().min(1),
-    verdict: z.enum(["remediate", "approve", "reject"]),
+    verdict: z.enum(["remediate", "approve", "reject", "ask-operator"]),
   })
   .strict();
 const terminalReportSchema = reportIdentitySchema

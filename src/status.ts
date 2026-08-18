@@ -38,7 +38,7 @@ export type DerivedChangeStatus = {
   };
   review: null | {
     ticketId: string;
-    verdict: "remediate" | "approve" | "reject";
+    verdict: "remediate" | "approve" | "reject" | "ask-operator";
     reviewedRevision: string;
     producingImplementationTicketId: string;
   };

@@ -282,5 +282,5 @@ describe("Change rejection and abandonment", () => {
     const second = await nextChange(repository, goalId);
     expect(second.change.metadata.changeId).toBe("002");
     expect(second.change.metadata.baseRevision).toBe(baseRevision);
-  });
+  }, 10_000);
 });

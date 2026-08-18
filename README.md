@@ -64,6 +64,22 @@ spike report publish \
   --commit-summary "Implement the Change"
 ```
 
+Inside the private worker checkout, structured completion reads the Ticket from
+`SPIKE_INPUT_DIR/ticket.md` and accepts JSON from a file or stdin:
+
+```bash
+spike worker complete --file payload.json
+# or: printf '%s' "$payload" | spike worker complete
+```
+
+Implementation payloads contain `summary`, `verification`, `assumptions`,
+`limitations`, `risks`, `followUp`, and an `artifacts` path array. Review
+payloads contain `reviewStatement`, `findings`, `acceptanceAssessment`,
+`verdict` (`remediate`, `approve`, `reject`, or `ask-operator`), and
+`artifacts`. Spike computes artifact digests, snapshots an
+implementation checkout, creates its bundle, and publishes canonical
+`submission.md` last.
+
 A completed review Report needs no commit message options. To seal a worker
 failure instead, use `--failure "<reason>"`. Report publication returns worker
 cleanup status and retains a warning when finalization must be retried.

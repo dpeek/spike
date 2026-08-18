@@ -401,12 +401,15 @@ The private checkout starts at the exact Candidate \`${inputRevision}\`.
 
 ## Declared output
 
-Write only to \`SPIKE_OUTPUT_DIR\`:
+Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`, then complete the Ticket with JSON via \`spike worker complete --file payload.json\` or stdin. The review payload contains:
 
-- \`submission.md\` — JSON-frontmatter Markdown with kind \`submission\`, the full Ticket identity, outcome \`completed\`, \`reviewedRevision\`, \`producingImplementationTicketId\`, \`findings\`, \`acceptanceAssessment\`, verdict \`remediate\`, \`approve\`, or \`reject\`, and declared \`artifacts\`;
-- files below \`artifacts/\` that are declared by path and SHA-256 digest in the Submission.
+- non-blank \`reviewStatement\`;
+- \`findings\` with unique kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and non-blank \`statement\`;
+- \`acceptanceAssessment\` covering every criterion exactly once with assessment \`met\`, \`not-met\`, or \`unclear\`, and evidence;
+- verdict \`remediate\`, \`approve\`, \`reject\`, or \`ask-operator\`;
+- \`artifacts\`, an array of declared paths below \`artifacts/\`.
 
-Each finding requires a stable kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and a non-blank \`statement\`. Assess every acceptance criterion exactly once as \`met\`, \`not-met\`, or \`unclear\`, with evidence. Do not write an output Git bundle. The completed Submission body must contain a non-blank Review statement section.
+Spike validates and digests artifacts and atomically writes the canonical \`submission.md\`. Do not write a Submission or Git bundle yourself.
 `;
   }
   return `# Implementation worker context
@@ -415,13 +418,9 @@ The private checkout starts at exact revision \`${inputRevision}\`.
 
 ## Declared output
 
-Write only to \`SPIKE_OUTPUT_DIR\`:
+Implement in the private checkout, write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`, then complete the Ticket with JSON via \`spike worker complete --file payload.json\` or stdin. The implementation payload contains non-blank \`summary\`, \`verification\`, \`assumptions\`, \`limitations\`, \`risks\`, and \`followUp\` strings plus \`artifacts\`, an array of declared paths below \`artifacts/\`.
 
-- \`submission.md\` — JSON-frontmatter Markdown with kind \`submission\`, the full Ticket identity, outcome \`completed\`, the exact \`workerRevision\`, and declared artifacts;
-- \`repository.bundle\` — a valid Git bundle advertising \`workerRevision\`;
-- files below \`artifacts/\` that are declared by path and SHA-256 digest in the Submission.
-
-The completed Submission body must contain Summary, Verification, Assumptions, Limitations, Risks, and Follow-up sections.
+Spike snapshots the checkout, creates \`repository.bundle\`, validates and digests artifacts, and atomically writes the canonical \`submission.md\` last. Do not write a Submission or Git bundle yourself.
 `;
 }
 

@@ -14,16 +14,29 @@ afterEach(async () => {
   }
 });
 
+const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
 const worker = String.raw`
-import { writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 async function git(...args) {
   const child = Bun.spawn(["git", ...args], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   if (code !== 0) throw new Error(stderr);
   return stdout.trim();
 }
-const output = process.env.SPIKE_OUTPUT_DIR;
+async function complete(payload, file = false) {
+  const path = file ? join(tmpdir(), "spike-completion-" + randomUUID() + ".json") : undefined;
+  if (path) await writeFile(path, JSON.stringify(payload));
+  const child = Bun.spawn([${JSON.stringify(spikePath)}, "worker", "complete", ...(path ? ["--file", path] : [])], {
+    cwd: process.cwd(), stdin: path ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  if (!path) { child.stdin.write(JSON.stringify(payload)); child.stdin.end(); }
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  if (path) await rm(path);
+  if (code !== 0) throw new Error(stderr || stdout);
+}
 const ticketId = process.env.SPIKE_TICKET_ID;
 const head = await git("rev-parse", "HEAD");
 if (head !== process.env.SPIKE_INPUT_REVISION) throw new Error("wrong input revision");
@@ -31,41 +44,28 @@ if (ticketId === "001") {
   if (process.env.SPIKE_MODEL !== "implementation-model" || process.env.SPIKE_THINKING !== "medium") {
     throw new Error("dispatch did not use the frozen implementation selection");
   }
-  await git("config", "user.name", "Direct CLI Implementer");
-  await git("config", "user.email", "implementer@example.test");
   await writeFile("direct-cli.txt", "approved through direct CLI\n");
-  await git("add", "direct-cli.txt");
-  await git("commit", "--quiet", "-m", "worker checkpoint");
-  const workerRevision = await git("rev-parse", "HEAD");
-  const metadata = {
-    kind: "submission", goalId: process.env.SPIKE_GOAL_ID, changeId: process.env.SPIKE_CHANGE_ID,
-    ticketId, outcome: "completed", workerRevision, artifacts: [],
-  };
-  const body = "# Implementation evidence\n\n## Summary\n\nAdded direct CLI behavior.\n\n## Verification\n\nScripted verification passed.\n\n## Assumptions\n\nNone.\n\n## Limitations\n\nNone.\n\n## Risks\n\nNone.\n\n## Follow-up\n\nIndependent review.\n";
-  await writeFile(join(output, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
-  const bundle = Bun.spawn(["git", "bundle", "create", join(output, "repository.bundle"), "HEAD"], { cwd: process.cwd(), stdout: "ignore", stderr: "pipe" });
-  const [code, stderr] = await Promise.all([bundle.exited, new Response(bundle.stderr).text()]);
-  if (code !== 0) throw new Error(stderr);
+  await complete({
+    summary: "Added direct CLI behavior.",
+    verification: "Scripted verification passed.",
+    assumptions: "None.", limitations: "None.", risks: "None.",
+    followUp: "Independent review.", artifacts: [],
+  }, true);
 } else if (ticketId === "002") {
   if (process.env.SPIKE_MODEL !== "review-model" || process.env.SPIKE_THINKING !== "high") {
     throw new Error("dispatch did not use the frozen review selection");
   }
-  const metadata = {
-    kind: "submission", goalId: process.env.SPIKE_GOAL_ID, changeId: process.env.SPIKE_CHANGE_ID,
-    ticketId, outcome: "completed", reviewedRevision: head, producingImplementationTicketId: "001",
+  await complete({
+    reviewStatement: "The exact Candidate is approved.",
     findings: [], acceptanceAssessment: [{
       criterion: "The direct CLI Candidate is independently approved.", assessment: "met",
       evidence: "The exact Candidate contains direct-cli.txt with the expected content.",
     }], verdict: "approve", artifacts: [],
-  };
-  const body = "# Review evidence\n\n## Review statement\n\nThe exact Candidate is approved.\n";
-  await writeFile(join(output, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
+  });
 } else {
   throw new Error("unexpected Ticket " + ticketId);
 }
 `;
-
-const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
 
 async function spike(cwd: string, args: string[]): Promise<any> {
   const separator = args.indexOf("--");
@@ -142,6 +142,7 @@ describe("direct CLI tracer bullet", () => {
       cleanup: { status: "finalized" },
     });
     const candidateRevision = implementationPublication.data.report.candidateRevision as string;
+    expect(await repository.git("show", `${candidateRevision}:direct-cli.txt`)).toBe("approved through direct CLI");
 
     const issuedReview = await spike(repository.root, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--role", "review",
