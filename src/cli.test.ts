@@ -4,14 +4,19 @@ import { join } from "node:path";
 import { createChange, loadChangeDecision } from "./change.ts";
 import { createGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
+import { issueTicket } from "./ticket.ts";
+import { workerRecordPath } from "./worker.ts";
 import { usage, version } from "./cli.ts";
 import { temporaryRepository } from "../test/support/repository.ts";
 
 const root = join(import.meta.dir, "..");
-const repositories: Array<{ remove: () => Promise<void> }> = [];
+const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
 
 afterEach(async () => {
-  await Promise.all(repositories.splice(0).map((repository) => repository.remove()));
+  await Promise.all(repositories.splice(0).map(async (repository) => {
+    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
+    await repository.remove();
+  }));
 });
 
 async function spikeAt(cwd: string, args: string[], stdin?: string) {
@@ -113,6 +118,93 @@ describe("spike CLI", () => {
     expect(fromStdin.exitCode).toBe(0);
     expect(JSON.parse(fromStdin.stdout)).toMatchObject({ ok: true, command: "plan revise", data: { body: stdinBody } });
     expect((await loadPlan(repository.root, goalId)).body).toBe(stdinBody);
+  });
+
+  test("dispatches with frozen Ticket execution policy and publishes failure evidence after exit", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const goal = await createGoal({
+      cwd: repository.root,
+      title: "Publish direct failure evidence",
+      outcome: "Seal a failed controlled worker execution.",
+      approval: "Approved.",
+    });
+    const goalId = goal.goal.metadata.goalId;
+    await createChange({
+      cwd: repository.root,
+      goalId,
+      title: "Exercise failed publication",
+      intent: "Preserve execution evidence between CLI processes.",
+      rationale: "Publication must not depend on a live worker.",
+      acceptanceCriteria: ["The failed Report records the frozen model selection."],
+    });
+    await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      instruction: "Exit with a controlled failure.",
+      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      model: "frozen-model",
+      thinking: "low",
+    });
+    await writeFile(
+      join(repository.root, "spike.json"),
+      '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+    );
+
+    const rejectedOverride = await spikeAt(repository.root, [
+      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "--worker", "scripted-failure", "--model", "dispatch-override", "--json", "--", "bun", "-e", "process.exit(19)",
+    ]);
+    expect(rejectedOverride.exitCode).toBe(2);
+    expect(JSON.parse(rejectedOverride.stdout)).toEqual({
+      ok: false,
+      command: "ticket dispatch",
+      error: { code: "usage", message: "unknown option: --model" },
+    });
+
+    const dispatched = await spikeAt(repository.root, [
+      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "--worker", "scripted-failure", "--json", "--", "bun", "-e",
+      'if (process.env.SPIKE_MODEL !== "frozen-model" || process.env.SPIKE_THINKING !== "low") process.exit(99); console.log("controlled failure"); process.exit(19)',
+    ]);
+    expect(dispatched.exitCode).toBe(0);
+    expect(dispatched.stderr).toBe("");
+    expect(JSON.parse(dispatched.stdout)).toMatchObject({
+      ok: true,
+      command: "ticket dispatch",
+      data: {
+        execution: {
+          worker: "scripted-failure",
+          model: "frozen-model",
+          thinking: "low",
+          exitCode: 19,
+          stdout: "controlled failure\n",
+        },
+      },
+    });
+    const identity = { goalId, changeId: "001", ticketId: "001" };
+    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(true);
+
+    const published = await spikeAt(repository.root, [
+      "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "--failure", "Controlled worker exited with code 19.", "--json",
+    ]);
+    expect(published.exitCode).toBe(0);
+    expect(published.stderr).toBe("");
+    expect(JSON.parse(published.stdout)).toMatchObject({
+      ok: true,
+      command: "report publish",
+      data: {
+        report: {
+          role: "implement",
+          outcome: "failed",
+          execution: { worker: "scripted-failure", model: "frozen-model", thinking: "low" },
+        },
+        cleanup: { status: "finalized" },
+      },
+    });
+    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(false);
   });
 
   test("delegates abandonment and repository recovery to workflow modules", async () => {

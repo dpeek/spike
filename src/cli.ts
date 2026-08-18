@@ -14,6 +14,12 @@ import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { planPath, revisePlan } from "./plan.ts";
+import {
+  publishFailedReport,
+  publishImplementationReport,
+  publishReviewReport,
+  type ReportPublicationCleanup,
+} from "./report.ts";
 import { reconcileGoal, reconcileRepository, type ReconciledGoal } from "./recovery.ts";
 import {
   deriveGoalStatus,
@@ -21,7 +27,8 @@ import {
   type DerivedGoalStatus,
   type DerivedRepositoryStatus,
 } from "./status.ts";
-import { issueTicket, ticketPath, type ExecutionPolicy } from "./ticket.ts";
+import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
+import { dispatchLocalTicket, loadFinishedLocalExecution } from "./worker.ts";
 
 export const version = "2.0.0-dev";
 
@@ -37,6 +44,8 @@ Usage:
   spike change reject --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike change abandon --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
+  spike ticket dispatch --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
+  spike report publish --goal <goal-id> --change <change-id> --ticket <ticket-id> [options]
   spike recover [--goal <goal-id>] [--reason <reason>] [--json]
   spike --help
   spike --version
@@ -66,6 +75,16 @@ Ticket issuance options:
   --credential <grant-id>        Repeat for each credential grant identifier
   --model <model>                Override the role's configured model for this Ticket
   --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
+
+Ticket dispatch options:
+  --worker <identity>             Worker identity recorded in Report provenance
+  --environment-digest <digest>  Optional immutable environment identity
+  -- <command> [args...]          Controlled direct worker command
+
+Report publication options:
+  --commit-summary <summary>      Required for a completed implementation Report
+  --commit-body <body>            Optional Candidate commit message body
+  --failure <reason>              Publish a failed Report instead of a completed Report
 `;
 }
 
@@ -93,9 +112,14 @@ function failure(json: boolean, command: string, error: unknown): number {
 }
 
 function extractJson(args: string[]): { args: string[]; json: boolean } {
-  const count = args.filter((arg) => arg === "--json").length;
+  const separator = args.indexOf("--");
+  const boundary = separator === -1 ? args.length : separator;
+  const count = args.slice(0, boundary).filter((arg) => arg === "--json").length;
   if (count > 1) throw new UsageError("--json may be specified only once");
-  return { args: args.filter((arg) => arg !== "--json"), json: count === 1 };
+  return {
+    args: args.filter((arg, index) => index >= boundary || arg !== "--json"),
+    json: count === 1,
+  };
 }
 
 function commandName(args: string[]): string {
@@ -261,6 +285,90 @@ function parseTicketIssue(args: string[]): {
   };
 }
 
+function parseTicketDispatch(args: string[]): {
+  goalId: string;
+  changeId: string;
+  ticketId: string;
+  worker: string;
+  environmentDigest?: string;
+  command: string[];
+} {
+  const separator = args.indexOf("--");
+  if (separator === -1) throw new UsageError("ticket dispatch requires -- before the worker command");
+  const options = args.slice(0, separator);
+  const command = args.slice(separator + 1);
+  if (command.length === 0) throw new UsageError("ticket dispatch requires a worker command after --");
+
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let ticketId: string | undefined;
+  let worker: string | undefined;
+  let environmentDigest: string | undefined;
+  for (let index = 0; index < options.length; index += 2) {
+    const option = options[index]!;
+    const value = valueAfter(options, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else if (option === "--ticket") ticketId = value;
+    else if (option === "--worker") worker = value;
+    else if (option === "--environment-digest") environmentDigest = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (ticketId === undefined) throw new UsageError("--ticket is required");
+  if (worker === undefined) throw new UsageError("--worker is required");
+  return {
+    goalId,
+    changeId,
+    ticketId,
+    worker,
+    command,
+    ...(environmentDigest === undefined ? {} : { environmentDigest }),
+  };
+}
+
+function parseReportPublish(args: string[]): {
+  goalId: string;
+  changeId: string;
+  ticketId: string;
+  commitSummary?: string;
+  commitBody?: string;
+  failure?: string;
+} {
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let ticketId: string | undefined;
+  let commitSummary: string | undefined;
+  let commitBody: string | undefined;
+  let failure: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else if (option === "--ticket") ticketId = value;
+    else if (option === "--commit-summary") commitSummary = value;
+    else if (option === "--commit-body") commitBody = value;
+    else if (option === "--failure") failure = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (ticketId === undefined) throw new UsageError("--ticket is required");
+  if (failure !== undefined && (commitSummary !== undefined || commitBody !== undefined)) {
+    throw new UsageError("--failure cannot be combined with Candidate commit message options");
+  }
+  return {
+    goalId,
+    changeId,
+    ticketId,
+    ...(commitSummary === undefined ? {} : { commitSummary }),
+    ...(commitBody === undefined ? {} : { commitBody }),
+    ...(failure === undefined ? {} : { failure }),
+  };
+}
+
 function parseStatus(args: string[]): { goalId?: string } {
   if (args.length === 0) return {};
   if (args.length !== 2 || args[0] !== "--goal") throw new UsageError(`unknown status option: ${args[0]}`);
@@ -352,6 +460,12 @@ function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
 
 function decisionData(decision: ChangeDecision): unknown {
   return { ...decision.metadata, statement: decision.body.trim() };
+}
+
+function humanCleanup(cleanup: ReportPublicationCleanup): string {
+  return cleanup.status === "finalized"
+    ? "  Worker resources finalized\n"
+    : `  Cleanup warning (${cleanup.phase}): ${cleanup.message}\n`;
 }
 
 function humanReconciliation(goals: ReconciledGoal[], ignored = 0): string {
@@ -472,6 +586,81 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         },
         `Issued Ticket ${goalId}/${changeId}/${ticketId}\n` +
           `  ${relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId))}\n`,
+      );
+    }
+
+    if (args[0] === "ticket" && args[1] === "dispatch") {
+      const input = parseTicketDispatch(args.slice(2));
+      const dispatched = await dispatchLocalTicket({ cwd, ...input });
+      const identity = {
+        goalId: input.goalId,
+        changeId: input.changeId,
+        ticketId: input.ticketId,
+      };
+      return success(
+        json,
+        "ticket dispatch",
+        {
+          ticket: identity,
+          execution: dispatched.execution,
+          paths: {
+            input: relative(dispatched.root, dispatched.exchange.inputDirectory),
+            output: relative(dispatched.root, dispatched.exchange.outputDirectory),
+          },
+        },
+        `Dispatched Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
+          `  Worker exited ${dispatched.execution.exitCode}\n`,
+      );
+    }
+
+    if (args[0] === "report" && args[1] === "publish") {
+      const input = parseReportPublish(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+      const [ticket, execution] = await Promise.all([
+        loadTicket(repository.root, input.goalId, input.changeId, input.ticketId),
+        loadFinishedLocalExecution(repository.root, identity),
+      ]);
+
+      let publication;
+      if (input.failure !== undefined) {
+        publication = await publishFailedReport({
+          cwd: repository.root,
+          ...identity,
+          role: ticket.metadata.role,
+          reason: input.failure,
+          execution,
+        });
+      } else if (ticket.metadata.role === "implement") {
+        if (input.commitSummary === undefined) {
+          throw new UsageError("--commit-summary is required for a completed implementation Report");
+        }
+        publication = await publishImplementationReport({
+          cwd: repository.root,
+          ...identity,
+          execution,
+          commitMessage: {
+            summary: input.commitSummary,
+            ...(input.commitBody === undefined ? {} : { body: input.commitBody }),
+          },
+        });
+      } else {
+        if (input.commitSummary !== undefined || input.commitBody !== undefined) {
+          throw new UsageError("review Reports do not accept Candidate commit message options");
+        }
+        publication = await publishReviewReport({ cwd: repository.root, ...identity, execution });
+      }
+
+      return success(
+        json,
+        "report publish",
+        {
+          report: publication.report.metadata,
+          cleanup: publication.cleanup,
+          path: relative(repository.root, reportPath(repository.root, input.goalId, input.changeId, input.ticketId)),
+        },
+        `Published ${publication.report.metadata.outcome} Report ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
+          humanCleanup(publication.cleanup),
       );
     }
 

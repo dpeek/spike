@@ -49,6 +49,24 @@ spike ticket issue \
 
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
+Dispatch accepts no model overrides: it runs a controlled direct command with
+the immutable selection from `ticket.md`, then preserves execution provenance
+and exchange output for a later publication process:
+
+```bash
+spike ticket dispatch \
+  --goal <goal-id> --change 001 --ticket 001 \
+  --worker scripted-implementer \
+  -- ./scripted-worker
+
+spike report publish \
+  --goal <goal-id> --change 001 --ticket 001 \
+  --commit-summary "Implement the Change"
+```
+
+A completed review Report needs no commit message options. To seal a worker
+failure instead, use `--failure "<reason>"`. Report publication returns worker
+cleanup status and retains a warning when finalization must be retried.
 
 Planner-facing commands derive status from durable documents, atomically revise
 the Plan, resolve Changes, and reconcile interrupted repository state:

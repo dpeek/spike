@@ -302,6 +302,7 @@ async function replaceWorkerRecord(root: string, record: RecordedWorker): Promis
 
 const localWorkerResourceOperations: LocalWorkerResourceOperations = {
   async stop(pid, identity) {
+    if (pid === undefined) return;
     const live = liveDirectWorkers.get(workerKey(identity));
     if (live === undefined) {
       throw new Error("direct worker session is unavailable after restart; refusing to signal a persisted PID");
@@ -373,6 +374,23 @@ export async function forgetFinalizedWorker(root: string, identity: TicketIdenti
   if (record === undefined) return;
   if (record.metadata.resource !== undefined) throw new Error("cannot forget Worker record before resources are finalized");
   await rm(workerRecordPath(root, identity));
+}
+
+export async function loadFinishedLocalExecution(
+  root: string,
+  identity: TicketIdentity,
+): Promise<LocalCloneExecution> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record === undefined) {
+    throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker execution evidence`);
+  }
+  if (record.metadata.finishedAt === undefined || record.metadata.exitCode === undefined) {
+    throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker has not finished`);
+  }
+  if (record.metadata.resource?.pid !== undefined) {
+    throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker still has a live process handle`);
+  }
+  return localExecution(record.metadata, record.metadata.finishedAt);
 }
 
 function contextBody(role: "implement" | "review", inputRevision: string): string {
@@ -517,6 +535,8 @@ export async function dispatchLocalTicket(
         SPIKE_GOAL_ID: input.goalId,
         SPIKE_CHANGE_ID: input.changeId,
         SPIKE_TICKET_ID: input.ticketId,
+        SPIKE_MODEL: ticket.metadata.model,
+        SPIKE_THINKING: ticket.metadata.thinking,
       },
       stdin: "ignore",
       stdout: "pipe",
@@ -539,14 +559,13 @@ export async function dispatchLocalTicket(
     finishedAt = clock().toISOString();
   } finally {
     try {
-      await rm(workspace, { recursive: true, force: true });
       if (workerRecord !== undefined) {
         finishedAt ||= new Date().toISOString();
         workerRecord = {
           ...workerRecord,
           metadata: workerRecordSchema.parse({
             ...workerRecord.metadata,
-            resource: undefined,
+            resource: { workspace },
             finishedAt,
             exitCode,
           }),

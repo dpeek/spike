@@ -16,6 +16,8 @@ import { discoverRepository } from "./git.ts";
 import { loadTicket, reportPath, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
+  loadRecordedWorkerIfPresent,
+  stopAndFinalizeRecordedWorker,
   ticketOutputPath,
   type LocalCloneExecution,
   type TicketIdentity,
@@ -228,6 +230,10 @@ export type PublishInterruptedReportInput = TicketIdentity & {
 };
 
 export type PublishStoppedReportInput = PublishInterruptedReportInput;
+
+export type ReportPublicationCleanup =
+  | { status: "finalized" }
+  | { status: "failed"; phase: "stop" | "cleanup"; message: string };
 
 const maximumBundleBytes = 100 * 1024 * 1024;
 const maximumArtifactBytes = 16 * 1024 * 1024;
@@ -503,6 +509,28 @@ function requireTerminalReason(reason: string, outcome: "Failure" | "Interruptio
   return normalized;
 }
 
+async function finalizePublishedWorker(
+  root: string,
+  identity: TicketIdentity,
+  finishedAt: Date,
+): Promise<ReportPublicationCleanup> {
+  if ((await loadRecordedWorkerIfPresent(root, identity)) === undefined) return { status: "finalized" };
+  const result = await stopAndFinalizeRecordedWorker(root, identity, finishedAt);
+  if (result.status === "failed") {
+    return { status: "failed", phase: result.phase, message: result.message };
+  }
+  try {
+    await forgetFinalizedWorker(root, identity);
+    return { status: "finalized" };
+  } catch (error) {
+    return {
+      status: "failed",
+      phase: "cleanup",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function loadReportDocument(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
   const document = await readDocument(root, reportPath(root, goalId, changeId, ticketId));
   const metadata = reportSchema.parse(document.metadata);
@@ -710,7 +738,7 @@ export function deriveCurrentRejection(
 
 export async function publishFailedReport(
   input: PublishFailedReportInput,
-): Promise<{ root: string; report: TerminalReport }> {
+): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
@@ -746,8 +774,8 @@ export async function publishFailedReport(
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
-  await forgetFinalizedWorker(repository.root, identity);
-  return { root: repository.root, report };
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+  return { root: repository.root, report, cleanup };
 }
 
 async function publishHostTerminalReport(
@@ -809,7 +837,7 @@ export function publishStoppedReport(
 
 export async function publishImplementationReport(
   input: PublishImplementationReportInput,
-): Promise<{ root: string; report: ImplementationReport }> {
+): Promise<{ root: string; report: ImplementationReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
@@ -881,15 +909,15 @@ export async function publishImplementationReport(
         serializeDocument(metadata, submission.body),
         commitCrashHooks(input.crash, "implementation-report-publication"),
       );
-      await forgetFinalizedWorker(repository.root, identity);
-      return { root: repository.root, report };
+      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+      return { root: repository.root, report, cleanup };
     },
   );
 }
 
 export async function publishReviewReport(
   input: PublishReviewReportInput,
-): Promise<{ root: string; report: ReviewReport }> {
+): Promise<{ root: string; report: ReviewReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
@@ -956,6 +984,6 @@ export async function publishReviewReport(
     serializeDocument(metadata, submission.body),
     commitCrashHooks(input.crash, "review-report-publication"),
   );
-  await forgetFinalizedWorker(repository.root, identity);
-  return { root: repository.root, report };
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date());
+  return { root: repository.root, report, cleanup };
 }
