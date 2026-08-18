@@ -44,6 +44,9 @@ if (ticketId === "001") {
   if (process.env.SPIKE_MODEL !== "implementation-model" || process.env.SPIKE_THINKING !== "medium") {
     throw new Error("dispatch did not use the frozen implementation selection");
   }
+  if (process.env.SPIKE_TICKET_ROLE !== "implement" || process.env.SPIKE_BIN !== ${JSON.stringify(spikePath)}) {
+    throw new Error("dispatch did not expose the implementation completion environment");
+  }
   await writeFile("direct-cli.txt", "approved through direct CLI\n");
   await complete({
     summary: "Added direct CLI behavior.",
@@ -54,6 +57,9 @@ if (ticketId === "001") {
 } else if (ticketId === "002") {
   if (process.env.SPIKE_MODEL !== "review-model" || process.env.SPIKE_THINKING !== "high") {
     throw new Error("dispatch did not use the frozen review selection");
+  }
+  if (process.env.SPIKE_TICKET_ROLE !== "review" || process.env.SPIKE_BIN !== ${JSON.stringify(spikePath)}) {
+    throw new Error("dispatch did not expose the review completion environment");
   }
   await complete({
     reviewStatement: "The exact Candidate is approved.",
@@ -131,6 +137,8 @@ describe("direct CLI tracer bullet", () => {
     expect(implementationDispatch.data.execution).toMatchObject({
       exitCode: 0, model: "implementation-model", thinking: "medium",
     });
+    expect(await readFile(join(repository.root, implementationDispatch.data.paths.input, "context.md"), "utf8"))
+      .toContain("spike_complete_implementation");
 
     const implementationPublication = await spike(repository.root, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001",
@@ -159,6 +167,8 @@ describe("direct CLI tracer bullet", () => {
       "--worker", "direct-cli-reviewer", "--", "bun", "-e", worker,
     ]);
     expect(reviewDispatch.data.execution).toMatchObject({ exitCode: 0, model: "review-model", thinking: "high" });
+    expect(await readFile(join(repository.root, reviewDispatch.data.paths.input, "context.md"), "utf8"))
+      .toContain("spike_complete_review");
 
     const reviewPublication = await spike(repository.root, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "002",

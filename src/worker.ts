@@ -401,7 +401,7 @@ The private checkout starts at the exact Candidate \`${inputRevision}\`.
 
 ## Declared output
 
-Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`, then complete the Ticket with JSON via \`spike worker complete --file payload.json\` or stdin. The review payload contains:
+Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with the terminating \`spike_complete_review\` tool. Scripted workers may instead use \`spike worker complete --file payload.json\` or stdin. The review payload contains:
 
 - non-blank \`reviewStatement\`;
 - \`findings\` with unique kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and non-blank \`statement\`;
@@ -418,7 +418,7 @@ The private checkout starts at exact revision \`${inputRevision}\`.
 
 ## Declared output
 
-Implement in the private checkout, write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`, then complete the Ticket with JSON via \`spike worker complete --file payload.json\` or stdin. The implementation payload contains non-blank \`summary\`, \`verification\`, \`assumptions\`, \`limitations\`, \`risks\`, and \`followUp\` strings plus \`artifacts\`, an array of declared paths below \`artifacts/\`.
+Implement in the private checkout and write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with the terminating \`spike_complete_implementation\` tool. Scripted workers may instead use \`spike worker complete --file payload.json\` or stdin. The implementation payload contains non-blank \`summary\`, \`verification\`, \`assumptions\`, \`limitations\`, \`risks\`, and \`followUp\` strings plus \`artifacts\`, an array of declared paths below \`artifacts/\`.
 
 Spike snapshots the checkout, creates \`repository.bundle\`, validates and digests artifacts, and atomically writes the canonical \`submission.md\` last. Do not write a Submission or Git bundle yourself.
 `;
@@ -534,8 +534,10 @@ export async function dispatchLocalTicket(
         SPIKE_GOAL_ID: input.goalId,
         SPIKE_CHANGE_ID: input.changeId,
         SPIKE_TICKET_ID: input.ticketId,
+        SPIKE_TICKET_ROLE: ticket.metadata.role,
         SPIKE_MODEL: ticket.metadata.model,
         SPIKE_THINKING: ticket.metadata.thinking,
+        SPIKE_BIN: process.env["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike"),
       },
       stdin: "ignore",
       stdout: "pipe",

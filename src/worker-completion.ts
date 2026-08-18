@@ -125,6 +125,7 @@ function assertEnvironmentMatchesTicket(ticket: Ticket): void {
     ["SPIKE_GOAL_ID", ticket.metadata.goalId],
     ["SPIKE_CHANGE_ID", ticket.metadata.changeId],
     ["SPIKE_TICKET_ID", ticket.metadata.ticketId],
+    ["SPIKE_TICKET_ROLE", ticket.metadata.role],
     ["SPIKE_INPUT_REVISION", ticket.metadata.inputRevision],
   ];
   for (const [name, value] of expected) {

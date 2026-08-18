@@ -80,6 +80,13 @@ payloads contain `reviewStatement`, `findings`, `acceptanceAssessment`,
 implementation checkout, creates its bundle, and publishes canonical
 `submission.md` last.
 
+The Pi worker extension is `src/pi-worker-extension.ts`. Ticket launchers load
+it with exactly one terminating tool selected by the immutable Ticket role:
+`spike_complete_implementation` or `spike_complete_review`. The extension sends
+tool arguments to `spike worker complete --json`; it does not import Spike
+internals or format durable files. A rejected payload remains retryable and
+only an accepted completion terminates the agent turn.
+
 A completed review Report needs no commit message options. To seal a worker
 failure instead, use `--failure "<reason>"`. Report publication returns worker
 cleanup status and retains a warning when finalization must be retried.
