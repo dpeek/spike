@@ -49,19 +49,27 @@ spike ticket issue \
 
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
-Dispatch accepts no model overrides: it runs a controlled direct command with
-the immutable selection from `ticket.md`, then preserves execution provenance
-and exchange output for a later publication process:
+Pi dispatch accepts no model, thinking, role, prompt, or extension overrides. It
+launches one fresh non-interactive Pi process with the immutable selection from
+`ticket.md`, the role-specific completion extension, and the exact Ticket input
+revision. Exchange output remains staging until a separate publication command:
 
 ```bash
-spike ticket dispatch \
+spike ticket dispatch-pi \
   --goal <goal-id> --change 001 --ticket 001 \
-  --worker scripted-implementer \
-  -- ./scripted-worker
+  --worker pi-implementer
 
 spike report publish \
   --goal <goal-id> --change 001 --ticket 001 \
   --commit-summary "Implement the Change"
+```
+
+Arbitrary commands remain available only as the explicit controlled-test fallback:
+
+```bash
+spike ticket dispatch-test \
+  --goal <goal-id> --change 001 --ticket 001 \
+  --worker scripted-implementer -- ./scripted-worker
 ```
 
 Inside the private worker checkout, structured completion reads the Ticket from

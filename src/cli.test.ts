@@ -153,18 +153,18 @@ describe("spike CLI", () => {
     );
 
     const rejectedOverride = await spikeAt(repository.root, [
-      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "scripted-failure", "--model", "dispatch-override", "--json", "--", "bun", "-e", "process.exit(19)",
     ]);
     expect(rejectedOverride.exitCode).toBe(2);
     expect(JSON.parse(rejectedOverride.stdout)).toEqual({
       ok: false,
-      command: "ticket dispatch",
+      command: "ticket dispatch-test",
       error: { code: "usage", message: "unknown option: --model" },
     });
 
     const dispatched = await spikeAt(repository.root, [
-      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "scripted-failure", "--json", "--", "bun", "-e",
       'if (process.env.SPIKE_MODEL !== "frozen-model" || process.env.SPIKE_THINKING !== "low") process.exit(99); console.log("controlled failure"); process.exit(19)',
     ]);
@@ -172,7 +172,7 @@ describe("spike CLI", () => {
     expect(dispatched.stderr).toBe("");
     expect(JSON.parse(dispatched.stdout)).toMatchObject({
       ok: true,
-      command: "ticket dispatch",
+      command: "ticket dispatch-test",
       data: {
         execution: {
           worker: "scripted-failure",

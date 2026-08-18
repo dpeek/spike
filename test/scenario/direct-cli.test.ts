@@ -131,7 +131,7 @@ describe("direct CLI tracer bullet", () => {
     await writeFile(join(repository.root, "spike.json"), `${JSON.stringify(config, null, 2)}\n`);
 
     const implementationDispatch = await spike(repository.root, [
-      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "001",
+      "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "direct-cli-implementer", "--", "bun", "-e", worker,
     ]);
     expect(implementationDispatch.data.execution).toMatchObject({
@@ -163,7 +163,7 @@ describe("direct CLI tracer bullet", () => {
     });
 
     const reviewDispatch = await spike(repository.root, [
-      "ticket", "dispatch", "--goal", goalId, "--change", "001", "--ticket", "002",
+      "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "002",
       "--worker", "direct-cli-reviewer", "--", "bun", "-e", worker,
     ]);
     expect(reviewDispatch.data.execution).toMatchObject({ exitCode: 0, model: "review-model", thinking: "high" });

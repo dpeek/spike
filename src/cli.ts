@@ -29,7 +29,7 @@ import {
 } from "./status.ts";
 import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
 import { completeWorker, readWorkerPayload } from "./worker-completion.ts";
-import { dispatchLocalTicket, loadFinishedLocalExecution } from "./worker.ts";
+import { dispatchLocalTicket, dispatchPiTicket, loadFinishedLocalExecution } from "./worker.ts";
 
 export const version = "2.0.0-dev";
 
@@ -45,7 +45,8 @@ Usage:
   spike change reject --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike change abandon --goal <goal-id> --change <change-id> --statement <statement> [--json]
   spike ticket issue --goal <goal-id> --change <change-id> --instruction <instruction> [options]
-  spike ticket dispatch --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
+  spike ticket dispatch-pi --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity>
+  spike ticket dispatch-test --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
   spike worker complete [--file <payload.json>] [--json]
   spike report publish --goal <goal-id> --change <change-id> --ticket <ticket-id> [options]
   spike recover [--goal <goal-id>] [--reason <reason>] [--json]
@@ -78,10 +79,13 @@ Ticket issuance options:
   --model <model>                Override the role's configured model for this Ticket
   --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
 
-Ticket dispatch options:
+Pi dispatch options:
+  --worker <identity>             Worker identity recorded in Report provenance
+
+Controlled-test dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
   --environment-digest <digest>  Optional immutable environment identity
-  -- <command> [args...]          Controlled direct worker command
+  -- <command> [args...]          Explicit controlled-test worker command
 
 Worker completion options:
   --file <path>                  Read JSON payload from a file; omit or use - for stdin
@@ -290,7 +294,33 @@ function parseTicketIssue(args: string[]): {
   };
 }
 
-function parseTicketDispatch(args: string[]): {
+function parsePiDispatch(args: string[]): {
+  goalId: string;
+  changeId: string;
+  ticketId: string;
+  worker: string;
+} {
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  let ticketId: string | undefined;
+  let worker: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else if (option === "--ticket") ticketId = value;
+    else if (option === "--worker") worker = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (changeId === undefined) throw new UsageError("--change is required");
+  if (ticketId === undefined) throw new UsageError("--ticket is required");
+  if (worker === undefined) throw new UsageError("--worker is required");
+  return { goalId, changeId, ticketId, worker };
+}
+
+function parseTestDispatch(args: string[]): {
   goalId: string;
   changeId: string;
   ticketId: string;
@@ -299,10 +329,10 @@ function parseTicketDispatch(args: string[]): {
   command: string[];
 } {
   const separator = args.indexOf("--");
-  if (separator === -1) throw new UsageError("ticket dispatch requires -- before the worker command");
+  if (separator === -1) throw new UsageError("ticket dispatch-test requires -- before the worker command");
   const options = args.slice(0, separator);
   const command = args.slice(separator + 1);
-  if (command.length === 0) throw new UsageError("ticket dispatch requires a worker command after --");
+  if (command.length === 0) throw new UsageError("ticket dispatch-test requires a worker command after --");
 
   let goalId: string | undefined;
   let changeId: string | undefined;
@@ -600,17 +630,38 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       );
     }
 
-    if (args[0] === "ticket" && args[1] === "dispatch") {
-      const input = parseTicketDispatch(args.slice(2));
-      const dispatched = await dispatchLocalTicket({ cwd, ...input });
-      const identity = {
-        goalId: input.goalId,
-        changeId: input.changeId,
-        ticketId: input.ticketId,
-      };
+    if (args[0] === "ticket" && args[1] === "dispatch-pi") {
+      const input = parsePiDispatch(args.slice(2));
+      const dispatched = await dispatchPiTicket({
+        cwd,
+        ...input,
+        ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
+      });
+      const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       return success(
         json,
-        "ticket dispatch",
+        "ticket dispatch-pi",
+        {
+          ticket: identity,
+          classification: dispatched.classification,
+          execution: dispatched.execution,
+          paths: {
+            input: relative(dispatched.root, dispatched.exchange.inputDirectory),
+            output: relative(dispatched.root, dispatched.exchange.outputDirectory),
+          },
+        },
+        `Dispatched Pi Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
+          `  ${dispatched.classification}\n`,
+      );
+    }
+
+    if (args[0] === "ticket" && args[1] === "dispatch-test") {
+      const input = parseTestDispatch(args.slice(2));
+      const dispatched = await dispatchLocalTicket({ cwd, ...input });
+      const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+      return success(
+        json,
+        "ticket dispatch-test",
         {
           ticket: identity,
           execution: dispatched.execution,
@@ -619,7 +670,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
             output: relative(dispatched.root, dispatched.exchange.outputDirectory),
           },
         },
-        `Dispatched Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
+        `Dispatched controlled-test Ticket ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
           `  Worker exited ${dispatched.execution.exitCode}\n`,
       );
     }

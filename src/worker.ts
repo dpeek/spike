@@ -46,6 +46,18 @@ export type DispatchLocalTicketInput = TicketIdentity & {
   clock?: () => Date;
 };
 
+export type DispatchPiTicketInput = TicketIdentity & {
+  cwd: string;
+  worker: string;
+  piExecutable?: string;
+  clock?: () => Date;
+};
+
+export type PiDispatchClassification =
+  | "accepted-submission"
+  | "missing-submission"
+  | "failed-execution";
+
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const nonBlankString = z.string().refine((value) => value.trim().length > 0, "must not be blank");
 const workerRecordSchema = z
@@ -597,6 +609,70 @@ export async function dispatchLocalTicket(
       stderr,
     },
   };
+}
+
+function piCompletionTool(role: "implement" | "review"): string {
+  return role === "implement" ? "spike_complete_implementation" : "spike_complete_review";
+}
+
+async function acceptedSubmission(outputDirectory: string): Promise<boolean> {
+  try {
+    const stat = await lstat(join(outputDirectory, "submission.md"));
+    return stat.isFile() && !stat.isSymbolicLink();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export async function dispatchPiTicket(
+  input: DispatchPiTicketInput,
+): Promise<{
+  root: string;
+  exchange: TicketExchange;
+  execution: LocalCloneExecution;
+  classification: PiDispatchClassification;
+}> {
+  const repository = await discoverRepository(input.cwd);
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const inputDirectory = join(exchangePath(repository.root, identity), "input");
+  const completionTool = piCompletionTool(ticket.metadata.role);
+  const extension = resolve(import.meta.dir, "pi-worker-extension.ts");
+  const command = [
+    input.piExecutable ?? "pi",
+    "--print",
+    "--no-session",
+    "--no-approve",
+    "--model",
+    ticket.metadata.model,
+    "--thinking",
+    ticket.metadata.thinking,
+    "--no-extensions",
+    "--extension",
+    extension,
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--tools",
+    `read,bash,edit,write,${completionTool}`,
+    `@${join(inputDirectory, "ticket.md")}`,
+    `@${join(inputDirectory, "context.md")}`,
+    `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish only with ${completionTool}.`,
+  ];
+  const dispatched = await dispatchLocalTicket({
+    ...identity,
+    cwd: repository.root,
+    worker: input.worker,
+    command,
+    ...(input.clock === undefined ? {} : { clock: input.clock }),
+  });
+  const classification: PiDispatchClassification = dispatched.execution.exitCode !== 0
+    ? "failed-execution"
+    : await acceptedSubmission(dispatched.exchange.outputDirectory)
+      ? "accepted-submission"
+      : "missing-submission";
+  return { ...dispatched, classification };
 }
 
 async function dispatchLocalRole(
