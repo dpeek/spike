@@ -73,7 +73,7 @@ if (ticketId === "001") {
 }
 `;
 
-async function spike(cwd: string, args: string[]): Promise<any> {
+async function spikeResult(cwd: string, args: string[]): Promise<{ exitCode: number; output: any }> {
   const separator = args.indexOf("--");
   const jsonArgs = separator === -1
     ? [...args, "--json"]
@@ -91,9 +91,13 @@ async function spike(cwd: string, args: string[]): Promise<any> {
   ]);
   expect(stderr).toBe("");
   expect(stdout.trim().split("\n")).toHaveLength(1);
-  const output = JSON.parse(stdout);
-  if (exitCode !== 0 || output.ok !== true) throw new Error(stdout);
-  return output;
+  return { exitCode, output: JSON.parse(stdout) };
+}
+
+async function spike(cwd: string, args: string[]): Promise<any> {
+  const result = await spikeResult(cwd, args);
+  if (result.exitCode !== 0 || result.output.ok !== true) throw new Error(JSON.stringify(result.output));
+  return result.output;
 }
 
 describe("direct CLI tracer bullet", () => {
@@ -116,6 +120,15 @@ describe("direct CLI tracer bullet", () => {
       "--rationale", "The CLI must preserve workflow authority across process exits.",
       "--acceptance", "The direct CLI Candidate is independently approved.",
     ]);
+
+    const missingNetworkPolicy = await spikeResult(repository.root, [
+      "ticket", "issue", "--goal", goalId, "--change", "001",
+      "--instruction", "Do not freeze an implicit local network policy.",
+    ]);
+    expect(missingNetworkPolicy).toMatchObject({
+      exitCode: 2,
+      output: { ok: false, error: { code: "usage", message: "--network-access is required" } },
+    });
 
     const issuedImplementation = await spike(repository.root, [
       "ticket", "issue", "--goal", goalId, "--change", "001",

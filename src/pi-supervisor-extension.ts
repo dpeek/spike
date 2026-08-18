@@ -310,19 +310,19 @@ export function registerSupervisorExtension(
     tool({
       name: "spike_issue_ticket",
       label: "Issue Ticket",
-      description: "Issue the next sequential immutable Ticket with a frozen role model, thinking level, and execution policy.",
+      description: "Issue the next sequential immutable Ticket with a frozen role model, thinking level, and execution policy. The Phase 2 local-clone adapter requires an explicit unrestricted network acknowledgement.",
       promptSnippet: "Issue one bounded fresh-session Ticket",
       parameters: {
         type: "object",
         additionalProperties: false,
-        required: ["goalId", "changeId", "instruction"],
+        required: ["goalId", "changeId", "instruction", "networkAccess"],
         properties: {
           goalId: nonBlankString,
           changeId: nonBlankString,
           instruction: nonBlankString,
           role: { type: "string", enum: ["implement", "review"] },
           producingImplementationTicketId: optionalIdentity,
-          remediationReviewTicketId: optionalIdentity,
+          responseToReviewTicketId: optionalIdentity,
           context: { type: "string" },
           isolation: { type: "string", enum: ["workspace", "container"] },
           networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
@@ -339,7 +339,7 @@ export function registerSupervisorExtension(
         ];
         optional(args, "--role", params.role);
         optional(args, "--implementation-ticket", params.producingImplementationTicketId);
-        optional(args, "--remediation-review", params.remediationReviewTicketId);
+        optional(args, "--response-to-review", params.responseToReviewTicketId);
         optional(args, "--context", params.context);
         optional(args, "--isolation", params.isolation);
         optional(args, "--network-access", params.networkAccess);

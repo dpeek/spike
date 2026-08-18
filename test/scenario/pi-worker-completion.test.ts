@@ -34,11 +34,59 @@ const result = await tools[0].execute("completion-1", {
   risks: "None.",
   followUp: "Review independently.",
   artifacts: [],
-}, undefined, undefined, { cwd: process.cwd() });
+}, undefined, undefined, {
+  cwd: process.cwd(),
+  model: { provider: "openai-codex", id: "gpt-5.6-terra" },
+  thinkingLevel: "medium",
+});
 if (result.terminate !== true) throw new Error("accepted completion did not terminate the agent turn");
 `;
 
 describe("Pi worker completion boundary", () => {
+  test("rejects completion when Pi's observed selection differs from the Ticket assignment", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const goal = await createGoal({
+      cwd: repository.root,
+      title: "Verify actual Pi provenance",
+      outcome: "Reject execution that does not match immutable Ticket provenance.",
+      approval: "Approved.",
+    });
+    const goalId = goal.goal.metadata.goalId;
+    await createChange({
+      cwd: repository.root,
+      goalId,
+      title: "Verify Pi selection",
+      intent: "Compare observed execution with the Ticket assignment.",
+      rationale: "Reports must record actual rather than requested model provenance.",
+      acceptanceCriteria: ["Mismatched Pi execution cannot produce an accepted Submission."],
+    });
+    const issued = await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      instruction: "Attempt completion with mismatched observed provenance.",
+      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      model: "openai-codex/gpt-5.6-terra",
+      thinking: "medium",
+    });
+
+    const dispatched = await dispatchLocalImplementation({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      ticketId: issued.ticket.metadata.ticketId,
+      worker: "mismatched-pi-extension-worker",
+      command: ["bun", "-e", worker.replace("gpt-5.6-terra", "gpt-5.6-sol")],
+    });
+
+    expect(dispatched.execution.exitCode).not.toBe(0);
+    expect(dispatched.execution.stderr).toContain(
+      "actual worker selection openai-codex/gpt-5.6-sol/medium does not match Ticket assignment openai-codex/gpt-5.6-terra/medium",
+    );
+    expect(await Bun.file(`${dispatched.exchange.outputDirectory}/submission.md`).exists()).toBe(false);
+  });
+
   test("produces a publishable implementation exchange through only the terminating tool", async () => {
     const repository = await temporaryRepository();
     repositories.push(repository);
@@ -63,6 +111,8 @@ describe("Pi worker completion boundary", () => {
       changeId: "001",
       instruction: "Implement and complete through the role-specific Pi tool.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      model: "openai-codex/gpt-5.6-terra",
+      thinking: "medium",
     });
 
     const dispatched = await dispatchLocalImplementation({

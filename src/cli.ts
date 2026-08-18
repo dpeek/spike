@@ -73,10 +73,10 @@ Change creation options:
 Ticket issuance options:
   --role <role>                  implement (default) or review
   --implementation-ticket <id>   Producing Ticket; derived for review when omitted
-  --remediation-review <id>      Remediate review Ticket; derived for implementation
+  --response-to-review <id>      Prior review Ticket being addressed; derived for implementation
   --context <context>            Additional planner-curated context
   --isolation <level>            workspace (default) or container
-  --network-access <access>      none (default), restricted, or unrestricted
+  --network-access <access>      Required: none, restricted, or unrestricted; local dispatch requires unrestricted
   --credential <grant-id>        Repeat for each credential grant identifier
   --model <model>                Override the role's configured model for this Ticket
   --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
@@ -225,7 +225,7 @@ function parseTicketIssue(args: string[]): {
   curatedContext?: string;
   role: "implement" | "review";
   producingImplementationTicketId?: string;
-  remediationReviewTicketId?: string;
+  responseToReviewTicketId?: string;
   executionPolicy: ExecutionPolicy;
   model?: string;
   thinking?: ThinkingLevel;
@@ -235,12 +235,12 @@ function parseTicketIssue(args: string[]): {
   let instruction: string | undefined;
   let curatedContext: string | undefined;
   let producingImplementationTicketId: string | undefined;
-  let remediationReviewTicketId: string | undefined;
+  let responseToReviewTicketId: string | undefined;
   let role: "implement" | "review" = "implement";
   let model: string | undefined;
   let thinking: ThinkingLevel | undefined;
   let isolation: ExecutionPolicy["isolation"] = "workspace";
-  let networkAccess: ExecutionPolicy["networkAccess"] = "none";
+  let networkAccess: ExecutionPolicy["networkAccess"] | undefined;
   const credentialGrants: string[] = [];
 
   for (let index = 0; index < args.length; index += 2) {
@@ -256,7 +256,7 @@ function parseTicketIssue(args: string[]): {
         role = value;
         break;
       case "--implementation-ticket": producingImplementationTicketId = value; break;
-      case "--remediation-review": remediationReviewTicketId = value; break;
+      case "--response-to-review": responseToReviewTicketId = value; break;
       case "--isolation":
         if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
         isolation = value;
@@ -282,6 +282,7 @@ function parseTicketIssue(args: string[]): {
   if (goalId === undefined) throw new UsageError("--goal is required");
   if (changeId === undefined) throw new UsageError("--change is required");
   if (instruction === undefined) throw new UsageError("--instruction is required");
+  if (networkAccess === undefined) throw new UsageError("--network-access is required");
   return {
     goalId,
     changeId,
@@ -292,7 +293,7 @@ function parseTicketIssue(args: string[]): {
     ...(thinking === undefined ? {} : { thinking }),
     ...(curatedContext === undefined ? {} : { curatedContext }),
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
-    ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),
+    ...(responseToReviewTicketId === undefined ? {} : { responseToReviewTicketId }),
   };
 }
 

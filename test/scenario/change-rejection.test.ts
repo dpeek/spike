@@ -15,6 +15,7 @@ import {
   publishImplementationReport,
   publishReviewReport,
 } from "../../src/report.ts";
+import { deriveGoalStatus } from "../../src/status.ts";
 import { issueTicket, reportPath, ticketPath } from "../../src/ticket.ts";
 import { dispatchLocalImplementation, dispatchLocalReview } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
@@ -133,6 +134,35 @@ async function implementedChange() {
   };
 }
 
+async function reviewImplementedChange(
+  implemented: Awaited<ReturnType<typeof implementedChange>>,
+  reviewWorker = worker,
+) {
+  await issueTicket({
+    cwd: implemented.repository.root,
+    goalId: implemented.goalId,
+    changeId: "001",
+    role: "review",
+    instruction: "Decide whether this Candidate should be integrated, revised, or rejected.",
+    executionPolicy: policy,
+  });
+  const execution = await dispatchLocalReview({
+    cwd: implemented.repository.root,
+    goalId: implemented.goalId,
+    changeId: "001",
+    ticketId: "002",
+    command: ["bun", "-e", reviewWorker],
+    worker: "independent-reviewer",
+  });
+  return publishReviewReport({
+    cwd: implemented.repository.root,
+    goalId: implemented.goalId,
+    changeId: "001",
+    ticketId: "002",
+    execution: execution.execution,
+  });
+}
+
 async function dirtyHost(repository: Awaited<ReturnType<typeof temporaryRepository>>) {
   await writeFile(join(repository.root, "host-only.txt"), "host branch revision\n");
   await repository.git("add", "host-only.txt");
@@ -172,6 +202,44 @@ async function nextChange(repository: Awaited<ReturnType<typeof temporaryReposit
 }
 
 describe("Change rejection and abandonment", () => {
+  test("allows a fresh implementation Ticket to respond to a rejected Candidate", async () => {
+    const implemented = await implementedChange();
+    const review = await reviewImplementedChange(implemented);
+    expect(review.report.metadata.verdict).toBe("reject");
+
+    const response = await issueTicket({
+      cwd: implemented.repository.root,
+      goalId: implemented.goalId,
+      changeId: "001",
+      instruction: "Try a different implementation direction.",
+      responseToReviewTicketId: "002",
+      executionPolicy: policy,
+    });
+
+    expect(response.ticket.metadata).toMatchObject({
+      role: "implement",
+      ticketId: "003",
+      inputRevision: implemented.candidateRevision,
+      responseToReviewTicketId: "002",
+    });
+    expect(response.ticket.body).toContain("Reject this Change rather than remediate the Candidate.");
+  }, 10_000);
+
+  test("surfaces an ask-operator review as the current exact review", async () => {
+    const implemented = await implementedChange();
+    const askOperatorWorker = worker.replace('verdict: "reject"', 'verdict: "ask-operator"');
+    const review = await reviewImplementedChange(implemented, askOperatorWorker);
+    expect(review.report.metadata.verdict).toBe("ask-operator");
+
+    const status = await deriveGoalStatus(implemented.repository.root, implemented.goalId);
+    expect(status.currentChange?.review).toMatchObject({
+      ticketId: "002",
+      verdict: "ask-operator",
+      reviewedRevision: implemented.candidateRevision,
+      producingImplementationTicketId: "001",
+    });
+  }, 10_000);
+
   test("publishes a reject decision only after an exact reject review recommendation", async () => {
     const { repository, goalId, baseRevision, candidateRevision, artifactPath } = await implementedChange();
 

@@ -646,11 +646,10 @@ export async function deriveCurrentCandidate(
   return undefined;
 }
 
-async function deriveCurrentReview(
+export async function deriveCurrentReview(
   root: string,
   goalId: string,
   changeId: string,
-  verdict: ReviewReport["metadata"]["verdict"],
 ): Promise<CurrentReview | undefined> {
   const [candidate, change] = await Promise.all([
     deriveCurrentCandidate(root, goalId, changeId),
@@ -704,12 +703,20 @@ async function deriveCurrentReview(
       reviewReport.metadata.reviewedRevision === candidate.candidateRevision &&
       reviewReport.metadata.producingImplementationTicketId === candidate.producingImplementationTicketId
     ) {
-      return reviewReport.metadata.verdict === verdict
-        ? { ...candidate, reviewTicketId: ticketId, reviewReport }
-        : undefined;
+      return { ...candidate, reviewTicketId: ticketId, reviewReport };
     }
   }
   return undefined;
+}
+
+async function deriveCurrentReviewWithVerdict(
+  root: string,
+  goalId: string,
+  changeId: string,
+  verdict: ReviewReport["metadata"]["verdict"],
+): Promise<CurrentReview | undefined> {
+  const review = await deriveCurrentReview(root, goalId, changeId);
+  return review?.reviewReport.metadata.verdict === verdict ? review : undefined;
 }
 
 export function deriveCurrentRemediation(
@@ -717,7 +724,7 @@ export function deriveCurrentRemediation(
   goalId: string,
   changeId: string,
 ): Promise<CurrentRemediation | undefined> {
-  return deriveCurrentReview(root, goalId, changeId, "remediate");
+  return deriveCurrentReviewWithVerdict(root, goalId, changeId, "remediate");
 }
 
 export function deriveCurrentApproval(
@@ -725,7 +732,7 @@ export function deriveCurrentApproval(
   goalId: string,
   changeId: string,
 ): Promise<CurrentApproval | undefined> {
-  return deriveCurrentReview(root, goalId, changeId, "approve");
+  return deriveCurrentReviewWithVerdict(root, goalId, changeId, "approve");
 }
 
 export function deriveCurrentRejection(
@@ -733,7 +740,7 @@ export function deriveCurrentRejection(
   goalId: string,
   changeId: string,
 ): Promise<CurrentRejection | undefined> {
-  return deriveCurrentReview(root, goalId, changeId, "reject");
+  return deriveCurrentReviewWithVerdict(root, goalId, changeId, "reject");
 }
 
 export async function publishFailedReport(
@@ -854,18 +861,19 @@ export async function publishImplementationReport(
   matchingTicketModelSelection(ticket, input.execution);
 
   const currentCandidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
-  if (ticket.metadata.remediationReviewTicketId === undefined) {
+  if (ticket.metadata.responseToReviewTicketId === undefined) {
     if (currentCandidate !== undefined) {
-      throw new Error("implementation Ticket omits the current Candidate's remediate review Report");
+      throw new Error("implementation Ticket omits the current Candidate's review Report");
     }
   } else {
-    const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
+    const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
     if (
-      remediation === undefined ||
-      ticket.metadata.inputRevision !== remediation.candidateRevision ||
-      ticket.metadata.remediationReviewTicketId !== remediation.reviewTicketId
+      responseToReview === undefined ||
+      responseToReview.reviewReport.metadata.verdict === "approve" ||
+      ticket.metadata.inputRevision !== responseToReview.candidateRevision ||
+      ticket.metadata.responseToReviewTicketId !== responseToReview.reviewTicketId
     ) {
-      throw new Error("implementation Ticket does not select the current Candidate and its exact remediate review Report");
+      throw new Error("implementation Ticket does not select the current Candidate and its exact review Report");
     }
   }
 

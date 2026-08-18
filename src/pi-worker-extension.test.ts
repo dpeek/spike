@@ -57,9 +57,18 @@ describe("Pi worker extension", () => {
       followUp: "Review independently.",
       artifacts: [],
     };
-    const result = await tool.execute("call-1", payload, undefined, undefined, { cwd: "/worker/repository" });
+    const result = await tool.execute("call-1", payload, undefined, undefined, {
+      cwd: "/worker/repository",
+      model: { provider: "openai-codex", id: "gpt-5.6-terra" },
+      thinkingLevel: "medium",
+    });
 
-    expect(received).toEqual({ cwd: "/worker/repository", payload });
+    expect(received).toEqual({
+      cwd: "/worker/repository",
+      payload,
+      actualModel: "openai-codex/gpt-5.6-terra",
+      actualThinking: "medium",
+    });
     expect(result).toEqual({
       content: [{ type: "text", text: "Spike accepted implement Ticket goal-1/001/001." }],
       details: completion,
@@ -89,9 +98,14 @@ describe("Pi worker extension", () => {
       additionalProperties: false,
       required: ["reviewStatement", "findings", "acceptanceAssessment", "verdict", "artifacts"],
     });
-    expect((await tool.execute("call-2", {}, undefined, undefined, { cwd: "/worker/repository" })).terminate).toBe(true);
+    const context = {
+      cwd: "/worker/repository",
+      model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+      thinkingLevel: "high" as const,
+    };
+    expect((await tool.execute("call-2", {}, undefined, undefined, context)).terminate).toBe(true);
     shouldReject = true;
-    await expect(tool.execute("call-3", {}, undefined, undefined, { cwd: "/worker/repository" })).rejects.toBe(rejected);
+    await expect(tool.execute("call-3", {}, undefined, undefined, context)).rejects.toBe(rejected);
   });
 
   test("rejects a completion response for a different Ticket role", async () => {
@@ -103,9 +117,11 @@ describe("Pi worker extension", () => {
       artifacts: [],
     }));
 
-    await expect(tool.execute("call-3", {}, undefined, undefined, { cwd: "/worker/repository" })).rejects.toThrow(
-      "Spike completed a different Ticket role",
-    );
+    await expect(tool.execute("call-3", {}, undefined, undefined, {
+      cwd: "/worker/repository",
+      model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+      thinkingLevel: "high",
+    })).rejects.toThrow("Spike completed a different Ticket role");
   });
 
   test("delegates JSON to the Spike CLI process and parses its stable success response", async () => {
@@ -117,6 +133,7 @@ describe("Pi worker extension", () => {
 set -eu
 [ "$1" = worker ] && [ "$2" = complete ] && [ "$3" = --json ]
 cat > "$SPIKE_FAKE_PAYLOAD"
+printf '%s' "$SPIKE_ACTUAL_MODEL/$SPIKE_ACTUAL_THINKING" > "$SPIKE_FAKE_SELECTION"
 printf '%s\\n' '{"ok":true,"command":"worker complete","data":{"goalId":"goal-1","changeId":"001","ticketId":"001","role":"implement","workerRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifacts":[]}}'
 `);
     await chmod(executable, 0o700);
@@ -126,10 +143,17 @@ printf '%s\\n' '{"ok":true,"command":"worker complete","data":{"goalId":"goal-1"
       cwd: directory,
       payload,
       command: executable,
-      environment: { ...process.env, SPIKE_FAKE_PAYLOAD: payloadPath },
+      actualModel: "openai-codex/gpt-5.6-terra",
+      actualThinking: "medium",
+      environment: {
+        ...process.env,
+        SPIKE_FAKE_PAYLOAD: payloadPath,
+        SPIKE_FAKE_SELECTION: join(directory, "selection.txt"),
+      },
     });
 
     expect(JSON.parse(await readFile(payloadPath, "utf8"))).toEqual(payload);
+    expect(await readFile(join(directory, "selection.txt"), "utf8")).toBe("openai-codex/gpt-5.6-terra/medium");
     expect(result).toMatchObject({ goalId: "goal-1", changeId: "001", ticketId: "001", role: "implement" });
   });
 
@@ -143,11 +167,15 @@ exit 1
 `);
     await chmod(executable, 0o700);
 
-    await expect(runWorkerCompletion({ cwd: directory, payload: {}, command: executable })).rejects.toThrow(
+    const selection = {
+      actualModel: "openai-codex/gpt-5.6-terra",
+      actualThinking: "medium" as const,
+    };
+    await expect(runWorkerCompletion({ cwd: directory, payload: {}, command: executable, ...selection })).rejects.toThrow(
       "Spike rejected worker completion: Submission is invalid",
     );
     await writeFile(executable, "#!/bin/sh\nprintf '%s\\n' 'not-json'\n");
-    await expect(runWorkerCompletion({ cwd: directory, payload: {}, command: executable })).rejects.toThrow(
+    await expect(runWorkerCompletion({ cwd: directory, payload: {}, command: executable, ...selection })).rejects.toThrow(
       "Spike worker completion returned invalid JSON",
     );
     const controller = new AbortController();
@@ -156,6 +184,7 @@ exit 1
       cwd: directory,
       payload: {},
       command: executable,
+      ...selection,
       signal: controller.signal,
     })).rejects.toThrow("Spike worker completion was cancelled");
   });

@@ -134,6 +134,17 @@ function assertEnvironmentMatchesTicket(ticket: Ticket): void {
       throw new Error(`${name} does not match SPIKE_INPUT_DIR/ticket.md`);
     }
   }
+
+  const actualModel = process.env["SPIKE_ACTUAL_MODEL"] ?? process.env["SPIKE_MODEL"];
+  const actualThinking = process.env["SPIKE_ACTUAL_THINKING"] ?? process.env["SPIKE_THINKING"];
+  if (!actualModel || !actualThinking) {
+    throw new Error("worker completion requires observed model and thinking provenance");
+  }
+  if (actualModel !== ticket.metadata.model || actualThinking !== ticket.metadata.thinking) {
+    throw new Error(
+      `actual worker selection ${actualModel}/${actualThinking} does not match Ticket assignment ${ticket.metadata.model}/${ticket.metadata.thinking}`,
+    );
+  }
 }
 
 function acceptanceCriteria(ticketBody: string): string[] {

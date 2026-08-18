@@ -18,7 +18,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { loadGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
-import { deriveCurrentCandidate, deriveCurrentRemediation, loadReportIfPresent } from "./report.ts";
+import { deriveCurrentCandidate, deriveCurrentReview, loadReportIfPresent } from "./report.ts";
 
 const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
@@ -47,7 +47,7 @@ const ticketSchema = z.discriminatedUnion("role", [
   commonTicketSchema
     .extend({
       role: z.literal("implement"),
-      remediationReviewTicketId: z.string().regex(sequenceIdPattern).optional(),
+      responseToReviewTicketId: z.string().regex(sequenceIdPattern).optional(),
     })
     .strict(),
   commonTicketSchema
@@ -73,7 +73,7 @@ export type IssueTicketInput = {
   changeId: string;
   role?: "implement" | "review";
   producingImplementationTicketId?: string;
-  remediationReviewTicketId?: string;
+  responseToReviewTicketId?: string;
   instruction: string;
   curatedContext?: string;
   executionPolicy: ExecutionPolicy;
@@ -274,13 +274,14 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
       throw new Error("interrupted review Ticket does not select the latest committed Candidate");
     }
   } else if (candidate !== undefined) {
-    const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
+    const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
     if (
-      remediation === undefined ||
-      interrupted.metadata.remediationReviewTicketId !== remediation.reviewTicketId ||
-      remediation.candidateRevision !== inputRevision
+      responseToReview === undefined ||
+      responseToReview.reviewReport.metadata.verdict === "approve" ||
+      interrupted.metadata.responseToReviewTicketId !== responseToReview.reviewTicketId ||
+      responseToReview.candidateRevision !== inputRevision
     ) {
-      throw new Error("interrupted implementation Ticket does not select the latest committed remediation context");
+      throw new Error("interrupted implementation Ticket does not select the latest committed review context");
     }
   }
 
@@ -309,9 +310,9 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
     if (
       existing.metadata.role === "implement" &&
       (interrupted.metadata.role !== "implement" ||
-        existing.metadata.remediationReviewTicketId !== interrupted.metadata.remediationReviewTicketId)
+        existing.metadata.responseToReviewTicketId !== interrupted.metadata.responseToReviewTicketId)
     ) {
-      throw new Error("existing replacement implementation Ticket selects different remediation provenance");
+      throw new Error("existing replacement implementation Ticket selects different review provenance");
     }
     return { root: repository.root, ticket: existing };
   }
@@ -365,7 +366,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   });
   let derivedRevision: string;
   let producingImplementationTicketId: string | undefined;
-  let remediationReviewTicketId: string | undefined;
+  let responseToReviewTicketId: string | undefined;
   let relevantReport: { heading: string; document: string } | undefined;
   if (role === "review") {
     const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
@@ -379,8 +380,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
       );
     }
     derivedRevision = candidate.candidateRevision;
-    if (input.remediationReviewTicketId !== undefined) {
-      throw new Error("review Ticket must not reference a remediation review Ticket");
+    if (input.responseToReviewTicketId !== undefined) {
+      throw new Error("review Ticket must not reference a prior review Ticket");
     }
     producingImplementationTicketId = candidate.producingImplementationTicketId;
     relevantReport = {
@@ -393,26 +394,29 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     }
     const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
     if (candidate === undefined) {
-      if (input.remediationReviewTicketId !== undefined) {
-        throw new Error("initial implement Ticket must not reference a remediation review Ticket");
+      if (input.responseToReviewTicketId !== undefined) {
+        throw new Error("initial implement Ticket must not reference a prior review Ticket");
       }
       derivedRevision = change.metadata.baseRevision;
     } else {
-      const remediation = await deriveCurrentRemediation(repository.root, input.goalId, input.changeId);
-      if (remediation === undefined) {
-        throw new Error(`current Candidate ${candidate.candidateRevision} has no exact remediate review Report`);
+      const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
+      if (responseToReview === undefined) {
+        throw new Error(`current Candidate ${candidate.candidateRevision} has no exact review Report`);
+      }
+      if (responseToReview.reviewReport.metadata.verdict === "approve") {
+        throw new Error(`current Candidate ${candidate.candidateRevision} is already approved`);
       }
       if (
-        input.remediationReviewTicketId !== undefined &&
-        input.remediationReviewTicketId !== remediation.reviewTicketId
+        input.responseToReviewTicketId !== undefined &&
+        input.responseToReviewTicketId !== responseToReview.reviewTicketId
       ) {
-        throw new Error(`remediation implement Ticket must use remediate review Ticket ${remediation.reviewTicketId}`);
+        throw new Error(`implementation Ticket must respond to review Ticket ${responseToReview.reviewTicketId}`);
       }
-      derivedRevision = remediation.candidateRevision;
-      remediationReviewTicketId = remediation.reviewTicketId;
+      derivedRevision = responseToReview.candidateRevision;
+      responseToReviewTicketId = responseToReview.reviewTicketId;
       relevantReport = {
-        heading: "Remediation review Report",
-        document: serializeDocument(remediation.reviewReport.metadata, remediation.reviewReport.body),
+        heading: "Review Report being addressed",
+        document: serializeDocument(responseToReview.reviewReport.metadata, responseToReview.reviewReport.body),
       };
     }
   }
@@ -433,7 +437,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     thinking: modelSelection.thinking,
     executionPolicy: policy,
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
-    ...(remediationReviewTicketId === undefined ? {} : { remediationReviewTicketId }),
+    ...(responseToReviewTicketId === undefined ? {} : { responseToReviewTicketId }),
   });
   const body = ticketBody(role, instruction, goal.body, change.body, plan.body, input.curatedContext, relevantReport);
 

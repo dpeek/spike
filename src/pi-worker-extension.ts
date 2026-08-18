@@ -18,7 +18,12 @@ type ToolResult = {
   terminate: true;
 };
 
-type ToolContext = { cwd: string };
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ToolContext = {
+  cwd: string;
+  model?: { provider?: string; id?: string };
+  thinkingLevel?: string;
+};
 type ToolDefinition = {
   name: string;
   label: string;
@@ -43,6 +48,8 @@ export type WorkerExtensionApi = {
 export type RunWorkerCompletionInput = {
   cwd: string;
   payload: unknown;
+  actualModel: string;
+  actualThinking: ThinkingLevel;
   signal?: AbortSignal;
   command?: string;
   environment?: NodeJS.ProcessEnv;
@@ -163,7 +170,11 @@ export async function runWorkerCompletion(input: RunWorkerCompletionInput): Prom
   return new Promise<CompletionData>((resolve, reject) => {
     const child = spawn(command, ["worker", "complete", "--json"], {
       cwd: input.cwd,
-      env: input.environment ?? process.env,
+      env: {
+        ...(input.environment ?? process.env),
+        SPIKE_ACTUAL_MODEL: input.actualModel,
+        SPIKE_ACTUAL_THINKING: input.actualThinking,
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
@@ -224,6 +235,17 @@ function requiredRole(role: string | undefined): WorkerRole {
   throw new Error("SPIKE_TICKET_ROLE must be implement or review");
 }
 
+function actualSelection(context: ToolContext): { actualModel: string; actualThinking: ThinkingLevel } {
+  const provider = context.model?.provider?.trim();
+  const id = context.model?.id?.trim();
+  if (!provider || !id) throw new Error("Pi worker completion cannot observe the active model");
+  const actualThinking = context.thinkingLevel;
+  if (!actualThinking || !["off", "minimal", "low", "medium", "high", "xhigh"].includes(actualThinking)) {
+    throw new Error("Pi worker completion cannot observe a supported effective thinking level");
+  }
+  return { actualModel: `${provider}/${id}`, actualThinking: actualThinking as ThinkingLevel };
+}
+
 function toolForRole(
   role: WorkerRole,
   complete: (input: RunWorkerCompletionInput) => Promise<CompletionData>,
@@ -250,6 +272,7 @@ function toolForRole(
       const completion = await complete({
         cwd: context.cwd,
         payload: params,
+        ...actualSelection(context),
         ...(signal === undefined ? {} : { signal }),
         ...(options.command === undefined ? {} : { command: options.command }),
         ...(options.environment === undefined ? {} : { environment: options.environment }),

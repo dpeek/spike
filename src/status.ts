@@ -9,10 +9,8 @@ import { git, discoverRepository } from "./git.ts";
 import { integratedRef, listGoalIds, loadGoal } from "./goal.ts";
 import { detectChangeChurn, loadPlan, type ChurnIndicator } from "./plan.ts";
 import {
-  deriveCurrentApproval,
   deriveCurrentCandidate,
-  deriveCurrentRejection,
-  deriveCurrentRemediation,
+  deriveCurrentReview,
   loadChangeReportHistory,
   loadReportIfPresent,
 } from "./report.ts";
@@ -113,16 +111,13 @@ async function deriveActiveChangeStatus(
   changeId: string,
   plannedTicketCount: number | undefined,
 ): Promise<DerivedChangeStatus> {
-  const [change, candidate, approval, remediation, rejection, openTicket, history] = await Promise.all([
+  const [change, candidate, review, openTicket, history] = await Promise.all([
     loadChange(root, goalId, changeId),
     deriveCurrentCandidate(root, goalId, changeId),
-    deriveCurrentApproval(root, goalId, changeId),
-    deriveCurrentRemediation(root, goalId, changeId),
-    deriveCurrentRejection(root, goalId, changeId),
+    deriveCurrentReview(root, goalId, changeId),
     loadOpenTicket(root, goalId, changeId),
     loadChangeReportHistory(root, goalId, changeId),
   ]);
-  const review = approval ?? remediation ?? rejection;
   return {
     changeId,
     baseRevision: change.metadata.baseRevision,

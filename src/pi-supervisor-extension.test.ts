@@ -50,6 +50,9 @@ describe("Pi supervisor extension", () => {
 
     expect([...tools.keys()]).toEqual([...supervisorToolNames]);
     for (const definition of tools.values()) expect(definition.executionMode).toBe("sequential");
+    expect(tools.get("spike_issue_ticket")!.parameters).toMatchObject({
+      required: ["goalId", "changeId", "instruction", "networkAccess"],
+    });
 
     const calls: Array<[string, unknown]> = [
       ["spike_status", { goalId: "goal-1" }],
@@ -69,7 +72,7 @@ describe("Pi supervisor extension", () => {
         changeId: "001",
         instruction: "Implement it.",
         role: "implement",
-        remediationReviewTicketId: "002",
+        responseToReviewTicketId: "002",
         context: "Use the accepted design.",
         isolation: "workspace",
         networkAccess: "unrestricted",

@@ -43,12 +43,16 @@ spike ticket issue \
   --change 001 \
   --instruction "Implement the Change" \
   --context "Preserve the current filesystem contract" \
+  --network-access unrestricted \
   --model "openai-codex/gpt-5.6-terra" \
   --thinking medium
 ```
 
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
+`--network-access unrestricted` is the explicit acknowledgement required by the
+Phase 2 local-clone adapter, which provides workspace separation but cannot
+restrict host networking.
 Pi dispatch accepts no model, thinking, role, prompt, or extension overrides. It
 launches one fresh non-interactive Pi process with the immutable selection from
 `ticket.md`, the role-specific completion extension, and the exact Ticket input

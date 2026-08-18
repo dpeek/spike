@@ -65,7 +65,7 @@ if (id === "002" || id === "004") {
   } else if (id === "003") {
     if (await readFile("candidate.txt", "utf8") !== "candidate A\n") throw new Error("remediation did not start from Candidate A tree");
     const ticket = await readFile(join(process.env.SPIKE_INPUT_DIR, "ticket.md"), "utf8");
-    if (!ticket.includes("### Remediation review Report") || !ticket.includes("correctness-001") ||
+    if (!ticket.includes("### Review Report being addressed") || !ticket.includes("correctness-001") ||
         !ticket.includes("Replace Candidate A with the remediated behavior.")) {
       throw new Error("remediation finding context is missing");
     }
@@ -210,11 +210,11 @@ describe("Candidate remediation and landing", () => {
         cwd: repository.root,
         goalId,
         changeId: "001",
-        remediationReviewTicketId: "001",
+        responseToReviewTicketId: "001",
         instruction: "Use a mismatched review.",
         executionPolicy: policy,
       }),
-    ).rejects.toThrow("must use remediate review Ticket 002");
+    ).rejects.toThrow("must respond to review Ticket 002");
 
     const remediationTicket = await issueTicket({
       cwd: repository.root,
@@ -227,9 +227,9 @@ describe("Candidate remediation and landing", () => {
       role: "implement",
       ticketId: "003",
       inputRevision: candidateA,
-      remediationReviewTicketId: "002",
+      responseToReviewTicketId: "002",
     });
-    expect(remediationTicket.ticket.body).toContain("### Remediation review Report");
+    expect(remediationTicket.ticket.body).toContain("### Review Report being addressed");
     expect(remediationTicket.ticket.body).toContain('"id": "correctness-001"');
     expect(remediationTicket.ticket.body).toContain("Replace Candidate A with the remediated behavior.");
 
@@ -309,11 +309,11 @@ describe("Candidate remediation and landing", () => {
         cwd: repository.root,
         goalId,
         changeId: "001",
-        remediationReviewTicketId: "002",
+        responseToReviewTicketId: "002",
         instruction: "Retry the stale Candidate A review pair.",
         executionPolicy: policy,
       }),
-    ).rejects.toThrow(`current Candidate ${candidateB} has no exact remediate review Report`);
+    ).rejects.toThrow(`current Candidate ${candidateB} has no exact review Report`);
     await expect(
       landChange({ cwd: repository.root, goalId, changeId: "001" }),
     ).rejects.toThrow(`current Candidate ${candidateB} has no exact approve review Report`);
