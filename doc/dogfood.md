@@ -179,3 +179,40 @@ Report publication validated the standard exchange, installed the immutable Repo
 - Terminal read and attachment are operational surfaces only; neither changed the Submission, Report, or Ticket status.
 - A focused deterministic extension test proves a rejected completion does not request shutdown and a corrected accepted retry does. The attended model completed validly on its first completion call, so rejection was not artificially induced in the live run.
 - Direct Pi remains headless `--print --no-session`; Docker was not exercised and remains Phase 3.
+
+## Evidence: 2026-08-18 complete headed supervisor workflow
+
+This final disposable run combined the earlier supervisor/recovery workflow with the headed worker lifecycle:
+
+- Spike commit: `53b71bd` (`Headed herdr pis`)
+- disposable repository: `/tmp/spike-phase2-exit.QIZX5x`
+- Goal: `goal-1883bf0e6ff9e16bd4dca102b1347e89`
+- Change: `001`
+- initial revision: `b34b1960532b7bf96998f4cb8e84b71af82bf48f`
+- supervisor tab/pane: `w6:tF` / `w6:pF`
+- first supervisor session: `01a0134d-2cf0-7fd5-b43f-037c289293c1`
+- restarted supervisor session: `01a01350-b657-7c22-bcb4-c17530222e1d`
+- implementation tab/pane: `w6:tG` / `w6:pG`
+- implementation worker revision: `b377f0063c92a601674ddd200604333dd6e7b66f`
+- implementation Report SHA-256: `c5822567afdcb11a5cc5145f0f82ec0d965c07de00c67e26aea6fb44a5e9c2d8`
+- review tab/pane: `w6:tH` / `w6:pH`
+- review Report SHA-256: `f6ec2b33387612fc403612d495e3e09c2538d22e540ceeb598036fdd11070945`
+- normalized, approved, and landed Candidate: `ca6548574d97f36fabe015ff798ea848daa66b2b`
+
+After the operator created the approved Goal, a real `spike planner` using only the supervisor extension read status, revised the Plan, created Change `001`, issued implementation Ticket `001`, dispatched a fresh headed Pi implementer, and observed its live `working` status and terminal. The immutable Ticket froze `openai-codex/gpt-5.6-terra` at medium thinking and exact input `b34b1960532b7bf96998f4cb8e84b71af82bf48f`.
+
+The implementation worker completed through `spike_complete_implementation`, requested graceful shutdown, exited zero, and wrote its execution marker. Its Ticket remained open, Report absent, runtime record present, and ephemeral tab present. The first supervisor exited; a fresh `spike planner` reconstructed the open Ticket and opaque Herdr handles, observed marker-backed `done`, read the terminal, and published the Report. Publication installed `report.md` before finalization closed tab `w6:tG` and removed the runtime workspace.
+
+The restarted supervisor issued review Ticket `002` at the exact Candidate and dispatched a fresh headed reviewer with `openai-codex/gpt-5.6-sol` at high thinking. While the reviewer was naturally `working`, bounded terminal read succeeded. The exact `spike worker attach` command was run in a pseudo-TTY and detached using `Ctrl+B`, `q` with exit code zero; the reviewer remained `working` afterward. The reviewer independently ran the fixture tests and TypeScript checks, assessed all four canonical criteria exactly once, selected implementation Ticket `001` and Candidate `ca6548574d97f36fabe015ff798ea848daa66b2b`, and approved with one low-severity non-blocking finding.
+
+Review completion also shut Pi down gracefully and became `done` only after the zero-exit execution marker appeared. Before publication, `submission.md` and the marker existed, `report.md` did not, and tab `w6:tH` remained present. The supervisor published the immutable approving Report; only afterward did cleanup close the tab and remove its runtime record and workspace. The supervisor then landed Change `001`, revised the Plan, and derived a completed Goal with healthy cleanup and no warnings.
+
+Final Git verification established:
+
+- Candidate `ca6548574d97f36fabe015ff798ea848daa66b2b` has exactly one parent, initial revision `b34b1960532b7bf96998f4cb8e84b71af82bf48f`;
+- the implementation Ticket retention ref and Goal integration ref both equal that exact Candidate;
+- the review Report and landing decision select that exact Candidate;
+- host `HEAD` remained `b34b1960532b7bf96998f4cb8e84b71af82bf48f`, with no tracked worktree changes;
+- both worker tabs, runtime records, and workspaces were gone; after closing the supervisor tab, only the original operator tab remained.
+
+`bun run check` passed before the smoke with 53 tests. Natural blocked state and live rejected-completion retry were not induced; the documented boundaries and deterministic regressions remain their evidence. This run supplies the combined Phase 2 exit evidence.

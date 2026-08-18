@@ -124,7 +124,7 @@ export const herdrOperations: HerdrOperations = {
     if (input.ansi) args.push("--ansi");
     const result = await command(args, { raw: true });
     if (result.code !== 0) throw new Error(result.stderr.trim() || `Herdr terminal read exited with code ${result.code}`);
-    return result.stdout;
+    return input.ansi ? result.stdout : Bun.stripANSI(result.stdout);
   },
 
   async attach(pane) {
