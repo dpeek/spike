@@ -889,10 +889,58 @@ function validateDockerRuntime(resource: unknown): asserts resource is DockerRun
   }).strict().parse(resource);
 }
 
+type DockerCredential = { encodedAuth: string };
+
+// Docker Pi dispatch intentionally supports only the credential required by
+// the frozen OpenAI Codex worker model.  This is Pi's stored OAuth shape;
+// retain provider-specific fields (such as accountId) when serializing it.
+const dockerPiCredentialSchema = z.object({
+  type: z.literal("oauth"),
+  access: z.string().trim().min(1),
+  refresh: z.string().trim().min(1),
+  expires: z.number().finite(),
+}).passthrough();
+const dockerPiProvider = "openai-codex";
+
+/**
+ * Read one Pi credential from an operator-named auth source.  The source is
+ * deliberately never mounted: only a newly serialized one-provider document
+ * crosses the Docker boundary, and it exists there only on tmpfs.
+ */
+export async function resolveDockerCredential(ticket: Awaited<ReturnType<typeof loadTicket>>): Promise<DockerCredential | undefined> {
+  const grants = ticket.metadata.executionPolicy.credentialGrants;
+  if (grants.length === 0) return undefined;
+  if (grants.length !== 1) throw new Error("docker adapter supports exactly one declared credential grant");
+  const provider = ticket.metadata.model.split("/", 1)[0];
+  const grant = grants[0]!.trim();
+  if (provider !== dockerPiProvider || grant !== dockerPiProvider) {
+    throw new Error("docker adapter supports only the openai-codex credential grant and model provider");
+  }
+  const source = process.env["SPIKE_PI_AUTH_FILE"];
+  if (!source?.trim()) throw new Error("SPIKE_PI_AUTH_FILE is required for a declared Docker credential grant");
+  let raw: string;
+  try {
+    const stat = await lstat(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error("invalid");
+    raw = await readFile(source, "utf8");
+  } catch {
+    throw new Error("declared Docker credential source is unavailable or invalid");
+  }
+  let document: unknown;
+  try { document = JSON.parse(raw); } catch { throw new Error("declared Docker credential source is malformed"); }
+  if (typeof document !== "object" || document === null || Array.isArray(document)) {
+    throw new Error("declared Docker credential source is malformed");
+  }
+  const credential = (document as Record<string, unknown>)[provider];
+  if (!dockerPiCredentialSchema.safeParse(credential).success) {
+    throw new Error("declared Docker credential grant is absent or malformed");
+  }
+  return { encodedAuth: Buffer.from(JSON.stringify({ [provider]: credential })).toString("base64") };
+}
+
 function validateDockerPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): void {
   if (ticket.metadata.executionPolicy.isolation !== "container") throw new Error("docker adapter supports only container isolation");
   if (ticket.metadata.executionPolicy.networkAccess === "restricted") throw new Error("docker adapter does not support restricted network access");
-  if (ticket.metadata.executionPolicy.credentialGrants.length > 0) throw new Error("docker adapter does not resolve credential grants");
 }
 
 async function docker(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -932,12 +980,18 @@ function dockerImage(): string {
   return process.env["SPIKE_DOCKER_IMAGE"] ?? "spike-worker:local";
 }
 
-function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: Awaited<ReturnType<typeof loadTicket>>): string[] {
+function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: Awaited<ReturnType<typeof loadTicket>>, credential?: DockerCredential): string[] {
   const values = {
     ...workerEnvironment(exchange, revision, ticket),
     SPIKE_INPUT_DIR: "/exchange/input",
     SPIKE_OUTPUT_DIR: "/exchange/output",
     SPIKE_BIN: "/opt/spike/bin/spike",
+    PI_CODING_AGENT_DIR: "/tmp/pi-agent",
+    PI_CODING_AGENT_SESSION_DIR: "/tmp/pi-sessions",
+    PI_OFFLINE: "1",
+    PI_SKIP_VERSION_CHECK: "1",
+    PI_TELEMETRY: "0",
+    ...(credential === undefined ? {} : { SPIKE_PI_AUTH_B64: credential.encodedAuth }),
   };
   return Object.entries(values).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
@@ -966,8 +1020,9 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
-  // Validate before preparing an exchange or invoking Docker create.
+  // Validate and resolve before preparing an exchange or invoking Docker create.
   validateDockerPolicy(ticket);
+  const credential = await resolveDockerCredential(ticket);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const image = dockerImage();
   const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", image]);
@@ -984,7 +1039,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
       "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,noexec,nosuid,size=256m", 
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
-      "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket), imageDigest, ...input.command,
+      "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
     ]);
     validateDockerRuntime({ containerId, imageDigest });
     const createdImageDigest = await dockerRequired(["inspect", "--format", "{{.Image}}", containerId]);
@@ -1247,14 +1302,17 @@ export async function dispatchPiTicket(
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const inputDirectory = join(exchangePath(repository.root, identity), "input");
+  const container = selectWorkerAdapter(ticket.metadata.executionPolicy) === dockerWorkerAdapter;
+  // Docker receives no host checkout paths. The pinned image contains both Pi
+  // and this extension, while its entrypoint clones the immutable input bundle.
+  const inputDirectory = container ? "/exchange/input" : join(exchangePath(repository.root, identity), "input");
   const terminalTools = piTerminalTools(ticket.metadata.role);
-  const extension = resolve(import.meta.dir, "pi-worker-extension.ts");
+  const extension = container ? "/opt/spike/src/pi-worker-extension.ts" : resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
-    input.piExecutable ?? "pi",
+    container ? "/usr/local/bin/pi" : input.piExecutable ?? "pi",
     ...(input.host === "direct" ? ["--print"] : []),
     "--no-session",
-    "--no-approve",
+    ...(container ? [] : ["--no-approve"]),
     "--model",
     ticket.metadata.model,
     "--thinking",

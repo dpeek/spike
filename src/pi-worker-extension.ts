@@ -267,7 +267,11 @@ function actualSelection(context: ToolContext): { actualModel: string; actualThi
   const provider = context.model?.provider?.trim();
   const id = context.model?.id?.trim();
   if (!provider || !id) throw new Error("Pi worker completion cannot observe the active model");
-  const actualThinking = context.thinkingLevel;
+  // Pi 0.73 reports disabled reasoning as "none" while newer Pi releases
+  // report the Ticket vocabulary's "off". Normalize only that documented
+  // spelling; every enabled level remains exact provenance.
+  const reportedThinking = context.thinkingLevel;
+  const actualThinking = reportedThinking === "none" || reportedThinking === undefined ? "off" : reportedThinking;
   if (!actualThinking || !["off", "minimal", "low", "medium", "high", "xhigh"].includes(actualThinking)) {
     throw new Error("Pi worker completion cannot observe a supported effective thinking level");
   }

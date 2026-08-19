@@ -2,7 +2,8 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { issueTicket, type ExecutionPolicy } from "../../src/ticket.ts";
-import { dockerWorkerAdapter, loadRecordedWorkerIfPresent } from "../../src/worker.ts";
+import { dispatchPiTicket, dockerWorkerAdapter, exchangePath, loadRecordedWorkerIfPresent } from "../../src/worker.ts";
+import { publishImplementationReport } from "../../src/report.ts";
 import { temporaryRepository } from "../support/repository.ts";
 import { workerAdapterContract } from "../contract/worker-adapter.ts";
 
@@ -12,11 +13,12 @@ beforeAll(async () => {
   if (code !== 0) throw new Error(stderr);
 }, 120_000);
 
-async function fixture(policy: ExecutionPolicy = { isolation: "container", networkAccess: "none", credentialGrants: [] }) {
+async function fixture(policy: ExecutionPolicy = { isolation: "container", networkAccess: "none", credentialGrants: [] }, modelOverride?: string, instruction = "Execute Docker contract.") {
   const repository = await temporaryRepository();
+  const model = modelOverride ?? (policy.credentialGrants.length === 1 ? `${policy.credentialGrants[0]}/test-model` : "contract-model");
   const goal = await createGoal({ cwd: repository.root, title: "Docker adapter", outcome: "Exercise Docker isolation.", approval: "Approved." });
   await createChange({ cwd: repository.root, goalId: goal.goal.metadata.goalId, title: "Docker", intent: "Run Docker.", rationale: "Exercise the adapter.", acceptanceCriteria: ["Docker runs."] });
-  const issued = await issueTicket({ cwd: repository.root, goalId: goal.goal.metadata.goalId, changeId: "001", instruction: "Execute Docker contract.", executionPolicy: policy, model: "contract-model", thinking: "off" });
+  const issued = await issueTicket({ cwd: repository.root, goalId: goal.goal.metadata.goalId, changeId: "001", instruction, executionPolicy: policy, model, thinking: "off" });
   return { root: repository.root, identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId }, revision: issued.ticket.metadata.inputRevision, remove: repository.remove };
 }
 
@@ -58,6 +60,97 @@ describe("Docker worker isolation", () => {
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", unsupported.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await unsupported.remove();
+    }
+  }, 30_000);
+
+  test("resolves only the declared Pi credential before creation without mounting its source", async () => {
+    const auth = `/tmp/spike-docker-auth-${crypto.randomUUID()}.json`;
+    const prior = process.env["SPIKE_PI_AUTH_FILE"];
+    await Bun.write(auth, JSON.stringify({ "openai-codex": { type: "oauth", access: "test-secret", refresh: "test-refresh", expires: 4_102_444_800_000 }, other: { type: "api_key", key: "other-secret" } }));
+    process.env["SPIKE_PI_AUTH_FILE"] = auth;
+    const active = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
+    try {
+      await dockerWorkerAdapter.dispatch({ cwd: active.root, ...active.identity, worker: "credential-worker", command: ["true"] });
+      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const runtime = record!.metadata.runtime!.resource as { containerId: string };
+      const inspected = await Bun.$`docker inspect ${runtime.containerId}`.json();
+      expect((inspected[0].Mounts as Array<{ Destination: string }>).map((mount) => mount.Destination)).not.toContain(auth);
+      expect(JSON.stringify(record)).not.toContain("test-secret");
+      await dockerWorkerAdapter.finalize(active.root, active.identity, new Date());
+    } finally {
+      if (prior === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
+      else process.env["SPIKE_PI_AUTH_FILE"] = prior;
+      await Bun.file(auth).delete();
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
+    }
+
+    const absent = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
+    const sourceForLater = process.env["SPIKE_PI_AUTH_FILE"];
+    delete process.env["SPIKE_PI_AUTH_FILE"];
+    try {
+      let inspected = false;
+      await expect(dockerWorkerAdapter.dispatch({
+        cwd: absent.root, ...absent.identity, worker: "missing-credential", command: ["true"],
+        afterDockerImageInspection: async () => { inspected = true; },
+      })).rejects.toThrow("SPIKE_PI_AUTH_FILE");
+      expect(inspected).toBe(false);
+      expect(await loadRecordedWorkerIfPresent(absent.root, absent.identity)).toBeUndefined();
+      expect(await Bun.file(`${exchangePath(absent.root, absent.identity)}/input/ticket.md`).exists()).toBe(false);
+    } finally {
+      if (sourceForLater === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
+      else process.env["SPIKE_PI_AUTH_FILE"] = sourceForLater;
+      await Bun.spawn(["chmod", "-R", "u+w", absent.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await absent.remove();
+    }
+  }, 30_000);
+
+  test("refuses unsupported or malformed credential grants before any Docker or exchange side effect", async () => {
+    const auth = `/tmp/spike-docker-auth-${crypto.randomUUID()}.json`;
+    const prior = process.env["SPIKE_PI_AUTH_FILE"];
+    process.env["SPIKE_PI_AUTH_FILE"] = auth;
+    const valid = { "openai-codex": { type: "oauth", access: "test-secret", refresh: "test-refresh", expires: 4_102_444_800_000 } };
+    const cases: Array<{ name: string; policy: ExecutionPolicy; model?: string; document: unknown; error: string; secrets?: string[] }> = [
+      { name: "absent provider", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, document: {}, error: "absent or malformed" },
+      { name: "unknown provider", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["unknown-provider"] }, document: valid, error: "supports only" },
+      { name: "malformed credential", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, document: { "openai-codex": { nonsense: true } }, error: "absent or malformed" },
+      { name: "whitespace-only access", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, document: { "openai-codex": { type: "oauth", access: "\t \n  ", refresh: "test-refresh", expires: 4_102_444_800_000 } }, error: "absent or malformed", secrets: ["test-refresh"] },
+      { name: "whitespace-only refresh", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, document: { "openai-codex": { type: "oauth", access: "test-secret", refresh: " \n\t ", expires: 4_102_444_800_000 } }, error: "absent or malformed", secrets: ["test-secret"] },
+      { name: "provider model mismatch", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, model: "openai/test-model", document: valid, error: "supports only" },
+      { name: "multiple grants", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex", "openai-codex"] }, document: valid, error: "exactly one" },
+    ];
+    try {
+      for (const refusal of cases) {
+        await Bun.write(auth, JSON.stringify(refusal.document));
+        const active = await fixture(refusal.policy, refusal.model);
+        let inspected = false;
+        const containersBefore = await Bun.$`docker container ls --all --quiet`.text();
+        try {
+          let diagnostic: unknown;
+          try {
+            await dockerWorkerAdapter.dispatch({
+              cwd: active.root, ...active.identity, worker: `refusal-${refusal.name}`, command: ["true"],
+              afterDockerImageInspection: async () => { inspected = true; },
+            });
+          } catch (error) {
+            diagnostic = error;
+          }
+          expect(diagnostic).toBeInstanceOf(Error);
+          expect((diagnostic as Error).message).toContain(refusal.error);
+          for (const secret of refusal.secrets ?? []) expect((diagnostic as Error).message).not.toContain(secret);
+          expect(inspected).toBe(false);
+          expect(await loadRecordedWorkerIfPresent(active.root, active.identity)).toBeUndefined();
+          expect(await Bun.file(`${exchangePath(active.root, active.identity)}/input/ticket.md`).exists()).toBe(false);
+          expect(await Bun.$`docker container ls --all --quiet`.text()).toBe(containersBefore);
+        } finally {
+          await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+          await active.remove();
+        }
+      }
+    } finally {
+      if (prior === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
+      else process.env["SPIKE_PI_AUTH_FILE"] = prior;
+      await Bun.file(auth).delete();
     }
   }, 30_000);
 
@@ -109,4 +202,32 @@ describe("Docker worker isolation", () => {
       await active.remove();
     }
   }, 30_000);
+
+  const realSmoke = process.env["SPIKE_DOCKER_REAL_PI"] === "1" ? test : test.skip;
+  realSmoke("completes an implementation Ticket through Pi and publishes a cleaned Report", async () => {
+    const model = process.env["SPIKE_DOCKER_REAL_PI_MODEL"];
+    const auth = process.env["SPIKE_PI_AUTH_FILE"];
+    if (!model?.trim() || !auth?.trim()) throw new Error("SPIKE_DOCKER_REAL_PI_MODEL and SPIKE_PI_AUTH_FILE are required");
+    const provider = model.split("/", 1)[0]!;
+    const active = await fixture(
+      { isolation: "container", networkAccess: "unrestricted", credentialGrants: [provider] },
+      model,
+      "Create real-pi-smoke.txt containing exactly 'completed by real Pi'. Run bun run check. Then complete this implementation Ticket through spike_complete_implementation with concise non-blank evidence and no artifacts.",
+    );
+    try {
+      // The environment-selected model is frozen into the issued Ticket, then
+      // passed back to the pinned Pi process by the Docker dispatcher.
+      const dispatched = await dispatchPiTicket({ cwd: active.root, ...active.identity, worker: "real-pi-smoke", host: "direct" });
+      if (dispatched.hosting !== "direct" || dispatched.classification !== "accepted-submission") {
+        throw new Error(`real Pi did not submit successfully: ${dispatched.hosting === "direct" ? dispatched.classification : dispatched.status}`);
+      }
+      const published = await publishImplementationReport({ cwd: active.root, ...active.identity, execution: dispatched.execution, commitMessage: { summary: "Real Pi Docker smoke" } });
+      expect(published.report.metadata.execution.environmentDigest).toMatch(/^sha256:/);
+      expect(published.report.metadata.execution.model).toBe(model);
+      expect(await loadRecordedWorkerIfPresent(active.root, active.identity)).toBeUndefined();
+    } finally {
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
+    }
+  }, 600_000);
 });
