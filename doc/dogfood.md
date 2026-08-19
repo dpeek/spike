@@ -6,9 +6,9 @@ Use only a disposable repository. The Phase 2 local-clone adapter provides works
 
 ## Real-Pi Goal procedure
 
-From a Herdr-managed planner pane:
+From a Herdr-managed planner pane. The shell commands below remain valid raw operator commands. When exercising the supervisor, call `spike_begin_step` and read its exact committed Markdown immediately before each Goal, Plan, Change, Implement, Review, Remediate, Decide, or Recover mutation; verify a matching mutation consumes the selection and planner restart discards it.
 
-1. Create a temporary Git repository with one initial commit and a tracked `spike.json` containing planner, `implement`, and `review` model defaults.
+1. Create a temporary Git repository with one initial commit, a tracked `spike.json` containing planner, `implement`, and `review` model defaults, and all eight tracked files under `spike/guidance/`.
 2. Create the approved Goal:
    ```sh
    spike goal create --title "..." --outcome "..." --approval "..." --json

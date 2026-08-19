@@ -7,7 +7,7 @@ import { loadPlan } from "./plan.ts";
 import { issueTicket } from "./ticket.ts";
 import { workerRecordPath } from "./worker.ts";
 import { usage, version } from "./cli.ts";
-import { temporaryRepository } from "../test/support/repository.ts";
+import { fixtureGuidance, temporaryRepository } from "../test/support/repository.ts";
 
 const root = join(import.meta.dir, "..");
 const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
@@ -89,6 +89,32 @@ describe("spike CLI", () => {
       ok: false,
       command: "status",
       error: { code: "usage", message: "--json may be specified only once" },
+    });
+  });
+
+  test("shows exact committed guidance with its selected source revision", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+
+    const shown = await spikeAt(repository.root, ["guidance", "show", "--step", "goal", "--json"]);
+    expect(shown).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(shown.stdout)).toEqual({
+      ok: true,
+      command: "guidance show",
+      data: {
+        step: "goal",
+        path: "spike/guidance/goal.md",
+        sourceRevision: repository.head,
+        markdown: fixtureGuidance.goal,
+      },
+    });
+
+    const rejected = await spikeAt(repository.root, ["guidance", "show", "--step", "review", "--json"]);
+    expect(rejected.exitCode).toBe(2);
+    expect(JSON.parse(rejected.stdout)).toMatchObject({
+      ok: false,
+      command: "guidance show",
+      error: { code: "usage", message: "--goal is required for review guidance" },
     });
   });
 

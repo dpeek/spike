@@ -239,6 +239,43 @@ export async function changeStatus(root: string, goalId: string, changeId: strin
   return (await loadChangeDecisionIfPresent(root, goalId, changeId)) === undefined ? "active" : "resolved";
 }
 
+export async function deriveGoalIntegratedRevision(root: string, goalId: string): Promise<string> {
+  const goal = await loadGoal(root, goalId);
+  let integratedRevision = goal.metadata.repository.initialRevision;
+
+  for (const changeId of await listChangeIds(root, goalId)) {
+    const change = await loadChange(root, goalId, changeId);
+    if (change.metadata.baseRevision !== integratedRevision) {
+      throw new Error(
+        `Change ${goalId}/${changeId} base ${change.metadata.baseRevision} does not match rebuilt Goal integrated revision ${integratedRevision}`,
+      );
+    }
+    const decision = await loadChangeDecisionIfPresent(root, goalId, changeId);
+    if (decision?.metadata.disposition !== "land") continue;
+
+    const [candidate, approval] = await Promise.all([
+      deriveCurrentCandidate(root, goalId, changeId),
+      deriveCurrentApproval(root, goalId, changeId),
+    ]);
+    if (
+      candidate === undefined ||
+      approval === undefined ||
+      decision.metadata.approvedRevision !== candidate.candidateRevision ||
+      approval.candidateRevision !== candidate.candidateRevision ||
+      approval.producingImplementationTicketId !== candidate.producingImplementationTicketId
+    ) {
+      throw new Error(`land decision ${goalId}/${changeId} does not select the latest exactly approved Candidate`);
+    }
+    const commit = (await git(root, ["rev-list", "--parents", "-n", "1", decision.metadata.approvedRevision])).split(/\s+/);
+    if (commit.length !== 2 || commit[1] !== integratedRevision) {
+      throw new Error(`land decision ${goalId}/${changeId} does not select a one-commit Change on its base`);
+    }
+    integratedRevision = decision.metadata.approvedRevision;
+  }
+
+  return integratedRevision;
+}
+
 async function assertNoOpenTicket(root: string, goalId: string, changeId: string): Promise<void> {
   const history = await loadChangeReportHistory(root, goalId, changeId);
   if (history.reports.length !== history.ticketCount) {

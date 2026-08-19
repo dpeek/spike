@@ -14,6 +14,8 @@ type ToolResult = {
 
 type ToolContext = { cwd: string };
 type TicketIdentity = { goalId: string; changeId: string; ticketId: string };
+type PlannerStep = "goal" | "plan" | "change" | "implement" | "review" | "remediate" | "decide" | "recover";
+type SelectedStep = { step: PlannerStep; goalId?: string; changeId?: string };
 type ToolDefinition = {
   name: string;
   label: string;
@@ -61,11 +63,15 @@ export type RegisterSupervisorExtensionOptions = {
 };
 
 export const supervisorToolNames = [
+  "spike_begin_step",
   "spike_status",
+  "spike_create_goal",
   "spike_revise_plan",
   "spike_create_change",
   "spike_decide_change",
-  "spike_issue_ticket",
+  "spike_issue_implement",
+  "spike_issue_review",
+  "spike_issue_remediate",
   "spike_dispatch_pi",
   "spike_worker_status",
   "spike_worker_read",
@@ -77,6 +83,7 @@ const maximumProcessOutputBytes = 1024 * 1024;
 const nonBlankString = { type: "string", minLength: 1 } as const;
 const optionalIdentity = { type: "string", minLength: 1 } as const;
 const thinking = { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh"] } as const;
+const plannerSteps = ["goal", "plan", "change", "implement", "review", "remediate", "decide", "recover"] as const;
 
 function parseResponse(stdout: string, expectedCommand: string): SpikeJsonSuccess | SpikeJsonFailure {
   let value: unknown;
@@ -191,6 +198,7 @@ function tool(
     command: string | ((params: any) => string);
     args: (params: any) => string[];
     stdin?: (params: any) => string | undefined;
+    beforeInvoke?: (params: any, context: ToolContext) => void;
     afterSuccess?: (params: any, response: SpikeJsonSuccess, context: ToolContext) => void;
   },
   invoke: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>,
@@ -205,6 +213,7 @@ function tool(
     parameters: definition.parameters,
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, _onUpdate, context) {
+      definition.beforeInvoke?.(params, context);
       const stdin = definition.stdin?.(params);
       const response = await invoke({
         cwd: context.cwd,
@@ -266,6 +275,36 @@ export function registerSupervisorExtension(
   const waiters = new Map<string, AbortController>();
   const notified = new Set<string>();
   let shuttingDown = false;
+  let selectedStep: SelectedStep | undefined;
+
+  const selectStep = (params: any): void => {
+    selectedStep = undefined;
+    const step = params.step as PlannerStep;
+    selectedStep = {
+      step,
+      ...(params.goalId === undefined ? {} : { goalId: params.goalId }),
+      ...(params.changeId === undefined ? {} : { changeId: params.changeId }),
+    };
+  };
+
+  const requireStep = (step: PlannerStep, params: any): void => {
+    const required: SelectedStep = {
+      step,
+      ...(params.goalId === undefined ? {} : { goalId: params.goalId }),
+      ...(params.changeId === undefined ? {} : { changeId: params.changeId }),
+    };
+    if (
+      selectedStep?.step !== required.step ||
+      selectedStep.goalId !== required.goalId ||
+      selectedStep.changeId !== required.changeId
+    ) {
+      const identity = [required.goalId, required.changeId].filter(Boolean).join("/");
+      throw new Error(
+        `Call spike_begin_step for ${step}${identity ? ` on ${identity}` : ""} before this mutation`,
+      );
+    }
+    selectedStep = undefined;
+  };
 
   const armWorkerWake = (
     cwd: string,
@@ -319,6 +358,7 @@ export function registerSupervisorExtension(
 
   pi.on("session_start", async (_event, context) => {
     shuttingDown = false;
+    selectedStep = undefined;
     notified.clear();
     try {
       const status = await invoke({
@@ -335,11 +375,41 @@ export function registerSupervisorExtension(
   });
   pi.on("session_shutdown", () => {
     shuttingDown = true;
+    selectedStep = undefined;
     for (const controller of waiters.values()) controller.abort();
     waiters.clear();
   });
 
   const tools: ToolDefinition[] = [
+    tool({
+      name: "spike_begin_step",
+      label: "Begin guided step",
+      description: "Load the tracked Markdown guidance for one planner step from Spike's committed authority. This selects exactly one matching supervisor mutation and is consumed by that attempt.",
+      promptSnippet: "Load committed guidance immediately before a planner mutation",
+      promptGuidelines: [
+        "Call this immediately before every Goal, Plan, Change, Implement, Review, Remediate, Decide, or Recover mutation.",
+        "Read and follow the returned Markdown before forming mutation arguments. A selection is operational, one-use, and lost on supervisor restart.",
+      ],
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["step"],
+        properties: {
+          step: { type: "string", enum: plannerSteps },
+          goalId: optionalIdentity,
+          changeId: optionalIdentity,
+        },
+      },
+      command: "guidance show",
+      args(params) {
+        const args = ["guidance", "show", "--step", params.step];
+        optional(args, "--goal", params.goalId);
+        optional(args, "--change", params.changeId);
+        return args;
+      },
+      beforeInvoke: () => { selectedStep = undefined; },
+      afterSuccess: (params) => selectStep(params),
+    }, invoke, options),
     tool({
       name: "spike_status",
       label: "Spike status",
@@ -363,6 +433,32 @@ export function registerSupervisorExtension(
       },
     }, invoke, options),
     tool({
+      name: "spike_create_goal",
+      label: "Create approved Goal",
+      description: "Create a Goal only after the operator explicitly approves its outcome and constraints. Pass the operator's exact approval statement; never infer or invent approval.",
+      promptSnippet: "Create one explicitly operator-approved Goal",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["title", "outcome", "approval"],
+        properties: {
+          title: nonBlankString,
+          outcome: nonBlankString,
+          approval: { type: "string", minLength: 1, description: "The operator's explicit approval statement." },
+          constraints: { type: "array", items: nonBlankString },
+          repositoryIdentity: nonBlankString,
+        },
+      },
+      command: "goal create",
+      args(params) {
+        const args = ["goal", "create", "--title", params.title, "--outcome", params.outcome, "--approval", params.approval];
+        repeated(args, "--constraint", params.constraints);
+        optional(args, "--repository-id", params.repositoryIdentity);
+        return args;
+      },
+      beforeInvoke: (params) => requireStep("goal", params),
+    }, invoke, options),
+    tool({
       name: "spike_revise_plan",
       label: "Revise Plan",
       description: "Atomically replace one Goal's mutable Plan body through Spike.",
@@ -376,6 +472,7 @@ export function registerSupervisorExtension(
       command: "plan revise",
       args: (params) => ["plan", "revise", "--goal", params.goalId],
       stdin: (params) => params.body,
+      beforeInvoke: (params) => requireStep("plan", params),
     }, invoke, options),
     tool({
       name: "spike_create_change",
@@ -407,6 +504,7 @@ export function registerSupervisorExtension(
         repeated(args, "--dependency", params.dependencies);
         return args;
       },
+      beforeInvoke: (params) => requireStep("change", params),
     }, invoke, options),
     tool({
       name: "spike_decide_change",
@@ -430,12 +528,13 @@ export function registerSupervisorExtension(
         optional(args, "--statement", params.statement);
         return args;
       },
+      beforeInvoke: (params) => requireStep("decide", params),
     }, invoke, options),
     tool({
-      name: "spike_issue_ticket",
-      label: "Issue Ticket",
-      description: "Issue the next sequential immutable Ticket with a frozen role model, thinking level, and execution policy. The Phase 2 local-clone adapter requires an explicit unrestricted network acknowledgement.",
-      promptSnippet: "Issue one bounded fresh-session Ticket",
+      name: "spike_issue_implement",
+      label: "Issue Implement Ticket",
+      description: "Issue the initial bounded implementation Ticket for a Change with frozen execution policy and model selection.",
+      promptSnippet: "Issue one initial Implement Ticket",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -444,9 +543,6 @@ export function registerSupervisorExtension(
           goalId: nonBlankString,
           changeId: nonBlankString,
           instruction: nonBlankString,
-          role: { type: "string", enum: ["implement", "review"] },
-          producingImplementationTicketId: optionalIdentity,
-          responseToReviewTicketId: optionalIdentity,
           context: { type: "string" },
           isolation: { type: "string", enum: ["workspace", "container"] },
           networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
@@ -459,11 +555,8 @@ export function registerSupervisorExtension(
       args(params) {
         const args = [
           "ticket", "issue", "--goal", params.goalId, "--change", params.changeId,
-          "--instruction", params.instruction,
+          "--instruction", params.instruction, "--role", "implement",
         ];
-        optional(args, "--role", params.role);
-        optional(args, "--implementation-ticket", params.producingImplementationTicketId);
-        optional(args, "--response-to-review", params.responseToReviewTicketId);
         optional(args, "--context", params.context);
         optional(args, "--isolation", params.isolation);
         optional(args, "--network-access", params.networkAccess);
@@ -472,6 +565,85 @@ export function registerSupervisorExtension(
         optional(args, "--thinking", params.thinking);
         return args;
       },
+      beforeInvoke: (params) => requireStep("implement", params),
+    }, invoke, options),
+    tool({
+      name: "spike_issue_review",
+      label: "Issue Review Ticket",
+      description: "Issue a fresh independent review Ticket for one exact producing implementation Ticket.",
+      promptSnippet: "Issue one exact-Candidate Review Ticket",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "changeId", "instruction", "producingImplementationTicketId", "networkAccess"],
+        properties: {
+          goalId: nonBlankString,
+          changeId: nonBlankString,
+          instruction: nonBlankString,
+          producingImplementationTicketId: nonBlankString,
+          context: { type: "string" },
+          isolation: { type: "string", enum: ["workspace", "container"] },
+          networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
+          credentialGrants: { type: "array", items: nonBlankString },
+          model: nonBlankString,
+          thinking,
+        },
+      },
+      command: "ticket issue",
+      args(params) {
+        const args = [
+          "ticket", "issue", "--goal", params.goalId, "--change", params.changeId,
+          "--instruction", params.instruction, "--role", "review",
+          "--implementation-ticket", params.producingImplementationTicketId,
+        ];
+        optional(args, "--context", params.context);
+        optional(args, "--isolation", params.isolation);
+        optional(args, "--network-access", params.networkAccess);
+        repeated(args, "--credential", params.credentialGrants);
+        optional(args, "--model", params.model);
+        optional(args, "--thinking", params.thinking);
+        return args;
+      },
+      beforeInvoke: (params) => requireStep("review", params),
+    }, invoke, options),
+    tool({
+      name: "spike_issue_remediate",
+      label: "Issue Remediate Ticket",
+      description: "Issue a fresh implementation-role Ticket focused on one exact review Report's accepted findings.",
+      promptSnippet: "Issue one finding-focused Remediate Ticket",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "changeId", "instruction", "responseToReviewTicketId", "networkAccess"],
+        properties: {
+          goalId: nonBlankString,
+          changeId: nonBlankString,
+          instruction: nonBlankString,
+          responseToReviewTicketId: nonBlankString,
+          context: { type: "string" },
+          isolation: { type: "string", enum: ["workspace", "container"] },
+          networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
+          credentialGrants: { type: "array", items: nonBlankString },
+          model: nonBlankString,
+          thinking,
+        },
+      },
+      command: "ticket issue",
+      args(params) {
+        const args = [
+          "ticket", "issue", "--goal", params.goalId, "--change", params.changeId,
+          "--instruction", params.instruction, "--role", "implement",
+          "--response-to-review", params.responseToReviewTicketId,
+        ];
+        optional(args, "--context", params.context);
+        optional(args, "--isolation", params.isolation);
+        optional(args, "--network-access", params.networkAccess);
+        repeated(args, "--credential", params.credentialGrants);
+        optional(args, "--model", params.model);
+        optional(args, "--thinking", params.thinking);
+        return args;
+      },
+      beforeInvoke: (params) => requireStep("remediate", params),
     }, invoke, options),
     tool({
       name: "spike_dispatch_pi",
@@ -583,7 +755,8 @@ export function registerSupervisorExtension(
       parameters: {
         type: "object",
         additionalProperties: false,
-        properties: { goalId: optionalIdentity, reason: nonBlankString },
+        required: ["goalId"],
+        properties: { goalId: nonBlankString, reason: nonBlankString },
       },
       command: "recover",
       args(params) {
@@ -592,6 +765,7 @@ export function registerSupervisorExtension(
         optional(args, "--reason", params.reason);
         return args;
       },
+      beforeInvoke: (params) => requireStep("recover", params),
     }, invoke, options),
   ];
 

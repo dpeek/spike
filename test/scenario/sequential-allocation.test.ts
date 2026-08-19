@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changeDecisionPath, changeStatus, createChange } from "../../src/change.ts";
 import { installImmutable, serializeDocument } from "../../src/durable-state.ts";
 import { createGoal, integratedRef } from "../../src/goal.ts";
-import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
-import { temporaryRepository } from "../support/repository.ts";
+import { issueTicket, reportPath, ticketPath, ticketStatus } from "../../src/ticket.ts";
+import { fixtureGuidance, temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ remove: () => Promise<void> }> = [];
 afterEach(async () => {
@@ -120,7 +120,8 @@ describe("sequential Change and Ticket allocation", () => {
     const { repository, goalId } = await fixture();
     const change = await firstChange(repository, goalId);
     await writeFile(join(repository.root, "candidate-input.txt"), "unrelated host change\n");
-    await repository.git("add", "candidate-input.txt");
+    await writeFile(join(repository.root, "spike", "guidance", "implement.md"), "# Newer host guidance\n");
+    await repository.git("add", "candidate-input.txt", "spike/guidance/implement.md");
     await repository.git("commit", "--quiet", "-m", "Advance host after Change creation");
     const hostRevision = await repository.git("rev-parse", "HEAD");
 
@@ -145,15 +146,34 @@ describe("sequential Change and Ticket allocation", () => {
       model: "implementation-model",
       thinking: "medium",
       executionPolicy,
+      guidance: { step: "implement", revision: change.change.metadata.baseRevision },
     });
     expect(first.ticket.metadata.inputRevision).not.toBe(hostRevision);
     expect(first.ticket.metadata).not.toHaveProperty("status");
     expect(first.ticket.body).toContain("## Instruction\n\nImplement monotonic Ticket allocation.");
+    expect(first.ticket.body).toContain(fixtureGuidance.implement);
+    expect(first.ticket.body).not.toContain("Newer host guidance");
     expect(first.ticket.body).toContain("### Goal\n\n# Sequential workflow");
     expect(first.ticket.body).toContain("### Change\n\n# Create allocation");
     expect(first.ticket.body).toContain("### Current Plan\n\n# Plan: Sequential workflow");
     expect(first.ticket.body).toContain("### Planner-selected context\n\nPreserve directories");
     expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("open");
+
+    const firstTicketPath = ticketPath(repository.root, goalId, "001", "001");
+    const firstTicketSource = await readFile(firstTicketPath, "utf8");
+    await rm(firstTicketPath);
+    await writeFile(
+      firstTicketPath,
+      firstTicketSource.replace(
+        `\"revision\": \"${change.change.metadata.baseRevision}\"`,
+        `\"revision\": \"${hostRevision}\"`,
+      ),
+    );
+    await expect(ticketStatus(repository.root, goalId, "001", "001")).rejects.toThrow(
+      "Ticket guidance must come from the Change base revision",
+    );
+    await rm(firstTicketPath);
+    await writeFile(firstTicketPath, firstTicketSource);
 
     await expect(
       issueTicket({

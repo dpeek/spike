@@ -16,6 +16,7 @@ import {
   type MarkdownDocument,
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
+import { loadGuidance, guidanceStepSchema, type Guidance } from "./guidance.ts";
 import { loadGoal } from "./goal.ts";
 import { loadPlan } from "./plan.ts";
 import { deriveCurrentCandidate, deriveCurrentReview, loadReportIfPresent } from "./report.ts";
@@ -42,6 +43,12 @@ const commonTicketSchema = z.object({
   model: z.string().trim().min(1),
   thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
   executionPolicy: executionPolicySchema,
+  guidance: z
+    .object({
+      step: guidanceStepSchema,
+      revision: z.string().regex(revisionPattern),
+    })
+    .strict(),
 });
 const ticketSchema = z.discriminatedUnion("role", [
   commonTicketSchema
@@ -141,15 +148,22 @@ function ticketBody(
   goalBody: string,
   changeBody: string,
   planBody: string,
+  guidance: Guidance,
   context?: string,
   relevantReport?: { heading: string; document: string },
 ): string {
+  const guidanceMarkdown = guidance.markdown.endsWith("\n") ? guidance.markdown : `${guidance.markdown}\n`;
   return `# ${role === "implement" ? "Implement Change" : "Review Candidate"}
 
 ## Instruction
 
 ${instruction}
 
+## Workflow guidance
+
+Selected \`${guidance.path}\` from Change base \`${guidance.revision}\`.
+
+${guidanceMarkdown}
 ## Curated context
 
 ### Goal
@@ -183,7 +197,16 @@ export async function listTicketIds(root: string, goalId: string, changeId: stri
 }
 
 export function parseTicketDocument(document: MarkdownDocument): Ticket {
-  return { metadata: ticketSchema.parse(document.metadata), body: document.body };
+  const metadata = ticketSchema.parse(document.metadata);
+  const expectedGuidanceStep = metadata.role === "review"
+    ? "review"
+    : metadata.responseToReviewTicketId === undefined
+      ? "implement"
+      : "remediate";
+  if (metadata.guidance.step !== expectedGuidanceStep) {
+    throw new Error(`${metadata.role} Ticket must select ${expectedGuidanceStep} guidance`);
+  }
+  return { metadata, body: document.body };
 }
 
 export async function loadTicketDocument(root: string, path: string): Promise<Ticket> {
@@ -197,6 +220,10 @@ export async function loadTicket(root: string, goalId: string, changeId: string,
     throw new Error(
       `Ticket document belongs to a different Ticket: ${metadata.goalId}/${metadata.changeId}/${metadata.ticketId}`,
     );
+  }
+  const change = await loadChange(root, goalId, changeId);
+  if (metadata.guidance.revision !== change.metadata.baseRevision) {
+    throw new Error("Ticket guidance must come from the Change base revision");
   }
   return ticket;
 }
@@ -425,6 +452,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   if (inputRevision !== derivedRevision) throw new Error("Ticket input revision must identify a commit exactly");
 
   const ticketId = nextTicketId(await allocatedTicketIds(repository.root, input.goalId, input.changeId));
+  const guidanceStep = role === "review" ? "review" : responseToReviewTicketId === undefined ? "implement" : "remediate";
+  const guidance = await loadGuidance(repository.root, guidanceStep, change.metadata.baseRevision);
   const metadata = ticketSchema.parse({
     kind: "ticket",
     goalId: input.goalId,
@@ -436,10 +465,11 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     model: modelSelection.model,
     thinking: modelSelection.thinking,
     executionPolicy: policy,
+    guidance: { step: guidance.step, revision: guidance.revision },
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),
     ...(responseToReviewTicketId === undefined ? {} : { responseToReviewTicketId }),
   });
-  const body = ticketBody(role, instruction, goal.body, change.body, plan.body, input.curatedContext, relevantReport);
+  const body = ticketBody(role, instruction, goal.body, change.body, plan.body, guidance, input.curatedContext, relevantReport);
 
   await installImmutable(
     repository.root,

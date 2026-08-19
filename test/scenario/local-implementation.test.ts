@@ -96,6 +96,7 @@ async function fixture() {
         model: "implementation-model",
         thinking: "medium",
         executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+        guidance: { step: "implement", revision: baseRevision },
       },
       "# Implement Change\n\n## Instruction\n\nAdd the implementation marker.\n",
     ),

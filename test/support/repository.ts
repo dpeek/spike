@@ -1,6 +1,17 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+export const fixtureGuidance = {
+  goal: "# Fixture Goal guidance\n\nRequire explicit operator approval.\n",
+  plan: "# Fixture Plan guidance\n\nKeep the next bounded step current.\n",
+  change: "# Fixture Change guidance\n\nDefine one coherent integration unit.\n",
+  implement: "# Fixture Implement guidance\n\nComplete the bounded implementation Ticket.\n",
+  review: "# Fixture Review guidance\n\nReview only the exact Candidate and canonical criteria.\n",
+  remediate: "# Fixture Remediate guidance\n\nClose only the accepted review findings.\n",
+  decide: "# Fixture Decide guidance\n\nUse exact durable approval evidence.\n",
+  recover: "# Fixture Recover guidance\n\nRewind to committed workflow facts.\n",
+} as const;
 
 async function git(root: string, ...args: string[]): Promise<string> {
   const child = Bun.spawn(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
@@ -23,8 +34,12 @@ export async function temporaryRepository(): Promise<{
   await git(root, "init", "--quiet");
   await git(root, "config", "user.name", "Spike Test");
   await git(root, "config", "user.email", "spike@example.test");
+  await mkdir(join(root, "spike", "guidance"), { recursive: true });
   await Promise.all([
     writeFile(join(root, "README.md"), "fixture\n"),
+    ...Object.entries(fixtureGuidance).map(([step, markdown]) =>
+      writeFile(join(root, "spike", "guidance", `${step}.md`), markdown)
+    ),
     writeFile(
       join(root, "spike.json"),
       `${JSON.stringify(
@@ -40,7 +55,7 @@ export async function temporaryRepository(): Promise<{
       )}\n`,
     ),
   ]);
-  await git(root, "add", "README.md", "spike.json");
+  await git(root, "add", "README.md", "spike.json", "spike/guidance");
   await git(root, "commit", "--quiet", "-m", "Initial fixture");
   return {
     root,

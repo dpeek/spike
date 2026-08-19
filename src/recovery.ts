@@ -1,12 +1,11 @@
 import { lstat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { changePath, loadChange, loadChangeDecisionIfPresent } from "./change.ts";
+import { changePath, deriveGoalIntegratedRevision } from "./change.ts";
 import { documentExists, listDirectoryNames } from "./durable-state.ts";
 import { candidateRef } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, loadGoal } from "./goal.ts";
 import {
-  deriveCurrentApproval,
   deriveCurrentCandidate,
   loadReportIfPresent,
   publishInterruptedReport,
@@ -302,40 +301,8 @@ async function reconcileCandidateRefs(root: string, goalId: string, changeIds: s
   return discarded;
 }
 
-async function rebuildIntegrationRef(root: string, goalId: string, changeIds: string[]): Promise<string> {
-  const goal = await loadGoal(root, goalId);
-  let integratedRevision = goal.metadata.repository.initialRevision;
-
-  for (const changeId of changeIds) {
-    const change = await loadChange(root, goalId, changeId);
-    if (change.metadata.baseRevision !== integratedRevision) {
-      throw new Error(
-        `Change ${goalId}/${changeId} base ${change.metadata.baseRevision} does not match rebuilt Goal integrated revision ${integratedRevision}`,
-      );
-    }
-    const decision = await loadChangeDecisionIfPresent(root, goalId, changeId);
-    if (decision?.metadata.disposition !== "land") continue;
-
-    const [candidate, approval] = await Promise.all([
-      deriveCurrentCandidate(root, goalId, changeId),
-      deriveCurrentApproval(root, goalId, changeId),
-    ]);
-    if (
-      candidate === undefined ||
-      approval === undefined ||
-      decision.metadata.approvedRevision !== candidate.candidateRevision ||
-      approval.candidateRevision !== candidate.candidateRevision ||
-      approval.producingImplementationTicketId !== candidate.producingImplementationTicketId
-    ) {
-      throw new Error(`land decision ${goalId}/${changeId} does not select the latest exactly approved Candidate`);
-    }
-    const commit = (await git(root, ["rev-list", "--parents", "-n", "1", decision.metadata.approvedRevision])).split(/\s+/);
-    if (commit.length !== 2 || commit[1] !== integratedRevision) {
-      throw new Error(`land decision ${goalId}/${changeId} does not select a one-commit Change on its base`);
-    }
-    integratedRevision = decision.metadata.approvedRevision;
-  }
-
+async function rebuildIntegrationRef(root: string, goalId: string): Promise<string> {
+  const integratedRevision = await deriveGoalIntegratedRevision(root, goalId);
   await git(root, ["update-ref", "--no-deref", integratedRef(goalId), integratedRevision]);
   return integratedRevision;
 }
@@ -350,7 +317,7 @@ export async function reconcileGoal(
   const reason = interruptionReason(input.reason ?? "Supervisor restart interrupted an open Ticket before its Report was published.");
   const changeIds = await publishedChangeIds(repository.root, input.goalId);
   const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
-  const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId, changeIds);
+  const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId);
   const interruptedTickets: InterruptedTicketRecovery[] = [];
   const finalizedWorkers: TicketIdentity[] = [];
   const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];

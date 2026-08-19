@@ -13,6 +13,8 @@ import {
 import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { createGoal, goalPath } from "./goal.ts";
+import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
+import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
 import { launchPlanner } from "./planner.ts";
 import {
@@ -48,6 +50,7 @@ export function usage(): string {
 Usage:
   spike planner
   spike status [--goal <goal-id>] [--json]
+  spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike change create --goal <goal-id> --title <title> --intent <intent> --rationale <rationale> --acceptance <criterion> [options]
@@ -69,6 +72,11 @@ Usage:
 
 Global options:
   --json                         Emit one JSON object on success or failure
+
+Guidance options:
+  --step <step>                  goal, plan, change, implement, review, remediate, decide, or recover
+  --goal <goal-id>               Required except for Goal guidance
+  --change <change-id>           Required for Implement, Review, Remediate, and Decide guidance
 
 Plan revision options:
   --file <path>                  Read the Plan body from a file; omit or use - for stdin
@@ -482,6 +490,37 @@ function parseStatus(args: string[]): { goalId?: string } {
   return { goalId: valueAfter(args, 0, "--goal") };
 }
 
+function parseGuidanceShow(args: string[]): { step: GuidanceStep; goalId?: string; changeId?: string } {
+  let step: GuidanceStep | undefined;
+  let goalId: string | undefined;
+  let changeId: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--step") {
+      const parsed = guidanceStepSchema.safeParse(value);
+      if (!parsed.success) throw new UsageError(`unsupported guidance step: ${value}`);
+      step = parsed.data;
+    } else if (option === "--goal") goalId = value;
+    else if (option === "--change") changeId = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (step === undefined) throw new UsageError("--step is required");
+  const needsGoal = step !== "goal";
+  const needsChange = ["implement", "review", "remediate", "decide"].includes(step);
+  if (needsGoal && goalId === undefined) throw new UsageError(`--goal is required for ${step} guidance`);
+  if (needsChange && changeId === undefined) throw new UsageError(`--change is required for ${step} guidance`);
+  if (step === "goal" && (goalId !== undefined || changeId !== undefined)) {
+    throw new UsageError("goal guidance does not accept Goal or Change identity");
+  }
+  if (!needsChange && changeId !== undefined) throw new UsageError(`${step} guidance does not accept --change`);
+  return {
+    step,
+    ...(goalId === undefined ? {} : { goalId }),
+    ...(changeId === undefined ? {} : { changeId }),
+  };
+}
+
 function parsePlanRevise(args: string[]): { goalId: string; file?: string } {
   let goalId: string | undefined;
   let file: string | undefined;
@@ -622,6 +661,22 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         input.goalId === undefined
           ? humanRepositoryStatus(status as DerivedRepositoryStatus)
           : humanGoalStatus(status as DerivedGoalStatus),
+      );
+    }
+
+    if (args[0] === "guidance" && args[1] === "show") {
+      const input = parseGuidanceShow(args.slice(2));
+      const guidance = await selectGuidance({ cwd, ...input });
+      return success(
+        json,
+        "guidance show",
+        {
+          step: guidance.step,
+          path: guidance.path,
+          sourceRevision: guidance.revision,
+          markdown: guidance.markdown,
+        },
+        `Guidance ${guidance.step}\n  ${guidance.path}\n  Source ${guidance.revision}\n\n${guidance.markdown}`,
       );
     }
 

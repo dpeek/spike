@@ -13,4 +13,3 @@ Supervisor planning inbox. These are ideas, fixes, and improvements—not approv
 - Use stable Project slugs and Project-relative sequences for human-friendly Goal references such as `formless-001`.
 - Schedule work across Projects against shared model quotas, renewal windows, priorities, and usage analytics.
 - Run leased Tickets on capability-matched execution nodes over Tailscale using the standard bundle and Submission exchange.
-- Make workflow guidance first-class Markdown selected by Goal, Plan, Change, Implement, Review, Remediate, Decide, and Recover steps; inject planner guidance explicitly and snapshot worker guidance into immutable Ticket context. Let supervisors propose operator-reviewed guidance improvements from Reports and churn.

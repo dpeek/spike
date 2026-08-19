@@ -182,46 +182,46 @@ describe("Pi supervisor extension", () => {
 
     expect([...tools.keys()]).toEqual([...supervisorToolNames]);
     for (const definition of tools.values()) expect(definition.executionMode).toBe("sequential");
-    expect(tools.get("spike_issue_ticket")!.parameters).toMatchObject({
-      required: ["goalId", "changeId", "instruction", "networkAccess"],
+    expect(tools.has("spike_issue_ticket")).toBe(false);
+    expect(tools.get("spike_create_goal")!.parameters).toMatchObject({ required: ["title", "outcome", "approval"] });
+    expect(tools.get("spike_issue_review")!.parameters).toMatchObject({
+      required: ["goalId", "changeId", "instruction", "producingImplementationTicketId", "networkAccess"],
+    });
+    expect(tools.get("spike_issue_remediate")!.parameters).toMatchObject({
+      required: ["goalId", "changeId", "instruction", "responseToReviewTicketId", "networkAccess"],
     });
 
+    const identity = { goalId: "goal-1", changeId: "001" };
     const calls: Array<[string, unknown]> = [
       ["spike_status", { goalId: "goal-1" }],
+      ["spike_begin_step", { step: "goal" }],
+      ["spike_create_goal", { title: "Approved Goal", outcome: "Delegate safely.", approval: "Operator approved." }],
+      ["spike_begin_step", { step: "plan", goalId: "goal-1" }],
       ["spike_revise_plan", { goalId: "goal-1", body: "# Revised Plan\n" }],
+      ["spike_begin_step", { step: "change", goalId: "goal-1" }],
       ["spike_create_change", {
-        goalId: "goal-1",
-        title: "Boundary",
-        intent: "Delegate through Spike.",
-        rationale: "Keep workflow authority on the host.",
-        acceptanceCriteria: ["Structured calls are authoritative.", "Text is not parsed."],
-        nonGoals: ["Herdr integration."],
-        dependencies: ["Phase 2 CLI."],
+        goalId: "goal-1", title: "Boundary", intent: "Delegate through Spike.",
+        rationale: "Keep workflow authority on the host.", acceptanceCriteria: ["Text is not parsed."],
       }],
-      ["spike_decide_change", { goalId: "goal-1", changeId: "001", disposition: "abandon", statement: "Stop." }],
-      ["spike_issue_ticket", {
-        goalId: "goal-1",
-        changeId: "001",
-        instruction: "Implement it.",
-        role: "implement",
-        responseToReviewTicketId: "002",
-        context: "Use the accepted design.",
-        isolation: "workspace",
-        networkAccess: "unrestricted",
-        credentialGrants: ["github"],
-        model: "worker-model",
-        thinking: "medium",
+      ["spike_begin_step", { step: "decide", ...identity }],
+      ["spike_decide_change", { ...identity, disposition: "abandon", statement: "Stop." }],
+      ["spike_begin_step", { step: "implement", ...identity }],
+      ["spike_issue_implement", {
+        ...identity, instruction: "Implement it.", networkAccess: "unrestricted", model: "worker-model", thinking: "medium",
       }],
-      ["spike_dispatch_pi", { goalId: "goal-1", changeId: "001", ticketId: "003", worker: "pi-worker" }],
-      ["spike_worker_status", { goalId: "goal-1", changeId: "001", ticketId: "003" }],
-      ["spike_worker_read", { goalId: "goal-1", changeId: "001", ticketId: "003", lines: 80 }],
-      ["spike_publish_report", {
-        goalId: "goal-1",
-        changeId: "001",
-        ticketId: "003",
-        commitSummary: "Complete boundary",
-        commitBody: "Keep evidence structured.",
+      ["spike_begin_step", { step: "review", ...identity }],
+      ["spike_issue_review", {
+        ...identity, instruction: "Review it.", producingImplementationTicketId: "001", networkAccess: "unrestricted",
       }],
+      ["spike_begin_step", { step: "remediate", ...identity }],
+      ["spike_issue_remediate", {
+        ...identity, instruction: "Close F-1.", responseToReviewTicketId: "002", networkAccess: "unrestricted",
+      }],
+      ["spike_dispatch_pi", { ...identity, ticketId: "003", worker: "pi-worker" }],
+      ["spike_worker_status", { ...identity, ticketId: "003" }],
+      ["spike_worker_read", { ...identity, ticketId: "003", lines: 80 }],
+      ["spike_publish_report", { ...identity, ticketId: "003", commitSummary: "Complete boundary" }],
+      ["spike_begin_step", { step: "recover", goalId: "goal-1" }],
       ["spike_recover", { goalId: "goal-1", reason: "Supervisor restarted." }],
     ];
 
@@ -232,29 +232,69 @@ describe("Pi supervisor extension", () => {
     }
 
     const invocations = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    expect(invocations).toHaveLength(10);
+    expect(invocations).toHaveLength(calls.length);
     expect(invocations.every((call) => call.args.at(-1) === "--json")).toBe(true);
-    expect(invocations[0].args).toEqual(["status", "--goal", "goal-1", "--json"]);
-    expect(invocations[1]).toMatchObject({
-      args: ["plan", "revise", "--goal", "goal-1", "--json"],
-      stdin: "# Revised Plan\n",
+    expect(invocations[1].args).toEqual(["guidance", "show", "--step", "goal", "--json"]);
+    expect(invocations[2].args).toContain("Operator approved.");
+    expect(invocations[4]).toMatchObject({ args: ["plan", "revise", "--goal", "goal-1", "--json"], stdin: "# Revised Plan\n" });
+    expect(invocations[10].args).toContain("worker-model");
+    expect(invocations[12].args).toContain("--implementation-ticket");
+    expect(invocations[12].args).toContain("review");
+    expect(invocations[14].args).toContain("--response-to-review");
+    expect(invocations[14].args).toContain("implement");
+    expect(invocations[20].args).toEqual(["recover", "--goal", "goal-1", "--reason", "Supervisor restarted.", "--json"]);
+  });
+
+  test("rejects unselected or mismatched mutations, consumes one match, and forgets selection on restart", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    const handlers = new Map<string, (event: unknown, context: { cwd: string }) => void | Promise<void>>();
+    registerSupervisorExtension({
+      registerTool(tool) { tools.push(tool); },
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage() {},
+    }, {
+      async invoke(input) {
+        calls.push(input);
+        return {
+          ok: true,
+          command: input.expectedCommand,
+          data: input.expectedCommand === "guidance show"
+            ? { step: input.args[3], path: `spike/guidance/${input.args[3]}.md`, sourceRevision: "a".repeat(40), markdown: "# Guidance\n" }
+            : {},
+        };
+      },
+      waitForDone: () => new Promise(() => undefined),
     });
-    expect(invocations[2].args).toEqual([
-      "change", "create", "--goal", "goal-1", "--title", "Boundary", "--intent", "Delegate through Spike.",
-      "--rationale", "Keep workflow authority on the host.", "--acceptance", "Structured calls are authoritative.",
-      "--acceptance", "Text is not parsed.", "--non-goal", "Herdr integration.", "--dependency", "Phase 2 CLI.", "--json",
-    ]);
-    expect(invocations[3].args.slice(0, 4)).toEqual(["change", "abandon", "--goal", "goal-1"]);
-    expect(invocations[4].args).toContain("worker-model");
-    expect(invocations[5].args.slice(0, 2)).toEqual(["ticket", "dispatch-pi"]);
-    expect(invocations[6].args.slice(0, 2)).toEqual(["worker", "status"]);
-    expect(invocations[7].args).toEqual([
-      "worker", "read", "--goal", "goal-1", "--change", "001", "--ticket", "003", "--lines", "80", "--json",
-    ]);
-    expect(invocations[8].args.slice(0, 2)).toEqual(["report", "publish"]);
-    expect(invocations[9].args).toEqual([
-      "recover", "--goal", "goal-1", "--reason", "Supervisor restarted.", "--json",
-    ]);
+    const registered = new Map(tools.map((tool) => [tool.name, tool]));
+    const context = { cwd: "/project" };
+    const ticket = { goalId: "goal-1", changeId: "001", instruction: "Bounded work.", networkAccess: "unrestricted" };
+
+    await expect(registered.get("spike_issue_implement")!.execute("call", ticket, undefined, undefined, context))
+      .rejects.toThrow("Call spike_begin_step for implement on goal-1/001");
+    expect(calls).toEqual([]);
+
+    await registered.get("spike_begin_step")!.execute("call", { step: "implement", goalId: "goal-1", changeId: "001" }, undefined, undefined, context);
+    expect(calls[0]!.args).toEqual(["guidance", "show", "--step", "implement", "--goal", "goal-1", "--change", "001"]);
+    await expect(registered.get("spike_issue_review")!.execute("call", {
+      ...ticket,
+      producingImplementationTicketId: "001",
+    }, undefined, undefined, context)).rejects.toThrow("Call spike_begin_step for review on goal-1/001");
+    expect(calls).toHaveLength(1);
+
+    await registered.get("spike_issue_implement")!.execute("call", ticket, undefined, undefined, context);
+    expect(calls[1]!.args.slice(0, 2)).toEqual(["ticket", "issue"]);
+    await expect(registered.get("spike_issue_implement")!.execute("call", ticket, undefined, undefined, context))
+      .rejects.toThrow("Call spike_begin_step");
+    expect(calls).toHaveLength(2);
+
+    await registered.get("spike_begin_step")!.execute("call", { step: "plan", goalId: "goal-1" }, undefined, undefined, context);
+    await handlers.get("session_start")!({}, context);
+    await expect(registered.get("spike_revise_plan")!.execute("call", {
+      goalId: "goal-1",
+      body: "# Restarted\n",
+    }, undefined, undefined, context)).rejects.toThrow("Call spike_begin_step for plan on goal-1");
+    expect(calls.at(-1)!.args).toEqual(["status"]);
   });
 
   test("trusts only Spike's parsed envelope, not process status, and rejects malformed or failed envelopes", async () => {

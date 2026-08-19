@@ -92,7 +92,7 @@ describe("direct Pi supervisor", () => {
     expect(planner.args[planner.args.indexOf("--model") + 1]).toBe("planner-model");
     expect(planner.args[planner.args.indexOf("--thinking") + 1]).toBe("high");
     expect(planner.args[planner.args.indexOf("--tools") + 1]).toBe(
-      "read,grep,find,ls,spike_status,spike_revise_plan,spike_create_change,spike_decide_change,spike_issue_ticket,spike_dispatch_pi,spike_worker_status,spike_worker_read,spike_publish_report,spike_recover",
+      "read,grep,find,ls,spike_begin_step,spike_status,spike_create_goal,spike_revise_plan,spike_create_change,spike_decide_change,spike_issue_implement,spike_issue_review,spike_issue_remediate,spike_dispatch_pi,spike_worker_status,spike_worker_read,spike_publish_report,spike_recover",
     );
     expect(planner.args).not.toContain("--print");
 

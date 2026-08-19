@@ -23,6 +23,12 @@ Spike reads tracked project model defaults from `spike.json`. Ticket issuance
 freezes the selected model and thinking level into `ticket.md`; later dispatch
 never rereads configuration or accepts model overrides.
 
+Workflow guidance is tracked as Markdown at
+`spike/guidance/{goal,plan,change,implement,review,remediate,decide,recover}.md`.
+Planner guidance is selected from committed authority with `spike guidance show`;
+Ticket issuance loads Implement, Review, or Remediate guidance from the Change
+base and embeds it in the immutable Ticket. There is no built-in fallback.
+
 The workflow can create an approved Goal and Plan, allocate a Change, and issue
 its first implementation Ticket in any Git repository with a commit:
 
@@ -147,20 +153,28 @@ model and thinking level. It disables extension discovery, explicitly loads only
 spike planner
 ```
 
-The supervisor extension exposes sequential structured tools for status, Plan
-revision, Change creation and decisions, Ticket issuance and Pi dispatch, Report
-publication, and recovery. Every tool invokes Spike with an argument array and
-parses its single `--json` response. While a Ticket worker runs, the extension
+The supervisor extension exposes sequential structured tools for committed
+guidance selection, explicitly approved Goal creation, status, Plan revision,
+Change creation and decisions, focused Implement/Review/Remediate Ticket issuance,
+Pi dispatch, Report publication, and recovery. `spike_begin_step` must run
+immediately before each guided mutation. It loads the selected Markdown through
+the CLI; one matching mutation consumes the in-memory selection, and restart
+discards it. Raw operator CLI commands are not gated. Every tool invokes Spike
+with an argument array and parses its single `--json` response. While a Ticket worker runs, the extension
 owns a cancellable one-shot `worker wait`; marker-backed completion queues an
 operational follow-up keyed by full Ticket identity, while unexpected waiter failure
 queues a distinct recheck. Planner prose, wake messages, worker terminal output,
 and Pi exit status never become workflow facts; a successful Report publication or
 Change decision remains the relevant immutable commit point.
 
-Planner-facing commands derive status from durable documents, atomically revise
-the Plan, resolve Changes, and reconcile interrupted repository state:
+Planner-facing commands select exact guidance, derive status from durable
+documents, atomically revise the Plan, resolve Changes, and reconcile interrupted
+repository state:
 
 ```bash
+spike guidance show --step goal [--json]
+spike guidance show --step plan --goal <goal-id> [--json]
+spike guidance show --step implement --goal <goal-id> --change 001 [--json]
 spike status [--goal <goal-id>] [--json]
 spike plan revise --goal <goal-id> [--file plan.md] [--json] # stdin when omitted
 spike change land --goal <goal-id> --change 001 [--json]

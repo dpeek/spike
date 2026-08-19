@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { changePath } from "./change.ts";
 import { installImmutable, serializeDocument } from "./durable-state.ts";
 import {
   createInitialPlan,
@@ -28,6 +29,14 @@ const execution = {
 };
 
 async function installChurnHistory(root: string): Promise<string[]> {
+  await installImmutable(
+    root,
+    changePath(root, goalId, "001"),
+    serializeDocument(
+      { kind: "change", goalId, changeId: "001", createdAt: "2026-03-25T09:30:00.000Z", baseRevision },
+      "# Detect churn\n",
+    ),
+  );
   const ticketIds = ["001", "002", "003", "004"];
   for (const ticketId of ticketIds) {
     const implement = ticketId === "001";
@@ -46,6 +55,7 @@ async function installChurnHistory(root: string): Promise<string[]> {
               model: "fixture-model",
               thinking: "low",
               executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+              guidance: { step: "implement", revision: baseRevision },
               role: "implement",
             }
           : {
@@ -58,6 +68,7 @@ async function installChurnHistory(root: string): Promise<string[]> {
               model: "fixture-model",
               thinking: "low",
               executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+              guidance: { step: "review", revision: baseRevision },
               role: "review",
               producingImplementationTicketId: "001",
             },
