@@ -18,6 +18,8 @@ import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
 import { launchPlanner } from "./planner.ts";
 import {
+  loadSubmissionOutcome,
+  publishBlockedReport,
   publishFailedReport,
   publishImplementationReport,
   publishReviewReport,
@@ -31,7 +33,7 @@ import {
   type DerivedRepositoryStatus,
 } from "./status.ts";
 import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
-import { completeWorker, readWorkerPayload } from "./worker-completion.ts";
+import { blockWorker, completeWorker, readWorkerPayload } from "./worker-completion.ts";
 import {
   attachWorkerTerminal,
   dispatchWorkerTicket,
@@ -65,6 +67,7 @@ Usage:
   spike worker read --goal <goal-id> --change <change-id> --ticket <ticket-id> [--lines <count>] [--ansi] [--json]
   spike worker attach --goal <goal-id> --change <change-id> --ticket <ticket-id>
   spike worker complete [--file <payload.json>] [--json]
+  spike worker block [--file <payload.json>] [--json]
   spike report publish --goal <goal-id> --change <change-id> --ticket <ticket-id> [options]
   spike recover [--goal <goal-id>] [--reason <reason>] [--json]
   spike --help
@@ -114,7 +117,7 @@ Controlled-test dispatch options:
   --environment-digest <digest>  Optional immutable environment identity
   -- <command> [args...]          Explicit controlled-test worker command
 
-Worker completion options:
+Worker submission options:
   --file <path>                  Read JSON payload from a file; omit or use - for stdin
 
 Report publication options:
@@ -437,9 +440,9 @@ function parseWorkerRead(args: string[]): { goalId: string; changeId: string; ti
   return { ...parseWorkerIdentity(identity), ...(lines === undefined ? {} : { lines }), ...(ansi ? { ansi: true } : {}) };
 }
 
-function parseWorkerComplete(args: string[]): { file?: string } {
+function parseWorkerSubmission(args: string[], command: "complete" | "block"): { file?: string } {
   if (args.length === 0) return {};
-  if (args.length !== 2 || args[0] !== "--file") throw new UsageError(`unknown worker complete option: ${args[0]}`);
+  if (args.length !== 2 || args[0] !== "--file") throw new UsageError(`unknown worker ${command} option: ${args[0]}`);
   return { file: valueAfter(args, 0, "--file") };
 }
 
@@ -592,6 +595,9 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
     lines.push(`  Candidate ${change.candidate?.revision ?? "none"}`);
     lines.push(change.review === null ? "  Review none" : `  Review ${change.review.verdict} (Ticket ${change.review.ticketId})`);
     lines.push(change.openTicket === null ? "  Open Ticket none" : `  Open Ticket ${change.openTicket.ticketId} (${change.openTicket.role})`);
+    lines.push(change.latestReport === null
+      ? "  Latest Report none"
+      : `  Latest Report ${change.latestReport.ticketId} ${change.latestReport.outcome}`);
     if (change.churnWarnings.length > 0) lines.push(`  Churn warnings ${change.churnWarnings.length}`);
   }
   for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
@@ -849,14 +855,16 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       return attachWorkerTerminal(repository.root, identity);
     }
 
-    if (args[0] === "worker" && args[1] === "complete") {
-      const input = parseWorkerComplete(args.slice(2));
-      const completion = await completeWorker(cwd, await readWorkerPayload(cwd, input.file, stdinText));
+    if (args[0] === "worker" && (args[1] === "complete" || args[1] === "block")) {
+      const action = args[1];
+      const input = parseWorkerSubmission(args.slice(2), action);
+      const payload = await readWorkerPayload(cwd, input.file, stdinText);
+      const submission = action === "complete" ? await completeWorker(cwd, payload) : await blockWorker(cwd, payload);
       return success(
         json,
-        "worker complete",
-        completion,
-        `Completed ${completion.role} Ticket ${completion.goalId}/${completion.changeId}/${completion.ticketId}\n`,
+        `worker ${action}`,
+        submission,
+        `${action === "complete" ? "Completed" : "Blocked"} ${submission.role} Ticket ${submission.goalId}/${submission.changeId}/${submission.ticketId}\n`,
       );
     }
 
@@ -878,6 +886,8 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
           reason: input.failure,
           execution,
         });
+      } else if (await loadSubmissionOutcome(repository.root, identity) === "blocked") {
+        publication = await publishBlockedReport({ cwd: repository.root, ...identity, execution });
       } else if (ticket.metadata.role === "implement") {
         if (input.commitSummary === undefined) {
           throw new UsageError("--commit-summary is required for a completed implementation Report");

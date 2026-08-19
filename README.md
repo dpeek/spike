@@ -132,33 +132,33 @@ spike ticket dispatch-test \
   --worker scripted-implementer -- ./scripted-worker
 ```
 
-Inside the private worker checkout, structured completion reads the Ticket from
-`SPIKE_INPUT_DIR/ticket.md` and accepts JSON from a file or stdin:
+Inside the private worker checkout, structured outcomes read the Ticket from
+`SPIKE_INPUT_DIR/ticket.md` and accept JSON from a file or stdin:
 
 ```bash
 spike worker complete --file payload.json
-# or: printf '%s' "$payload" | spike worker complete
+spike worker block --file blocked.json
 ```
 
-Implementation payloads contain `summary`, `verification`, `assumptions`,
-`limitations`, `risks`, `followUp`, and an `artifacts` path array. Review
-payloads contain `reviewStatement`, `findings`, `acceptanceAssessment`,
-`verdict` (`remediate`, `approve`, `reject`, or `ask-operator`), and
-`artifacts`. Spike computes artifact digests, snapshots an
-implementation checkout, creates its bundle, and publishes canonical
-`submission.md` last.
+Completed implementation payloads contain `summary`, `verification`,
+`assumptions`, `limitations`, `risks`, `followUp`, and an `artifacts` path
+array. Completed review payloads contain `reviewStatement`, `findings`,
+`acceptanceAssessment`, `verdict` (`remediate`, `approve`, `reject`, or
+`ask-operator`), and `artifacts`. Blocked payloads contain `reason`, `evidence`,
+and `artifacts`. Spike computes artifact digests and publishes canonical
+`submission.md` last. Only completed implementation snapshots create a bundle
+and Candidate.
 
 The Pi worker extension is `src/pi-worker-extension.ts`. Ticket launchers load
-it with exactly one terminating tool selected by the immutable Ticket role:
-`spike_complete_implementation` or `spike_complete_review`. The extension sends
-tool arguments to `spike worker complete --json`; it does not import Spike
-internals or format durable files. A rejected payload remains retryable. An
-accepted completion terminates the agent turn and requests Pi's supported
-graceful shutdown; the Herdr wrapper then records the process exit.
+role-specific completion and blocked tools. The extension sends tool arguments
+to `spike worker complete --json` or `spike worker block --json`; it does not
+import Spike internals or format durable files. A rejected payload remains
+retryable. An accepted outcome terminates the agent turn and requests Pi's
+supported graceful shutdown; the Herdr wrapper then records the process exit.
 
-A completed review Report needs no commit message options. To seal a worker
-failure instead, use `--failure "<reason>"`. Report publication returns worker
-cleanup status and retains a warning when finalization must be retried.
+A completed review or blocked Report needs no commit message options. To seal a
+worker failure instead, use `--failure "<reason>"`. Report publication returns
+worker cleanup status and retains a warning when finalization must be retried.
 
 The direct planner launcher starts interactive Pi with the configured `planner`
 model and thinking level. It disables extension discovery, explicitly loads only

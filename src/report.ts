@@ -46,15 +46,15 @@ const submittedArtifactSchema = z
     sha256: z.string().regex(digestPattern),
   })
   .strict();
-const commonSubmissionSchema = z.object({
+const submissionIdentitySchema = z.object({
   kind: z.literal("submission"),
   goalId: z.string().regex(goalIdPattern),
   changeId: z.string().regex(sequenceIdPattern),
   ticketId: z.string().regex(sequenceIdPattern),
-  outcome: z.literal("completed"),
   artifacts: z.array(submittedArtifactSchema),
 });
-const implementationSubmissionSchema = commonSubmissionSchema
+const completedSubmissionSchema = submissionIdentitySchema.extend({ outcome: z.literal("completed") });
+const implementationSubmissionSchema = completedSubmissionSchema
   .extend({ workerRevision: z.string().regex(revisionPattern) })
   .strict();
 const reviewFindingSchema = z
@@ -71,7 +71,7 @@ const acceptanceAssessmentSchema = z
     evidence: z.string().trim().min(1),
   })
   .strict();
-const reviewSubmissionSchema = commonSubmissionSchema
+const reviewSubmissionSchema = completedSubmissionSchema
   .extend({
     reviewedRevision: z.string().regex(revisionPattern),
     producingImplementationTicketId: z.string().regex(sequenceIdPattern),
@@ -80,6 +80,10 @@ const reviewSubmissionSchema = commonSubmissionSchema
     verdict: z.enum(["remediate", "approve", "reject", "ask-operator"]),
   })
   .strict();
+const blockedSubmissionSchema = submissionIdentitySchema
+  .extend({ outcome: z.literal("blocked") })
+  .strict();
+const submissionSchema = z.union([implementationSubmissionSchema, reviewSubmissionSchema, blockedSubmissionSchema]);
 const reportArtifactSchema = submittedArtifactSchema.extend({ bytes: z.number().int().nonnegative() }).strict();
 const executionSchema = z
   .object({
@@ -208,6 +212,14 @@ export type PublishImplementationReportInput = TicketIdentity & {
 };
 
 export type PublishReviewReportInput = TicketIdentity & {
+  cwd: string;
+  execution: WorkerExecution;
+  now?: Date;
+  crash?: CrashInjector;
+  runtimeOperations?: WorkerRuntimeOperations;
+};
+
+export type PublishBlockedReportInput = TicketIdentity & {
   cwd: string;
   execution: WorkerExecution;
   now?: Date;
@@ -398,6 +410,28 @@ function validateAcceptanceAssessment(
   }
 }
 
+async function validateBlockedSubmission(
+  root: string,
+  outputDirectory: string,
+  identity: TicketIdentity,
+): Promise<{
+  metadata: z.infer<typeof blockedSubmissionSchema>;
+  body: string;
+  artifacts: Array<z.infer<typeof reportArtifactSchema>>;
+}> {
+  const document = await readDocument(root, join(outputDirectory, "submission.md"));
+  const metadata = blockedSubmissionSchema.parse(document.metadata);
+  assertSubmissionIdentity(metadata, identity);
+  for (const section of ["Reason", "Evidence"]) {
+    const match = document.body.match(new RegExp(`^## ${section}\\s*\\n\\s*([\\s\\S]*?)(?=\\n## |$)`, "m"));
+    if (!match?.[1]?.trim()) throw new Error(`blocked Submission is missing the ${section} section`);
+  }
+  const artifactPaths = new Set(metadata.artifacts.map((artifact) => artifact.path));
+  await validateDeclaredPaths(outputDirectory, artifactPaths, ["submission.md"]);
+  const artifacts = await validateArtifacts(outputDirectory, metadata.artifacts);
+  return { metadata, body: document.body, artifacts };
+}
+
 async function validateReviewSubmission(
   root: string,
   outputDirectory: string,
@@ -581,6 +615,16 @@ async function loadReportDocument(root: string, goalId: string, changeId: string
     return { metadata, body: document.body };
   }
   return { metadata, body: document.body };
+}
+
+export async function loadSubmissionOutcome(
+  root: string,
+  identity: TicketIdentity,
+): Promise<"completed" | "blocked"> {
+  const document = await readDocument(root, join(ticketOutputPath(root, identity), "submission.md"));
+  const metadata = submissionSchema.parse(document.metadata);
+  assertSubmissionIdentity(metadata, identity);
+  return metadata.outcome;
 }
 
 export async function loadReport(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
@@ -770,6 +814,47 @@ export function deriveCurrentRejection(
   changeId: string,
 ): Promise<CurrentRejection | undefined> {
   return deriveCurrentReviewWithVerdict(root, goalId, changeId, "reject");
+}
+
+export async function publishBlockedReport(
+  input: PublishBlockedReportInput,
+): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
+  const repository = await discoverRepository(input.cwd);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.root, path)) {
+    throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
+  }
+  matchingExecution(input.execution, identity);
+
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  matchingTicketModelSelection(ticket, input.execution);
+  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "blocked");
+  const submission = await validateBlockedSubmission(
+    repository.root,
+    ticketOutputPath(repository.root, identity),
+    identity,
+  );
+  const metadata = terminalReportSchema.parse({
+    kind: "report",
+    goalId: input.goalId,
+    changeId: input.changeId,
+    ticketId: input.ticketId,
+    role: ticket.metadata.role,
+    outcome: "blocked",
+    publishedAt: (input.now ?? new Date()).toISOString(),
+    artifacts: submission.artifacts,
+    execution: executionMetadata(input.execution),
+  });
+  const report = { metadata, body: submission.body };
+  await installImmutable(
+    repository.root,
+    path,
+    serializeDocument(metadata, submission.body),
+    commitCrashHooks(input.crash, ticket.metadata.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
+  );
+  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
+  return { root: repository.root, report, cleanup };
 }
 
 export async function publishFailedReport(

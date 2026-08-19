@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { pathToFileURL } from "node:url";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
-import { publishImplementationReport } from "../../src/report.ts";
+import { loadReport, publishImplementationReport } from "../../src/report.ts";
+import { deriveGoalStatus } from "../../src/status.ts";
 import { issueTicket } from "../../src/ticket.ts";
 import { dispatchLocalImplementation } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
@@ -17,13 +18,34 @@ afterEach(async () => {
 });
 
 const extensionUrl = pathToFileURL(`${import.meta.dir}/../../src/pi-worker-extension.ts`).href;
+const spikePath = `${import.meta.dir}/../../bin/spike`;
+const blockedWorker = `
+import { registerWorkerExtension } from ${JSON.stringify(extensionUrl)};
+const tools = [];
+registerWorkerExtension({ registerTool: (tool) => tools.push(tool) });
+const blocked = tools.find((tool) => tool.name === "spike_block_implementation");
+if (!blocked) throw new Error("implementation blocked tool was not selected");
+let shutdowns = 0;
+const result = await blocked.execute("blocked-1", {
+  reason: "Required Docker daemon is unavailable.",
+  evidence: "docker info exited with status 1.",
+  artifacts: [],
+}, undefined, undefined, {
+  cwd: process.cwd(),
+  model: { provider: "openai-codex", id: "gpt-5.6-terra" },
+  thinkingLevel: "medium",
+  shutdown: () => shutdowns++,
+});
+if (result.terminate !== true || shutdowns !== 1) throw new Error("accepted blocked outcome did not terminate");
+`;
+
 const worker = `
 import { writeFile } from "node:fs/promises";
 import { registerWorkerExtension } from ${JSON.stringify(extensionUrl)};
 const tools = [];
 registerWorkerExtension({ registerTool: (tool) => tools.push(tool) });
-if (tools.length !== 1 || tools[0].name !== "spike_complete_implementation") {
-  throw new Error("implementation completion tool was not selected");
+if (tools.length !== 2 || tools[0].name !== "spike_complete_implementation" || tools[1].name !== "spike_block_implementation") {
+  throw new Error("implementation terminal tools were not selected");
 }
 await writeFile("pi-completed.txt", "completed through the Pi extension\\n");
 let shutdowns = 0;
@@ -88,6 +110,67 @@ describe("Pi worker completion boundary", () => {
       "actual worker selection openai-codex/gpt-5.6-sol/medium does not match Ticket assignment openai-codex/gpt-5.6-terra/medium",
     );
     expect(await Bun.file(`${dispatched.exchange.outputDirectory}/submission.md`).exists()).toBe(false);
+  });
+
+  test("publishes a blocked implementation without a Candidate or repository bundle", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const goal = await createGoal({
+      cwd: repository.root,
+      title: "Report an implementation blocker",
+      outcome: "Retain truthful blocked evidence without accepting partial work.",
+      approval: "Approved.",
+    });
+    const goalId = goal.goal.metadata.goalId;
+    await createChange({
+      cwd: repository.root,
+      goalId,
+      title: "Exercise blocked completion",
+      intent: "Publish worker-authored blocked evidence.",
+      rationale: "A blocker must not produce a Candidate.",
+      acceptanceCriteria: ["Blocked implementation evidence produces no Candidate."],
+    });
+    await issueTicket({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      instruction: "Report the external Docker blocker.",
+      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      model: "openai-codex/gpt-5.6-terra",
+      thinking: "medium",
+    });
+
+    const dispatched = await dispatchLocalImplementation({
+      cwd: repository.root,
+      goalId,
+      changeId: "001",
+      ticketId: "001",
+      worker: "blocked-pi-extension-worker",
+      command: ["bun", "-e", blockedWorker],
+    });
+    expect(dispatched.execution.exitCode).toBe(0);
+    expect(await Bun.file(`${dispatched.exchange.outputDirectory}/repository.bundle`).exists()).toBe(false);
+
+    const publication = Bun.spawn([
+      spikePath,
+      "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001", "--json",
+    ], { cwd: repository.root, stdout: "pipe", stderr: "pipe" });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      publication.exited,
+      new Response(publication.stdout).text(),
+      new Response(publication.stderr).text(),
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toMatchObject({ ok: true, data: { report: { outcome: "blocked", role: "implement" } } });
+    const report = await loadReport(repository.root, goalId, "001", "001");
+    expect(report.body).toContain("Required Docker daemon is unavailable.");
+    expect(report.metadata).not.toHaveProperty("candidateRevision");
+    expect((await deriveGoalStatus(repository.root, goalId)).currentChange?.latestReport).toEqual({
+      ticketId: "001",
+      role: "implement",
+      outcome: "blocked",
+    });
   });
 
   test("produces a publishable implementation exchange through only the terminating tool", async () => {

@@ -745,7 +745,7 @@ The private checkout starts at the exact Candidate \`${inputRevision}\`.
 
 ## Declared output
 
-Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with the terminating \`spike_complete_review\` tool. Scripted workers may instead use \`spike worker complete --file payload.json\` or stdin. The review payload contains:
+Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with either \`spike_complete_review\` or, when a condition outside the worker's control prevents review, \`spike_block_review\`. Scripted workers may instead use \`spike worker complete\` or \`spike worker block\` with \`--file payload.json\` or stdin. The completed review payload contains:
 
 - non-blank \`reviewStatement\`;
 - \`findings\` with unique kebab-case \`id\`, severity \`critical\`, \`high\`, \`medium\`, or \`low\`, and non-blank \`statement\`;
@@ -753,7 +753,7 @@ Write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with t
 - verdict \`remediate\`, \`approve\`, \`reject\`, or \`ask-operator\`;
 - \`artifacts\`, an array of declared paths below \`artifacts/\`.
 
-Spike validates and digests artifacts and atomically writes the canonical \`submission.md\`. Do not write a Submission or Git bundle yourself.
+A blocked payload contains non-blank \`reason\` and \`evidence\` plus declared \`artifacts\`; it produces no verdict. Spike validates and digests artifacts and atomically writes the canonical \`submission.md\`. Do not write a Submission or Git bundle yourself.
 `;
   }
   return `# Implementation worker context
@@ -762,9 +762,9 @@ The private checkout starts at exact revision \`${inputRevision}\`.
 
 ## Declared output
 
-Implement in the private checkout and write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with the terminating \`spike_complete_implementation\` tool. Scripted workers may instead use \`spike worker complete --file payload.json\` or stdin. The implementation payload contains non-blank \`summary\`, \`verification\`, \`assumptions\`, \`limitations\`, \`risks\`, and \`followUp\` strings plus \`artifacts\`, an array of declared paths below \`artifacts/\`.
+Implement in the private checkout and write artifacts only below \`SPIKE_OUTPUT_DIR/artifacts/\`. In Pi, finish with either \`spike_complete_implementation\` or, when a condition outside the worker's control prevents implementation, \`spike_block_implementation\`. Scripted workers may instead use \`spike worker complete\` or \`spike worker block\` with \`--file payload.json\` or stdin. The completed implementation payload contains non-blank \`summary\`, \`verification\`, \`assumptions\`, \`limitations\`, \`risks\`, and \`followUp\` strings plus \`artifacts\`, an array of declared paths below \`artifacts/\`. A blocked payload contains non-blank \`reason\` and \`evidence\` plus declared \`artifacts\`; it produces no Candidate.
 
-Spike snapshots the checkout, creates \`repository.bundle\`, validates and digests artifacts, and atomically writes the canonical \`submission.md\` last. Do not write a Submission or Git bundle yourself.
+For completed work, Spike snapshots the checkout and creates \`repository.bundle\`. For either outcome, Spike validates and digests artifacts and atomically writes the canonical \`submission.md\` last. Do not write a Submission or Git bundle yourself.
 `;
 }
 
@@ -1026,8 +1026,10 @@ export async function dispatchLocalTicket(
   };
 }
 
-function piCompletionTool(role: "implement" | "review"): string {
-  return role === "implement" ? "spike_complete_implementation" : "spike_complete_review";
+function piTerminalTools(role: "implement" | "review"): { complete: string; blocked: string } {
+  return role === "implement"
+    ? { complete: "spike_complete_implementation", blocked: "spike_block_implementation" }
+    : { complete: "spike_complete_review", blocked: "spike_block_review" };
 }
 
 async function acceptedSubmission(outputDirectory: string): Promise<boolean> {
@@ -1061,7 +1063,7 @@ export async function dispatchPiTicket(
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const inputDirectory = join(exchangePath(repository.root, identity), "input");
-  const completionTool = piCompletionTool(ticket.metadata.role);
+  const terminalTools = piTerminalTools(ticket.metadata.role);
   const extension = resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
     input.piExecutable ?? "pi",
@@ -1079,10 +1081,10 @@ export async function dispatchPiTicket(
     "--no-prompt-templates",
     "--no-context-files",
     "--tools",
-    `read,bash,edit,write,${completionTool}`,
+    `read,bash,edit,write,${terminalTools.complete},${terminalTools.blocked}`,
     `@${join(inputDirectory, "ticket.md")}`,
     `@${join(inputDirectory, "context.md")}`,
-    `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish only with ${completionTool}.`,
+    `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish with ${terminalTools.complete}, or use ${terminalTools.blocked} only when a condition outside the worker's control prevents completion.`,
   ];
   const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
   if (input.host !== "direct") {

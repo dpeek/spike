@@ -10,7 +10,6 @@ import {
   loadPlan,
   refreshChangeChurn,
   revisePlan,
-  setPlannedTicketCount,
 } from "./plan.ts";
 import { reportPath, ticketPath } from "./ticket.ts";
 
@@ -149,31 +148,29 @@ async function installChurnHistory(root: string): Promise<string[]> {
 
 describe("Plan", () => {
   test("detects only the documented deterministic churn thresholds", () => {
-    const quiet = detectChangeChurn(3, {
+    const quiet = detectChangeChurn({
       ticketCount: 5,
       reports: [
         { ticketId: "001", role: "review", outcome: "completed", verdict: "remediate", findingIds: ["repeat-001"] },
         { ticketId: "002", role: "implement", outcome: "partial", findingIds: [] },
         { ticketId: "003", role: "implement", outcome: "failed", findingIds: [] },
-        { ticketId: "004", role: "review", outcome: "completed", verdict: "remediate", findingIds: ["repeat-001"] },
+        { ticketId: "004", role: "review", outcome: "completed", verdict: "approve", findingIds: ["repeat-001"] },
       ],
     });
     expect(quiet).toEqual([]);
 
-    const churn = detectChangeChurn(3, {
-      ticketCount: 6,
+    const churn = detectChangeChurn({
+      ticketCount: 4,
       reports: [
         { ticketId: "001", role: "review", outcome: "completed", verdict: "remediate", findingIds: ["repeat-001"] },
         { ticketId: "002", role: "implement", outcome: "partial", findingIds: [] },
         { ticketId: "003", role: "review", outcome: "blocked", findingIds: [] },
         { ticketId: "004", role: "review", outcome: "completed", verdict: "remediate", findingIds: ["repeat-001"] },
-        { ticketId: "005", role: "review", outcome: "completed", verdict: "remediate", findingIds: ["other-001", "repeat-001"] },
       ],
     });
     expect(churn).toEqual([
-      { kind: "ticket-count", planned: 3, actual: 6 },
-      { kind: "remediation-rounds", count: 3 },
-      { kind: "reopened-finding", findingId: "repeat-001", reportCount: 3 },
+      { kind: "remediation-rounds", count: 2 },
+      { kind: "reopened-finding", findingId: "repeat-001", reportCount: 2 },
       { kind: "consecutive-non-progress", ticketIds: ["002", "003"], outcomes: ["partial", "blocked"] },
     ]);
   });
@@ -183,7 +180,6 @@ describe("Plan", () => {
     try {
       await installProjectConfig(root);
       await createInitialPlan(root, goalId, "Detect churn", "Warn after repeated feedback.", "2026-03-25T09:00:00.000Z");
-      await setPlannedTicketCount(root, goalId, "001", 1, "2026-03-25T09:01:00.000Z");
       const ticketIds = await installChurnHistory(root);
       const reportSources = await Promise.all(
         ticketIds.map((ticketId) => readFile(reportPath(root, goalId, "001", ticketId), "utf8")),
@@ -191,13 +187,11 @@ describe("Plan", () => {
 
       const refreshed = await refreshChangeChurn(root, goalId, "001", "2026-03-25T11:00:00.000Z");
       expect(refreshed.indicators).toEqual([
-        { kind: "ticket-count", planned: 1, actual: 4 },
         { kind: "remediation-rounds", count: 3 },
         { kind: "reopened-finding", findingId: "correctness-001", reportCount: 3 },
       ]);
       expect(refreshed.plan.metadata.updatedAt).toBe("2026-03-25T11:00:00.000Z");
       expect(refreshed.plan.body).toContain("Change 001 churn detected");
-      expect(refreshed.plan.body).toContain("planned Tickets: 1; actual Tickets: 4");
       expect(refreshed.plan.body).toContain("3 completed review Reports requested remediation");
       expect(refreshed.plan.body).toContain("`correctness-001` appeared in 3 review Reports");
       expect((await loadPlan(root, goalId)).body).toBe(refreshed.plan.body);

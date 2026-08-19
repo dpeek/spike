@@ -10,6 +10,7 @@ Independently assess the exact Candidate against the canonical Change criteria a
 - Assess every canonical acceptance criterion exactly once.
 - Reproduce important behavior where practical and verify external postconditions when resources are created or removed.
 - Reuse a stable finding ID when the same material defect recurs.
+- If a condition outside the worker's control prevents review, use the blocked tool with concrete reason and evidence; it produces no verdict.
 
 ## Blocking findings
 

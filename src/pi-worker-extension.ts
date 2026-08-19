@@ -7,6 +7,7 @@ type CompletionData = {
   changeId: string;
   ticketId: string;
   role: WorkerRole;
+  outcome: "completed" | "blocked";
   workerRevision?: string;
   reviewedRevision?: string;
   artifacts: Array<{ path: string; sha256: string }>;
@@ -61,6 +62,7 @@ export type RegisterWorkerExtensionOptions = {
   command?: string;
   environment?: NodeJS.ProcessEnv;
   complete?: (input: RunWorkerCompletionInput) => Promise<CompletionData>;
+  block?: (input: RunWorkerCompletionInput) => Promise<CompletionData>;
 };
 
 const maximumProcessOutputBytes = 1024 * 1024;
@@ -90,6 +92,17 @@ const acceptanceAssessment = {
     criterion: nonBlankString,
     assessment: { type: "string", enum: ["met", "not-met", "unclear"] },
     evidence: nonBlankString,
+  },
+} as const;
+
+const blockedParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["reason", "evidence", "artifacts"],
+  properties: {
+    reason: nonBlankString,
+    evidence: nonBlankString,
+    artifacts,
   },
 } as const;
 
@@ -157,19 +170,25 @@ function parseCompletion(stdout: string): CompletionData {
     !("role" in data) ||
     (data.role !== "implement" && data.role !== "review") ||
     !("artifacts" in data) ||
-    !Array.isArray(data.artifacts)
+    !Array.isArray(data.artifacts) ||
+    !("outcome" in data) ||
+    (data.outcome !== "completed" && data.outcome !== "blocked")
   ) {
     throw new Error("Spike worker completion returned invalid completion data");
   }
   return data as CompletionData;
 }
 
-export async function runWorkerCompletion(input: RunWorkerCompletionInput): Promise<CompletionData> {
-  if (input.signal?.aborted) throw new Error("Spike worker completion was cancelled");
+async function runWorkerSubmission(
+  input: RunWorkerCompletionInput,
+  action: "complete" | "block",
+): Promise<CompletionData> {
+  const actionLabel = action === "complete" ? "completion" : "block";
+  if (input.signal?.aborted) throw new Error(`Spike worker ${actionLabel} was cancelled`);
   const command = input.command ?? input.environment?.["SPIKE_BIN"] ?? process.env["SPIKE_BIN"] ?? "spike";
 
   return new Promise<CompletionData>((resolve, reject) => {
-    const child = spawn(command, ["worker", "complete", "--json"], {
+    const child = spawn(command, ["worker", action, "--json"], {
       cwd: input.cwd,
       env: {
         ...(input.environment ?? process.env),
@@ -214,9 +233,9 @@ export async function runWorkerCompletion(input: RunWorkerCompletionInput): Prom
       const stdoutText = Buffer.concat(stdout).toString("utf8");
       const stderrText = Buffer.concat(stderr).toString("utf8");
       if (input.signal?.aborted) {
-        reject(new Error("Spike worker completion was cancelled"));
+        reject(new Error(`Spike worker ${actionLabel} was cancelled`));
       } else if (outputLimitExceeded) {
-        reject(new Error("Spike worker completion process output exceeded its size limit"));
+        reject(new Error(`Spike worker ${actionLabel} process output exceeded its size limit`));
       } else if (code !== 0) {
         reject(completionError(stdoutText, stderrText));
       } else {
@@ -229,6 +248,14 @@ export async function runWorkerCompletion(input: RunWorkerCompletionInput): Prom
     });
     child.stdin.end(JSON.stringify(input.payload));
   });
+}
+
+export function runWorkerCompletion(input: RunWorkerCompletionInput): Promise<CompletionData> {
+  return runWorkerSubmission(input, "complete");
+}
+
+export function runWorkerBlocked(input: RunWorkerCompletionInput): Promise<CompletionData> {
+  return runWorkerSubmission(input, "block");
 }
 
 function requiredRole(role: string | undefined): WorkerRole {
@@ -247,7 +274,7 @@ function actualSelection(context: ToolContext): { actualModel: string; actualThi
   return { actualModel: `${provider}/${id}`, actualThinking: actualThinking as ThinkingLevel };
 }
 
-function toolForRole(
+function completionToolForRole(
   role: WorkerRole,
   complete: (input: RunWorkerCompletionInput) => Promise<CompletionData>,
   options: RegisterWorkerExtensionOptions,
@@ -278,7 +305,9 @@ function toolForRole(
         ...(options.command === undefined ? {} : { command: options.command }),
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       });
-      if (completion.role !== role) throw new Error("Spike completed a different Ticket role than the active worker tool");
+      if (completion.role !== role || completion.outcome !== "completed") {
+        throw new Error("Spike completed a different Ticket role or outcome than the active worker tool");
+      }
       context.shutdown();
       return {
         content: [{
@@ -292,12 +321,57 @@ function toolForRole(
   };
 }
 
+function blockedToolForRole(
+  role: WorkerRole,
+  block: (input: RunWorkerCompletionInput) => Promise<CompletionData>,
+  options: RegisterWorkerExtensionOptions,
+): ToolDefinition {
+  const implementation = role === "implement";
+  const name = implementation ? "spike_block_implementation" : "spike_block_review";
+  return {
+    name,
+    label: implementation ? "Report implementation blocked" : "Report review blocked",
+    description: "Submit a blocked outcome with concrete reason and evidence. Use only when a condition outside the worker's control prevents completing this Ticket.",
+    promptSnippet: "Report that the Ticket is blocked without producing a Candidate or verdict",
+    promptGuidelines: [
+      `Use ${name} instead of the completion tool when a condition outside your control prevents completion.`,
+      "Do not use a blocked outcome for planned partial delivery or work that can be completed in this session.",
+      `If ${name} reports an error, correct the payload and call it again.`,
+    ],
+    parameters: blockedParameters,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, context) {
+      const blocked = await block({
+        cwd: context.cwd,
+        payload: params,
+        ...actualSelection(context),
+        ...(signal === undefined ? {} : { signal }),
+        ...(options.command === undefined ? {} : { command: options.command }),
+        ...(options.environment === undefined ? {} : { environment: options.environment }),
+      });
+      if (blocked.role !== role || blocked.outcome !== "blocked") {
+        throw new Error("Spike blocked a different Ticket role or outcome than the active worker tool");
+      }
+      context.shutdown();
+      return {
+        content: [{
+          type: "text",
+          text: `Spike accepted blocked ${role} Ticket ${blocked.goalId}/${blocked.changeId}/${blocked.ticketId}.`,
+        }],
+        details: blocked,
+        terminate: true,
+      };
+    },
+  };
+}
+
 export function registerWorkerExtension(
   pi: WorkerExtensionApi,
   options: RegisterWorkerExtensionOptions = {},
 ): void {
   const role = requiredRole(options.role ?? process.env["SPIKE_TICKET_ROLE"]);
-  pi.registerTool(toolForRole(role, options.complete ?? runWorkerCompletion, options));
+  pi.registerTool(completionToolForRole(role, options.complete ?? runWorkerCompletion, options));
+  pi.registerTool(blockedToolForRole(role, options.block ?? runWorkerBlocked, options));
 }
 
 export default function spikeWorkerExtension(pi: WorkerExtensionApi): void {

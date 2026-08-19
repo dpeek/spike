@@ -33,13 +33,15 @@ await writeFile(process.env.FAKE_PI_ARGS, JSON.stringify(args));
 const value = (name) => args[args.indexOf(name) + 1];
 const role = process.env.SPIKE_TICKET_ROLE;
 const completion = role === "implement" ? "spike_complete_implementation" : "spike_complete_review";
-const other = role === "implement" ? "spike_complete_review" : "spike_complete_implementation";
+const blocked = role === "implement" ? "spike_block_implementation" : "spike_block_review";
+const otherCompletion = role === "implement" ? "spike_complete_review" : "spike_complete_implementation";
+const otherBlocked = role === "implement" ? "spike_block_review" : "spike_block_implementation";
 const headed = process.env.FAKE_PI_HOST === "herdr";
 if (headed ? args.includes("--print") : !args.includes("--print")) throw new Error("Pi mode does not match its host");
 if (!args.includes("--no-session") || !args.includes("--no-approve")) throw new Error("Pi session is not fresh");
 if (!args.includes("--no-extensions") || !args.includes("--no-context-files") || !args.includes("--no-skills") || !args.includes("--no-prompt-templates")) throw new Error("Pi discovery is not disabled");
 if (value("--model") !== process.env.SPIKE_MODEL || value("--thinking") !== process.env.SPIKE_THINKING) throw new Error("Pi selection is not frozen");
-if (value("--tools") !== "read,bash,edit,write," + completion || value("--tools").includes(other)) throw new Error("wrong completion tool exposure");
+if (value("--tools") !== "read,bash,edit,write," + completion + "," + blocked || value("--tools").includes(otherCompletion) || value("--tools").includes(otherBlocked)) throw new Error("wrong terminal tool exposure");
 for (const name of ["ticket.md", "context.md"]) {
   const path = process.env.SPIKE_INPUT_DIR + "/" + name;
   if (!args.includes("@" + path)) throw new Error("missing attached " + name);
@@ -172,11 +174,11 @@ describe("controlled Pi dispatch", () => {
     expect(headedArgs).toContain("--no-context-files");
     expect(headedArgs[headedArgs.indexOf("--model") + 1]).toBe("frozen-headed-model");
     expect(headedArgs[headedArgs.indexOf("--thinking") + 1]).toBe("high");
-    expect(headedArgs[headedArgs.indexOf("--tools") + 1]).toBe("read,bash,edit,write,spike_complete_implementation");
+    expect(headedArgs[headedArgs.indexOf("--tools") + 1]).toBe("read,bash,edit,write,spike_complete_implementation,spike_block_implementation");
     expect(headedArgs.filter((arg) => arg === "--extension")).toHaveLength(1);
     expect(headedArgs[headedArgs.indexOf("--extension") + 1]).toEndWith("/src/pi-worker-extension.ts");
     expect(headedArgs.at(-1)).toBe(
-      "Execute the attached immutable implement Ticket in this exact checkout. Finish only with spike_complete_implementation.",
+      "Execute the attached immutable implement Ticket in this exact checkout. Finish with spike_complete_implementation, or use spike_block_implementation only when a condition outside the worker's control prevents completion.",
     );
     expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/ticket.md`);
     expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/context.md`);
@@ -250,6 +252,7 @@ describe("controlled Pi dispatch", () => {
     expect(implementationArgs).toContain("--print");
     expect(implementationArgs).toContain("--no-session");
     expect(implementationArgs.join(" ")).toContain("spike_complete_implementation");
+    expect(implementationArgs.join(" ")).toContain("spike_block_implementation");
     expect(implementationArgs).not.toContain("--continue");
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
 
@@ -276,7 +279,9 @@ describe("controlled Pi dispatch", () => {
     });
     const reviewArgs = JSON.parse(await readFile(argsPath, "utf8")) as string[];
     expect(reviewArgs.join(" ")).toContain("spike_complete_review");
+    expect(reviewArgs.join(" ")).toContain("spike_block_review");
     expect(reviewArgs.join(" ")).not.toContain("spike_complete_implementation");
+    expect(reviewArgs.join(" ")).not.toContain("spike_block_implementation");
     expect(await Bun.file(reportPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
 
     const reviewPublication = await spike(repository.root, [

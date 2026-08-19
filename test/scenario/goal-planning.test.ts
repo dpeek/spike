@@ -45,9 +45,8 @@ describe("Goal planning", () => {
       kind: "plan",
       goalId,
       updatedAt: "2026-03-19T10:00:00.000Z",
-      changePlans: [],
     });
-    expect(plan.body).toContain("## Planned Changes\n\nNo Changes planned yet.");
+    expect(plan.body).toContain("## Change direction\n\nNo Change selected yet; later ideas remain tentative.");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
     expect(await readFile(join(repository.root, "operator-notes.txt"), "utf8")).toBe("leave me dirty\n");
   });

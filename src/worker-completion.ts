@@ -16,6 +16,13 @@ const artifactPathSchema = z.string().refine(
 );
 const nonBlankString = z.string().trim().min(1);
 const artifactsSchema = z.array(artifactPathSchema).default([]);
+const blockedPayloadSchema = z
+  .object({
+    reason: nonBlankString,
+    evidence: nonBlankString,
+    artifacts: artifactsSchema,
+  })
+  .strict();
 const implementationPayloadSchema = z
   .object({
     summary: nonBlankString,
@@ -64,8 +71,18 @@ export type WorkerCompletion = {
   changeId: string;
   ticketId: string;
   role: "implement" | "review";
+  outcome: "completed";
   workerRevision?: string;
   reviewedRevision?: string;
+  artifacts: Artifact[];
+};
+
+export type WorkerBlocked = {
+  goalId: string;
+  changeId: string;
+  ticketId: string;
+  role: "implement" | "review";
+  outcome: "blocked";
   artifacts: Artifact[];
 };
 
@@ -340,6 +357,19 @@ ${payload.reviewStatement}
 `;
 }
 
+function blockedBody(payload: z.infer<typeof blockedPayloadSchema>): string {
+  return `# Blocked evidence
+
+## Reason
+
+${payload.reason}
+
+## Evidence
+
+${payload.evidence}
+`;
+}
+
 function parsePayload(source: string): unknown {
   if (Buffer.byteLength(source) > maximumPayloadBytes) throw new Error("worker completion payload exceeds its size limit");
   try {
@@ -386,7 +416,7 @@ export async function completeWorker(cwd: string, payloadSource: string): Promis
       artifacts,
     } as const;
     await installImmutable(outputDirectory, join(outputDirectory, "submission.md"), serializeDocument(metadata, implementationBody(payload)));
-    return { ...identity, role: "implement", workerRevision, artifacts };
+    return { ...identity, role: "implement", outcome: "completed", workerRevision, artifacts };
   }
 
   const payload = reviewPayloadSchema.parse(payloadValue);
@@ -404,7 +434,39 @@ export async function completeWorker(cwd: string, payloadSource: string): Promis
     artifacts,
   } as const;
   await installImmutable(outputDirectory, join(outputDirectory, "submission.md"), serializeDocument(metadata, reviewBody(payload)));
-  return { ...identity, role: "review", reviewedRevision: ticket.metadata.inputRevision, artifacts };
+  return { ...identity, role: "review", outcome: "completed", reviewedRevision: ticket.metadata.inputRevision, artifacts };
+}
+
+export async function blockWorker(cwd: string, payloadSource: string): Promise<WorkerBlocked> {
+  const inputPath = requireEnvironmentDirectory("SPIKE_INPUT_DIR");
+  const outputPath = requireEnvironmentDirectory("SPIKE_OUTPUT_DIR");
+  const [inputDirectory, outputDirectory] = await Promise.all([
+    regularDirectory(inputPath, "SPIKE_INPUT_DIR"),
+    regularDirectory(outputPath, "SPIKE_OUTPUT_DIR"),
+  ]);
+  const ticket = await loadTicketDocument(inputDirectory, join(inputDirectory, "ticket.md"));
+  assertEnvironmentMatchesTicket(ticket);
+  const payload = blockedPayloadSchema.parse(parsePayload(payloadSource));
+  const repository = await repositoryRoot(cwd);
+  await assertInputRevision(repository, ticket);
+  const artifacts = await validateOutputAndDigestArtifacts(outputDirectory, payload.artifacts);
+  const identity = {
+    goalId: ticket.metadata.goalId,
+    changeId: ticket.metadata.changeId,
+    ticketId: ticket.metadata.ticketId,
+  };
+  const metadata = {
+    kind: "submission",
+    ...identity,
+    outcome: "blocked",
+    artifacts,
+  } as const;
+  await installImmutable(
+    outputDirectory,
+    join(outputDirectory, "submission.md"),
+    serializeDocument(metadata, blockedBody(payload)),
+  );
+  return { ...identity, role: ticket.metadata.role, outcome: "blocked", artifacts };
 }
 
 export async function readWorkerPayload(cwd: string, file: string | undefined, stdin: () => Promise<string>): Promise<string> {

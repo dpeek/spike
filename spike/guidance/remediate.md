@@ -13,7 +13,7 @@ Close the explicit accepted findings from the selected review Report in a fresh 
 
 ## Completion
 
-Call the implementation completion tool only when every accepted finding assigned to this Ticket is closed and all required verification passes. A limitation that leaves an assigned finding open forbids completed submission.
+Call the implementation completion tool only when every accepted finding assigned to this Ticket is closed and all required verification passes. A limitation that leaves an assigned finding open forbids completed submission. If a condition outside the worker's control prevents remediation, use the blocked tool with concrete reason and evidence; it produces no Candidate.
 
 ## Boundaries
 

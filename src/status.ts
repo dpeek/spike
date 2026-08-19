@@ -46,6 +46,12 @@ export type DerivedChangeStatus = {
     role: "implement" | "review";
     inputRevision: string;
   };
+  latestReport: null | {
+    ticketId: string;
+    role: "implement" | "review";
+    outcome: "completed" | "partial" | "blocked" | "failed" | "stopped" | "interrupted";
+    verdict?: "remediate" | "approve" | "reject" | "ask-operator";
+  };
   churnWarnings: ChurnIndicator[];
 };
 
@@ -111,7 +117,6 @@ async function deriveActiveChangeStatus(
   root: string,
   goalId: string,
   changeId: string,
-  plannedTicketCount: number | undefined,
 ): Promise<DerivedChangeStatus> {
   const [change, candidate, review, openTicket, history] = await Promise.all([
     loadChange(root, goalId, changeId),
@@ -120,6 +125,7 @@ async function deriveActiveChangeStatus(
     loadOpenTicket(root, goalId, changeId),
     loadChangeReportHistory(root, goalId, changeId),
   ]);
+  const latestReport = history.reports.at(-1);
   return {
     changeId,
     baseRevision: change.metadata.baseRevision,
@@ -147,7 +153,16 @@ async function deriveActiveChangeStatus(
             role: openTicket.metadata.role,
             inputRevision: openTicket.metadata.inputRevision,
           },
-    churnWarnings: plannedTicketCount === undefined ? [] : detectChangeChurn(plannedTicketCount, history),
+    latestReport:
+      latestReport === undefined
+        ? null
+        : {
+            ticketId: latestReport.ticketId,
+            role: latestReport.role,
+            outcome: latestReport.outcome,
+            ...(latestReport.verdict === undefined ? {} : { verdict: latestReport.verdict }),
+          },
+    churnWarnings: detectChangeChurn(history),
   };
 }
 
@@ -173,14 +188,10 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
   if (activeChangeIds.length > 1) throw new Error(`Goal ${goalId} has more than one active Change`);
 
   const activeChangeId = activeChangeIds[0];
-  const plannedTicketCount =
-    activeChangeId === undefined
-      ? undefined
-      : plan.metadata.changePlans.find((entry) => entry.changeId === activeChangeId)?.plannedTicketCount;
   const currentChange =
     activeChangeId === undefined
       ? null
-      : await deriveActiveChangeStatus(repository.root, goalId, activeChangeId, plannedTicketCount);
+      : await deriveActiveChangeStatus(repository.root, goalId, activeChangeId);
 
   return {
     goalId,

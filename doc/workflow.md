@@ -11,7 +11,7 @@ Spike should replace its current ticket-centric workflow with a smaller model bu
 - **Ticket** — one bounded assignment executed in one fresh worker session.
 - **Report** — the canonical, host-published record of one Ticket's accepted outcome.
 
-A **Project** is one Git repository configured by tracked `spike.json`. It has an operator-chosen stable slug, owns its Goals, and provides their sequence scope. A planner-owned **Plan** provides working memory: the intended Change sequence, current direction, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history. Workers write staging Submissions; Spike validates them and publishes canonical Reports.
+A **Project** is one Git repository configured by tracked `spike.json`. It has an operator-chosen stable slug, owns its Goals, and provides their sequence scope. A planner-owned **Plan** provides working memory: the next Change direction, tentative later ideas, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history. Workers write staging Submissions; Spike validates them and publishes canonical Reports.
 
 The normal loop becomes:
 
@@ -205,19 +205,19 @@ The Plan is the planner's durable notebook for accomplishing the Goal.
 It contains:
 
 - current Goal summary;
-- ordered planned Change sequence;
-- status of each Change;
-- dependencies between Changes;
-- rationale for ordering;
-- current focus;
-- planned next Tickets;
+- next Change direction;
+- tentative later Change ideas and dependencies;
+- rationale for the current ordering;
+- current focus and next Ticket;
 - progress summary;
 - decisions and changed assumptions;
 - open findings;
 - churn indicators;
 - deferred improvements.
 
-The Plan may be rewritten atomically as understanding changes. It owns all mutable Change summaries and planned Ticket sequences. It should reference authoritative Tickets where useful, but it must not copy every digest or evidence field.
+The planner selects the next independently safe Change from the Goal's current integrated revision and accumulated evidence. It does not need to decompose the whole Goal upfront, and later Change ideas remain tentative.
+
+The Plan may be rewritten atomically as understanding changes. It owns all mutable Change summaries and tentative direction. It should reference authoritative Tickets where useful, but it must not copy every digest or evidence field.
 
 ## Change
 
@@ -238,6 +238,8 @@ A Change owns:
 - terminal Change decision, when resolved.
 
 Acceptance criteria are distinct, canonical single-line assertions. Review Reports identify and assess them by their exact text, so blank, multiline, or duplicate criteria are invalid.
+
+A Change must be small enough for one fresh implementer to satisfy every criterion and verify its external postconditions in one session. The initial implementation Ticket covers the complete Change. Later implementation Tickets are retries or remediation of review findings, not planned delivery tranches. If several implementation sessions are predictably necessary, the planner splits the work into smaller Changes before issuance.
 
 The full identity of a Change is its Goal ID plus Change ID. A Change exists before its first candidate commit, so its identity cannot be a commit hash.
 
@@ -409,7 +411,7 @@ On normal completion, a worker session is stopped and finalized after Spike publ
 
 ## Submission and Report
 
-A Submission is the worker-authored, untrusted response to a Ticket. It exists only in staging, may be corrected before Report publication, and does not advance workflow state. A terminal host-generated Report does not require a Submission.
+A Submission is the worker-authored, untrusted response to a Ticket. It exists only in staging, may be corrected before Report publication, and does not advance workflow state. A worker may submit `blocked` when a condition outside its control prevents completion, with concrete reason and evidence; that Submission contains no Candidate or review verdict. A terminal host-generated Report does not require a Submission.
 
 A Report is the canonical, host-sealed outcome Spike publishes for one Ticket. Reports are immutable and append-only. A Report has no separate ID: its full identity and path are those of its Ticket. Spike owns its provenance, timestamps, exact revisions, artifact digests, and worker correlation while preserving any accepted worker-authored content.
 
@@ -449,8 +451,8 @@ Each Report remains a permanent, self-contained record of one Ticket outcome.
 
 1. Operator approves Goal.
 2. Planner creates or updates Plan.
-3. Planner identifies the first Change.
-4. Planner records the intended Change sequence and rationale.
+3. Planner selects the next independently safe Change from current evidence.
+4. Planner records the current direction and rationale while keeping later Change ideas tentative.
 
 ## Implementation
 
@@ -515,22 +517,19 @@ A poor Ticket never has to be approved merely to continue with a later Ticket.
 
 The planner needs enough Change history to detect non-convergence.
 
-Initial deterministic indicators use fixed thresholds:
+Initial deterministic indicators use only immutable Change history and fixed thresholds:
 
-- actual Ticket count exceeds planned Ticket count by more than two;
-- three completed review Reports have a `remediate` verdict;
-- the same finding ID appears in three review Reports, meaning it reopened twice;
+- two completed review Reports have a `remediate` verdict, meaning one remediation round failed to converge;
+- the same finding ID appears in two review Reports requesting remediation, meaning it reopened once;
 - two consecutive Reports have a `partial` or `blocked` outcome.
 
-These thresholds become configurable only if observed workflows justify it. For example:
+No indicator depends on an upfront Ticket or Change count. These thresholds become configurable only if observed workflows justify it. For example:
 
 ```text
 Change churn detected
 
-- planned tickets: 3
-- actual tickets: 8
-- remediation rounds: 3
-- finding concurrency-001 reopened twice
+- remediation rounds: 2
+- finding concurrency-001 reopened once
 
 Recommendation: pause implementation and review the Change design with the operator.
 ```
@@ -775,7 +774,7 @@ planner starts or reattaches in Herdr
   -> change create 001
   -> ticket issue 001
   -> fresh implementation worker starts in an ephemeral Herdr tab
-  -> worker writes a structured Submission through its completion tool
+  -> worker writes a structured Submission through a completion or blocked tool
   -> submission import
   -> candidate normalize
   -> report publish
@@ -789,7 +788,7 @@ planner starts or reattaches in Herdr
 Implement the phase as a small sequence of vertical additions:
 
 1. **Host CLI and configuration** — expose JSON-capable status, Plan revision, Change decision, Ticket dispatch, Report publication, and recovery commands. Add project defaults for planner, `implement`, and `review` model and thinking configuration. Ticket issuance accepts explicit one-Ticket model and thinking overrides, resolves and freezes the effective selection into `ticket.md`, and dispatch uses only that immutable selection. A Ticket worker never inherits the planner model or a later configuration change.
-2. **Structured worker completion** — add a thin, Node-compatible Pi worker extension with role-specific terminating tools for implementation and review completion. The extension delegates to a worker-facing Spike CLI/process command that validates the structured payload, verifies Pi's observed effective model and thinking selection against the immutable Ticket assignment, snapshots an implementation checkout into an exact worker revision, creates the output bundle, and atomically writes the declared Submission. Formatting JSON frontmatter and Git-bundle commands are host tooling responsibilities rather than instructions the model must remember. Spike still treats and revalidates all worker output as untrusted. A worker that exits without an accepted Submission cannot produce a completed Report; it receives an appropriate terminal Report and later work uses a fresh Ticket.
+2. **Structured worker outcomes** — add a thin, Node-compatible Pi worker extension with role-specific terminating tools for completion and blocked outcomes. The extension delegates to worker-facing Spike CLI/process commands that validate the structured payload and verify Pi's observed effective model and thinking selection against the immutable Ticket assignment. Completed implementation snapshots create an exact worker revision and output bundle. A blocked Submission records concrete reason and evidence but creates no bundle, Candidate, or review verdict. Host tooling atomically writes the declared Submission; workers do not format JSON frontmatter or run Git-bundle commands themselves. Spike still treats and revalidates all worker output as untrusted. A worker that exits without an accepted Submission cannot produce a completed or blocked Report; it receives an appropriate host terminal Report and later work uses a fresh Ticket.
 3. **Direct tracer-bullet verification** — run the complete CLI workflow with deterministic scripted workers and direct process launch. This remains the fast reference path for tests and proves that Herdr is not part of workflow authority.
 4. **Supervisor and Herdr integration** — add a thin, Node-compatible Pi supervisor extension and planner launcher. The extension invokes Spike only through structured CLI/process output and exposes committed guidance selection, explicitly approved Goal creation, status, Plan update, Change creation, focused Implement/Review/Remediate Ticket issuance, dispatch, recovery, and Change decision operations. For attended execution, the local adapter defaults to headed interactive Pi in one named ephemeral Herdr tab, automatically submits the immutable Ticket/context prompt, records opaque Herdr handles only in staging runtime state, surfaces live `working`, `blocked`, marker-backed `done`, or unavailable status, and supports terminal read or attachment. The completion extension requests graceful Pi shutdown only after Spike accepts structured completion. The attended wrapper then writes its execution marker. A cancellable one-shot Spike waiter observes that marker without mutating Worker records, and the supervisor extension queues one operational planner recheck keyed by full Ticket identity. An unexpected attended-waiter failure queues a distinct operational failure recheck instead of silently disabling wake-up. The planner calls `spike_status` and explicitly publishes the Report; markers, waiter failures, and wake messages are never workflow evidence. A Herdr state or terminal transcript is never a Submission, Report, approval, or recovery fact. Direct Pi remains the separately selected headless controlled-test fallback.
 5. **Attended smoke loop** — manually complete one real-Pi Goal in a temporary test repository through implement, review, approve, and land. Verify supervisor restart, marker-backed planner wake-up without model polling, worker observation, blocked-state visibility, exact Report publication, prompt closure of worker tabs, and idempotent cleanup.
@@ -883,7 +882,7 @@ The implementation succeeds when:
 - interruption rewinds to the latest committed Candidate, abandons in-progress sessions, and cleans their resources without PID-based workflow locks;
 - terminal workers are finalized promptly, including closure of ephemeral Herdr tabs after Report publication;
 - Herdr makes attended planner and worker progress observable without becoming workflow authority or enabling session reuse;
-- structured worker completion tools make a valid accepted Submission the only path to a completed Report;
+- structured worker completion and blocked tools make a valid accepted Submission the only path to a worker-authored completed or blocked Report;
 - Docker isolation is required before unattended autonomous workers run against valuable repositories;
 - Spike uses Bun as its sole application runtime while Pi remains on Node behind process protocols;
 - planner, implementation, and review model defaults are project-configured, while explicit Ticket overrides are frozen at issuance;

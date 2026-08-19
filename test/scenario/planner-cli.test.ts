@@ -117,6 +117,7 @@ describe("planner CLI", () => {
           candidate: null,
           review: null,
           openTicket: { ticketId: "001", role: "implement", inputRevision: baseRevision },
+          latestReport: null,
         },
       },
     });
@@ -179,6 +180,7 @@ describe("planner CLI", () => {
           candidate: { revision: candidateRevision, producingImplementationTicketId: "001" },
           review: { ticketId: "002", verdict: "approve", reviewedRevision: candidateRevision },
           openTicket: null,
+          latestReport: { ticketId: "002", role: "review", outcome: "completed", verdict: "approve" },
           churnWarnings: [],
         },
         decisions: [],

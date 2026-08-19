@@ -2,22 +2,15 @@ import { join } from "node:path";
 import { z } from "zod";
 import { assertGoalBelongsToProject } from "./config.ts";
 import { installImmutable, readDocument, replaceAtomic, serializeDocument } from "./durable-state.ts";
-import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
+import { goalIdPattern } from "./identity.ts";
 import { loadChangeReportHistory, type ChangeReportHistory } from "./report.ts";
 
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
-const changePlanSchema = z
-  .object({
-    changeId: z.string().regex(sequenceIdPattern),
-    plannedTicketCount: z.number().int().positive(),
-  })
-  .strict();
 const planSchema = z
   .object({
     kind: z.literal("plan"),
     goalId: z.string().regex(goalIdPattern),
     updatedAt: timestamp,
-    changePlans: z.array(changePlanSchema),
   })
   .strict();
 
@@ -27,7 +20,6 @@ export type Plan = {
 };
 
 export type ChurnIndicator =
-  | { kind: "ticket-count"; planned: number; actual: number }
   | { kind: "remediation-rounds"; count: number }
   | { kind: "reopened-finding"; findingId: string; reportCount: number }
   | {
@@ -47,17 +39,17 @@ function initialBody(title: string, outcome: string): string {
 
 ${outcome}
 
-## Planned Changes
+## Change direction
 
-No Changes planned yet.
+No Change selected yet; later ideas remain tentative.
 
 ## Current focus
 
-Identify the first Change.
+Select the next independently safe Change from current evidence.
 
-## Planned next Tickets
+## Next Ticket
 
-No Tickets planned yet.
+No Ticket selected yet.
 
 ## Progress
 
@@ -87,7 +79,7 @@ export async function createInitialPlan(
   outcome: string,
   now: string,
 ): Promise<Plan> {
-  const metadata = planSchema.parse({ kind: "plan", goalId, updatedAt: now, changePlans: [] });
+  const metadata = planSchema.parse({ kind: "plan", goalId, updatedAt: now });
   const body = `${initialBody(title, outcome)}\n`;
   await installImmutable(root, planPath(root, goalId), serializeDocument(metadata, body));
   return { metadata, body };
@@ -110,56 +102,25 @@ export async function revisePlan(root: string, goalId: string, body: string, now
   return { metadata, body: revisedBody };
 }
 
-export async function setPlannedTicketCount(
-  root: string,
-  goalId: string,
-  changeId: string,
-  plannedTicketCount: number,
-  now = new Date().toISOString(),
-): Promise<Plan> {
-  const planned = changePlanSchema.parse({ changeId, plannedTicketCount });
-  const current = await loadPlan(root, goalId);
-  const changePlans = current.metadata.changePlans
-    .filter((entry) => entry.changeId !== changeId)
-    .concat(planned)
-    .sort((left, right) => left.changeId.localeCompare(right.changeId));
-  const metadata = planSchema.parse({ ...current.metadata, updatedAt: now, changePlans });
-  await replaceAtomic(root, planPath(root, goalId), serializeDocument(metadata, current.body));
-  return { metadata, body: current.body };
-}
-
-export function detectChangeChurn(
-  plannedTicketCount: number,
-  history: ChangeReportHistory,
-): ChurnIndicator[] {
-  if (!Number.isInteger(plannedTicketCount) || plannedTicketCount < 1) {
-    throw new Error("planned Ticket count must be a positive integer");
-  }
-  if (!Number.isInteger(history.ticketCount) || history.ticketCount < 0) {
-    throw new Error("actual Ticket count must be a non-negative integer");
-  }
-
+export function detectChangeChurn(history: ChangeReportHistory): ChurnIndicator[] {
   const indicators: ChurnIndicator[] = [];
-  if (history.ticketCount > plannedTicketCount + 2) {
-    indicators.push({ kind: "ticket-count", planned: plannedTicketCount, actual: history.ticketCount });
-  }
 
   const remediationReports = history.reports.filter(
     (report) => report.role === "review" && report.outcome === "completed" && report.verdict === "remediate",
   );
-  if (remediationReports.length >= 3) {
+  if (remediationReports.length >= 2) {
     indicators.push({ kind: "remediation-rounds", count: remediationReports.length });
   }
 
   const findingCounts = new Map<string, number>();
   for (const report of history.reports) {
-    if (report.role !== "review" || report.outcome !== "completed") continue;
+    if (report.role !== "review" || report.outcome !== "completed" || report.verdict !== "remediate") continue;
     for (const findingId of new Set(report.findingIds)) {
       findingCounts.set(findingId, (findingCounts.get(findingId) ?? 0) + 1);
     }
   }
   for (const [findingId, reportCount] of [...findingCounts].sort(([left], [right]) => left.localeCompare(right))) {
-    if (reportCount >= 3) indicators.push({ kind: "reopened-finding", findingId, reportCount });
+    if (reportCount >= 2) indicators.push({ kind: "reopened-finding", findingId, reportCount });
   }
 
   let consecutive: Extract<ChurnIndicator, { kind: "consecutive-non-progress" }> | undefined;
@@ -185,8 +146,6 @@ function churnBody(changeId: string, indicators: ChurnIndicator[]): string {
   if (indicators.length === 0) return "None.";
   const lines = indicators.map((indicator) => {
     switch (indicator.kind) {
-      case "ticket-count":
-        return `- planned Tickets: ${indicator.planned}; actual Tickets: ${indicator.actual} (more than two over plan)`;
       case "remediation-rounds":
         return `- ${indicator.count} completed review Reports requested remediation`;
       case "reopened-finding":
@@ -216,10 +175,8 @@ export async function refreshChangeChurn(
   now = new Date().toISOString(),
 ): Promise<{ plan: Plan; indicators: ChurnIndicator[] }> {
   const current = await loadPlan(root, goalId);
-  const changePlan = current.metadata.changePlans.find((entry) => entry.changeId === changeId);
-  if (changePlan === undefined) throw new Error(`Plan has no planned Ticket count for Change ${changeId}`);
   const history = await loadChangeReportHistory(root, goalId, changeId);
-  const indicators = detectChangeChurn(changePlan.plannedTicketCount, history);
+  const indicators = detectChangeChurn(history);
   const metadata = planSchema.parse({ ...current.metadata, updatedAt: now });
   const body = replaceChurnSection(current.body, churnBody(changeId, indicators));
   await replaceAtomic(root, planPath(root, goalId), serializeDocument(metadata, body));

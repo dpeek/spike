@@ -13,7 +13,7 @@ Implement the complete Change in the private checkout without expanding its scop
 
 ## Completion
 
-Call the implementation completion tool only when the complete Change and all required verification are complete. A limitation that contradicts an acceptance criterion or required postcondition forbids completed submission. If the Change cannot reasonably be completed in this session, do not present an intermediate slice as completed or hide missing work under Limitations or Follow-up.
+Call the implementation completion tool only when the complete Change and all required verification are complete. A limitation that contradicts an acceptance criterion or required postcondition forbids completed submission. If a condition outside the worker's control prevents completion, use the blocked tool with concrete reason and evidence; it produces no Candidate. Do not use blocked for planned partial delivery, present an intermediate slice as completed, or hide missing work under Limitations or Follow-up.
 
 ## Boundaries
 
