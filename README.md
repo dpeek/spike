@@ -198,5 +198,34 @@ spike change abandon --goal <goal-id> --change 001 --statement "..." [--json]
 spike recover [--goal <goal-id>] [--json]
 ```
 
+## Apply a completed Goal locally
+
+After every Change is resolved and workflow cleanup is healthy, an operator may
+fast-forward the currently checked-out local branch to the Goal's exact
+integration revision. This is a separate, explicit local action:
+
+```bash
+spike goal apply --goal spike-001 --target main \
+  --approval "I approve applying this completed Goal" --json
+```
+
+The command requires all three arguments. It first refuses if the Goal has an
+active Change or Ticket, cleanup warnings, a detached or different checked-out
+branch, a dirty index/worktree, a missing local target, or a target that cannot
+fast-forward. A refusal changes no target ref or worktree state through Spike's
+apply logic and JSON reports a machine-readable `workflow` error with the
+refusal reason.
+
+On success, the single mutation performed by Spike's apply logic is Git's
+verified `--ff-only` fast-forward. The JSON data contains `goalId`,
+`targetBranch`, `previousTargetRevision`, `appliedRevision`, and
+`resultingTargetRevision`; the latter two are the exact Goal integration commit.
+Spike never invokes `git push` or another remote-mutating command, and never
+checks out branches, creates merge commits, rebases, cherry-picks, force-updates,
+or resolves conflicts. This contract does not defend against arbitrary commands
+an operator deliberately configures Git to execute (for example hooks,
+`core.fsmonitor`, or filters); their side effects are outside Spike's apply
+logic and this local-apply safety boundary.
+
 JSON mode emits exactly one `{ ok, command, data }` success object or one
 `{ ok, command, error }` failure object.

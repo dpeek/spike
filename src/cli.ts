@@ -13,6 +13,7 @@ import {
 import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { createGoal, goalPath } from "./goal.ts";
+import { applyGoalIntegration } from "./goal-apply.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
@@ -54,6 +55,7 @@ Usage:
   spike status [--goal <goal-id>] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
+  spike goal apply --goal <goal-id> --target <local-branch> --approval <statement> [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike change create --goal <goal-id> --title <title> --intent <intent> --rationale <rationale> --acceptance <criterion> [options]
   spike change land --goal <goal-id> --change <change-id> [--statement <statement>] [--json]
@@ -87,6 +89,11 @@ Plan revision options:
 Goal creation options:
   --constraint <constraint>      Repeat for each constraint
   --repository-id <identity>     Override the inferred repository identity
+
+Goal apply options:
+  --goal <goal-id>               Completed Goal to apply
+  --target <local-branch>        Currently checked-out local branch to fast-forward
+  --approval <statement>         Explicit operator approval for this mutation
 
 Change creation options:
   --acceptance <criterion>       Repeat for each acceptance criterion
@@ -204,6 +211,24 @@ function parseGoalCreate(args: string[]): {
   if (outcome === undefined) throw new UsageError("--outcome is required");
   if (approval === undefined) throw new UsageError("--approval is required");
   return { title, outcome, approval, constraints, ...(repositoryIdentity === undefined ? {} : { repositoryIdentity }) };
+}
+
+function parseGoalApply(args: string[]): { goalId: string; targetBranch: string; approval: string } {
+  let goalId: string | undefined;
+  let targetBranch: string | undefined;
+  let approval: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--target") targetBranch = value;
+    else if (option === "--approval") approval = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (targetBranch === undefined) throw new UsageError("--target is required");
+  if (approval === undefined) throw new UsageError("--approval is required");
+  return { goalId, targetBranch, approval };
 }
 
 function parseChangeCreate(args: string[]): {
@@ -684,6 +709,20 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
           markdown: guidance.markdown,
         },
         `Guidance ${guidance.step}\n  ${guidance.path}\n  Source ${guidance.revision}\n\n${guidance.markdown}`,
+      );
+    }
+
+    if (args[0] === "goal" && args[1] === "apply") {
+      const input = parseGoalApply(args.slice(2));
+      const applied = await applyGoalIntegration({ cwd, ...input });
+      return success(
+        json,
+        "goal apply",
+        applied,
+        `Applied Goal ${applied.goalId} to ${applied.targetBranch}\n` +
+          `  Previous target revision ${applied.previousTargetRevision}\n` +
+          `  Applied revision ${applied.appliedRevision}\n` +
+          `  Resulting target revision ${applied.resultingTargetRevision}\n`,
       );
     }
 
