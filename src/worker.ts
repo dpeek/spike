@@ -75,6 +75,8 @@ export type DispatchWorkerTicketInput = TicketIdentity & {
   worker: string;
   environmentDigest?: string;
   clock?: () => Date;
+  /** Deterministic adapter-test seam, invoked after immutable image inspection. */
+  afterDockerImageInspection?: (imageDigest: string) => Promise<void>;
 };
 
 /** @deprecated local-clone's command input; shared dispatch uses DispatchWorkerTicketInput. */
@@ -176,6 +178,7 @@ export type WorkerRuntimeEnvelope = NonNullable<RecordedWorker["metadata"]["runt
 /** Opaque adapter-owned data. Shared workflow code must only pass it back to the selected adapter. */
 export type WorkerRuntimeResource = unknown;
 type LocalCloneRuntime = { host: "direct"; workspace: string; pid?: number } | { host: "herdr"; workspace: string; tab: string; pane: string };
+type DockerRuntime = { containerId: string; imageDigest: string };
 
 /** Adapter-owned operations over its canonical runtime resource. */
 export type WorkerRuntimeOperations = {
@@ -203,6 +206,9 @@ type LiveDirectWorker = {
 };
 
 const liveDirectWorkers = new Map<string, LiveDirectWorker>();
+// Docker finalization shares this in-process completion barrier with dispatch
+// so cleanup cannot remove logs or overwrite terminal evidence mid-dispatch.
+const liveDockerWorkers = new Map<string, Promise<void>>();
 
 function workerKey(identity: TicketIdentity): string {
   return `${identity.goalId}/${identity.changeId}/${identity.ticketId}`;
@@ -227,8 +233,25 @@ export const localCloneWorkerAdapter: WorkerAdapter = {
   finalize: (root, identity, finishedAt, operations) => stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations),
 };
 
+/** The sole container adapter; its mounts and Docker resources never enter shared workflow state. */
+export const dockerWorkerAdapter: WorkerAdapter = {
+  adapter: "docker",
+  isolation: "container",
+  supports: (policy) => policy.isolation === "container",
+  dispatch: (input) => dispatchDockerTicket(input),
+  validateRuntime: validateDockerRuntime,
+  runtimeOperations: {
+    stop: (runtime) => dockerStop((runtime as DockerRuntime).containerId),
+    cleanup: (runtime) => dockerRemove((runtime as DockerRuntime).containerId),
+  },
+  observe: (root, identity) => observeDockerWorker(root, identity),
+  loadFinished: (root, identity) => loadFinishedDockerWorker(root, identity),
+  finalize: (root, identity, finishedAt, operations) => stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations),
+};
+
 export function selectWorkerAdapter(policy: { isolation: "workspace" | "container" }): WorkerAdapter {
   if (localCloneWorkerAdapter.supports(policy)) return localCloneWorkerAdapter;
+  if (dockerWorkerAdapter.supports(policy)) return dockerWorkerAdapter;
   throw new Error(`no Worker adapter supports ${policy.isolation} isolation`);
 }
 
@@ -503,33 +526,53 @@ export async function stopAndFinalizeRecordedWorker(
       message: error instanceof Error ? error.message : String(error),
     };
   }
+
+  // A live Docker stop has a terminal exit that must outlive resource cleanup.
+  // Reload rather than writing the pre-stop snapshot: dispatch may have observed
+  // the same exit while stop was in progress.
+  let durable = await loadRecordedWorkerIfPresent(root, identity) ?? record;
+  let stoppedExitCode: number | undefined;
+  if (adapter.adapter === "docker") {
+    try {
+      stoppedExitCode = await dockerExitCode((resource as DockerRuntime).containerId);
+    } catch (error) {
+      return { status: "failed", phase: "stop", execution, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const terminalMetadata = workerRecordSchema.parse({
+    ...durable.metadata,
+    finishedAt: durable.metadata.finishedAt ?? finish,
+    ...(durable.metadata.exitCode === undefined && stoppedExitCode !== undefined ? { exitCode: stoppedExitCode } : {}),
+  });
+  durable = { metadata: terminalMetadata, body: durable.body };
   try {
+    await replaceWorkerRecord(root, durable);
+    if (adapter.adapter === "docker") await liveDockerWorkers.get(workerKey(identity));
     await runtimeOperations.cleanup(resource);
   } catch (error) {
     return {
       status: "failed",
       phase: "cleanup",
-      execution,
+      execution: recordedExecution(durable.metadata, durable.metadata.finishedAt!),
       message: error instanceof Error ? error.message : String(error),
     };
   }
 
-  const metadata = workerRecordSchema.parse({
-    ...record.metadata,
-    runtime: undefined,
-    finishedAt: finish,
-  });
+  // Dispatch completion can race cleanup; retain any terminal fields it wrote
+  // and only clear the owned runtime resource.
+  durable = await loadRecordedWorkerIfPresent(root, identity) ?? durable;
+  const metadata = workerRecordSchema.parse({ ...durable.metadata, runtime: undefined });
   try {
-    await replaceWorkerRecord(root, { metadata, body: record.body });
+    await replaceWorkerRecord(root, { metadata, body: durable.body });
   } catch (error) {
     return {
       status: "failed",
       phase: "cleanup",
-      execution,
+      execution: recordedExecution(durable.metadata, durable.metadata.finishedAt!),
       message: error instanceof Error ? error.message : String(error),
     };
   }
-  return { status: "finalized", execution };
+  return { status: "finalized", execution: recordedExecution(metadata, metadata.finishedAt!) };
 }
 
 /** Finalize through the adapter selected by immutable Ticket policy. */
@@ -823,7 +866,7 @@ function workerEnvironment(
     SPIKE_TICKET_ROLE: ticket.metadata.role,
     SPIKE_MODEL: ticket.metadata.model,
     SPIKE_THINKING: ticket.metadata.thinking,
-    SPIKE_BIN: process.env["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike"),
+    SPIKE_BIN: resolve(import.meta.dir, "..", "bin", "spike"),
   };
 }
 
@@ -836,6 +879,148 @@ function validateLocalPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): vo
   }
   if (ticket.metadata.executionPolicy.credentialGrants.length > 0) {
     throw new Error("local-clone adapter does not resolve credential grants");
+  }
+}
+
+function validateDockerRuntime(resource: unknown): asserts resource is DockerRuntime {
+  z.object({
+    containerId: z.string().regex(/^[0-9a-f]{64}$/),
+    imageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  }).strict().parse(resource);
+}
+
+function validateDockerPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): void {
+  if (ticket.metadata.executionPolicy.isolation !== "container") throw new Error("docker adapter supports only container isolation");
+  if (ticket.metadata.executionPolicy.networkAccess === "restricted") throw new Error("docker adapter does not support restricted network access");
+  if (ticket.metadata.executionPolicy.credentialGrants.length > 0) throw new Error("docker adapter does not resolve credential grants");
+}
+
+async function docker(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const process = Bun.spawn(["docker", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [code, stdout, stderr] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()]);
+  return { code, stdout, stderr };
+}
+
+async function dockerRequired(args: string[]): Promise<string> {
+  const result = await docker(args);
+  if (result.code !== 0) throw new Error(`docker ${args[0]} failed: ${(result.stderr || result.stdout).trim()}`);
+  return result.stdout.trim();
+}
+
+async function dockerExists(containerId: string): Promise<boolean> {
+  return (await docker(["container", "inspect", containerId])).code === 0;
+}
+
+async function dockerStop(containerId: string): Promise<void> {
+  if (!(await dockerExists(containerId))) return;
+  await dockerRequired(["stop", "--time", "1", containerId]);
+}
+
+async function dockerExitCode(containerId: string): Promise<number> {
+  const value = await dockerRequired(["inspect", "--format", "{{.State.ExitCode}}", containerId]);
+  const exitCode = Number(value);
+  if (!Number.isInteger(exitCode)) throw new Error(`Docker container has no terminal exit code: ${containerId}`);
+  return exitCode;
+}
+
+async function dockerRemove(containerId: string): Promise<void> {
+  if (!(await dockerExists(containerId))) return;
+  await dockerRequired(["rm", "--force", containerId]);
+}
+
+function dockerImage(): string {
+  return process.env["SPIKE_DOCKER_IMAGE"] ?? "spike-worker:local";
+}
+
+function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: Awaited<ReturnType<typeof loadTicket>>): string[] {
+  const values = {
+    ...workerEnvironment(exchange, revision, ticket),
+    SPIKE_INPUT_DIR: "/exchange/input",
+    SPIKE_OUTPUT_DIR: "/exchange/output",
+    SPIKE_BIN: "/opt/spike/bin/spike",
+  };
+  return Object.entries(values).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+}
+
+async function observeDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerObservation> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record === undefined) return { hosting: null, status: "unavailable" };
+  if (record.metadata.finishedAt !== undefined) return { hosting: "direct", status: "done" };
+  const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
+  if (runtime === undefined || !(await dockerExists(runtime.containerId))) return { hosting: "direct", status: "unavailable" };
+  const running = await dockerRequired(["inspect", "--format", "{{.State.Running}}", runtime.containerId]);
+  return { hosting: "direct", status: running === "true" || running === "false" ? "working" : "unavailable" };
+}
+
+async function loadFinishedDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerExecution> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record === undefined || record.metadata.finishedAt === undefined || record.metadata.exitCode === undefined) {
+    throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker has not finished`);
+  }
+  return recordedExecution(record.metadata, record.metadata.finishedAt);
+}
+
+export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
+  if (input.command.length === 0) throw new Error("Worker command must not be empty");
+  const worker = requireText(input.worker, "Worker identity");
+  const repository = await discoverRepository(input.cwd);
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
+  // Validate before preparing an exchange or invoking Docker create.
+  validateDockerPolicy(ticket);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const image = dockerImage();
+  const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", image]);
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${image}`);
+  await input.afterDockerImageInspection?.(imageDigest);
+  const exchange = await prepareTicketExchange(repository.root, identity);
+  const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
+  let containerId: string | undefined;
+  let record: RecordedWorker | undefined;
+  let completeDispatch: (() => void) | undefined;
+  const startedAt = (input.clock ?? (() => new Date()))().toISOString();
+  try {
+    containerId = await dockerRequired([
+      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,noexec,nosuid,size=256m", 
+      "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
+      "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
+      "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket), imageDigest, ...input.command,
+    ]);
+    validateDockerRuntime({ containerId, imageDigest });
+    const createdImageDigest = await dockerRequired(["inspect", "--format", "{{.Image}}", containerId]);
+    if (createdImageDigest !== imageDigest) {
+      throw new Error(`Docker container image does not match inspected provenance: ${createdImageDigest}`);
+    }
+    record = await recordWorker(repository.root, {
+      ...identity, role: ticket.metadata.role, worker, startedAt, runtime: { containerId, imageDigest }, environmentDigest: imageDigest,
+    });
+    const completion = new Promise<void>((resolve) => { completeDispatch = resolve; });
+    liveDockerWorkers.set(workerKey(identity), completion);
+    await dockerRequired(["start", containerId]);
+    const exitCode = Number(await dockerRequired(["wait", containerId]));
+    const finishedAt = (input.clock ?? (() => new Date()))().toISOString();
+    // Finalization may have stopped and removed the runtime while wait was
+    // pending. Merge terminal evidence into the current durable record rather
+    // than resurrecting this dispatch-time runtime snapshot.
+    const current = await loadRecordedWorkerIfPresent(repository.root, identity) ?? record;
+    record = {
+      metadata: workerRecordSchema.parse({
+        ...current.metadata,
+        finishedAt: current.metadata.finishedAt ?? finishedAt,
+        ...(current.metadata.exitCode === undefined ? { exitCode } : {}),
+      }),
+      body: current.body,
+    };
+    await replaceWorkerRecord(repository.root, record);
+    const logs = await docker(["logs", containerId]);
+    if (logs.code !== 0) throw new Error(`docker logs failed: ${(logs.stderr || logs.stdout).trim()}`);
+    return { root: repository.root, exchange, execution: { ...identity, adapter: "docker", isolation: "container", worker, model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt, finishedAt, exitCode, environmentDigest: imageDigest, stdout: logs.stdout, stderr: logs.stderr } };
+  } catch (error) {
+    if (record === undefined && containerId !== undefined) await dockerRemove(containerId).catch(() => undefined);
+    throw error;
+  } finally {
+    completeDispatch?.();
+    liveDockerWorkers.delete(workerKey(identity));
   }
 }
 
