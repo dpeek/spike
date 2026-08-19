@@ -533,8 +533,8 @@ export function registerSupervisorExtension(
     tool({
       name: "spike_issue_implement",
       label: "Issue Implement Ticket",
-      description: "Issue the initial bounded implementation Ticket for a Change with frozen execution policy and model selection.",
-      promptSnippet: "Issue one initial Implement Ticket",
+      description: "Issue the initial implementation Ticket for the complete Change with frozen execution policy and model selection.",
+      promptSnippet: "Issue one Implement Ticket for the complete Change",
       parameters: {
         type: "object",
         additionalProperties: false,

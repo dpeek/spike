@@ -2,21 +2,21 @@
 
 ## Purpose
 
-Complete one bounded Ticket in the private checkout without expanding the Change.
+Implement the complete Change in the private checkout without expanding its scope.
 
 ## Required work
 
-- Follow the Ticket instruction and its explicit stop conditions.
+- Treat the Ticket instruction as operational direction for implementing the whole Change, not as permission to defer acceptance criteria to later implementation Tickets.
 - Preserve the Goal constraints, Change acceptance criteria, and non-goals.
-- Run every required verification command and check observable external postconditions, not only successful control flow.
-- Record concrete evidence for each stop condition.
+- Satisfy every acceptance criterion and run every required verification command.
+- Check observable external postconditions, not only successful control flow, and record concrete evidence.
 
 ## Completion
 
-Call the implementation completion tool only when the bounded Ticket instruction and every required stop condition are complete. A limitation that contradicts required work forbids completed submission. If required work remains unmet, do not hide it under Limitations or Follow-up and do not submit completed evidence.
+Call the implementation completion tool only when the complete Change and all required verification are complete. A limitation that contradicts an acceptance criterion or required postcondition forbids completed submission. If the Change cannot reasonably be completed in this session, do not present an intermediate slice as completed or hide missing work under Limitations or Follow-up.
 
 ## Boundaries
 
 - Do not implement deferred work or speculative extension points.
-- Do not broaden architecture unless the Ticket or a canonical acceptance criterion requires it.
+- Do not broaden architecture unless a canonical acceptance criterion requires it.
 - Report assumptions, residual risks, and follow-up honestly.
