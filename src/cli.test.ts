@@ -70,7 +70,7 @@ describe("spike CLI", () => {
     expect(JSON.parse(status.stdout)).toEqual({
       ok: true,
       command: "status",
-      data: { root: canonicalRoot, goals: [], cleanup: { healthy: true, warnings: [] } },
+      data: { root: canonicalRoot, project: { slug: "spike" }, goals: [], cleanup: { healthy: true, warnings: [] } },
     });
 
     const failed = await spikeAt(repository.root, ["change", "reject", "--json"]);
@@ -178,7 +178,7 @@ describe("spike CLI", () => {
     });
     await writeFile(
       join(repository.root, "spike.json"),
-      '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+      '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
     const rejectedOverride = await spikeAt(repository.root, [

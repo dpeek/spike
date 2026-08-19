@@ -18,11 +18,10 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { loadGuidance, guidanceStepSchema, type Guidance } from "./guidance.ts";
 import { loadGoal } from "./goal.ts";
+import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { loadPlan } from "./plan.ts";
 import { deriveCurrentCandidate, deriveCurrentReview, loadReportIfPresent } from "./report.ts";
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const executionPolicySchema = z

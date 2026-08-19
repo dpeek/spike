@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { goalSequence, projectSlugPattern } from "./identity.ts";
 
 const nonBlankString = z.string().trim().min(1);
 const thinkingSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -12,6 +13,11 @@ const modelSelectionSchema = z
   .strict();
 const projectConfigSchema = z
   .object({
+    project: z
+      .object({
+        slug: z.string().regex(projectSlugPattern),
+      })
+      .strict(),
     models: z
       .object({
         planner: modelSelectionSchema,
@@ -49,6 +55,13 @@ export async function loadProjectConfig(root: string): Promise<ProjectConfig> {
     throw new Error(`Spike project configuration is not valid JSON: ${configPath(root)}`);
   }
   return projectConfigSchema.parse(value);
+}
+
+export async function assertGoalBelongsToProject(root: string, goalId: string): Promise<void> {
+  const { slug } = (await loadProjectConfig(root)).project;
+  if (goalSequence(goalId, slug) === undefined) {
+    throw new Error(`Goal ${goalId} does not belong to Project ${slug}`);
+  }
 }
 
 export async function resolveTicketModelSelection(

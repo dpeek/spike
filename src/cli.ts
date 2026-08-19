@@ -600,8 +600,9 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
 }
 
 function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
-  if (status.goals.length === 0) return `Repository ${status.root}\n  No Goals\n  Cleanup healthy\n`;
-  return `Repository ${status.root}\n${status.goals.map(humanGoalStatus).join("")}`;
+  const heading = `Project ${status.project.slug}\nRepository ${status.root}\n`;
+  if (status.goals.length === 0) return `${heading}  No Goals\n  Cleanup healthy\n`;
+  return `${heading}${status.goals.map(humanGoalStatus).join("")}`;
 }
 
 function decisionData(decision: ChangeDecision): unknown {

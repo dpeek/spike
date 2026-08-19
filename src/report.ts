@@ -14,6 +14,7 @@ import {
 } from "./durable-state.ts";
 import { normalizeCandidate, retainCandidate, withImportedWorkerRevision } from "./git-change.ts";
 import { discoverRepository } from "./git.ts";
+import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { loadTicket, reportPath, ticketPath } from "./ticket.ts";
 import {
   forgetFinalizedWorker,
@@ -26,8 +27,6 @@ import {
   type TicketIdentity,
 } from "./worker.ts";
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const findingIdPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

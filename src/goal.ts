@@ -1,7 +1,7 @@
-import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
+import { assertGoalBelongsToProject, loadProjectConfig } from "./config.ts";
 import {
   documentExists,
   installImmutable,
@@ -10,9 +10,9 @@ import {
   serializeDocument,
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
+import { formatGoalId, goalIdPattern, goalSequence } from "./identity.ts";
 import { createInitialPlan, type Plan } from "./plan.ts";
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const goalSchema = z
@@ -60,6 +60,22 @@ export function integratedRef(goalId: string): string {
   return `refs/spike/goals/${goalId}/integrated`;
 }
 
+async function allocatedGoalIdsForProject(root: string, projectSlug: string): Promise<string[]> {
+  const names = await listDirectoryNames(root, join(root, ".spike", "goals"));
+  const foreignGoalId = names.find((name) => goalIdPattern.test(name) && goalSequence(name, projectSlug) === undefined);
+  if (foreignGoalId !== undefined) {
+    throw new Error(`Goal ${foreignGoalId} does not belong to Project ${projectSlug}`);
+  }
+  return names.filter((name) => goalSequence(name, projectSlug) !== undefined).sort();
+}
+
+async function nextGoalId(root: string, projectSlug: string): Promise<string> {
+  const allocated = await allocatedGoalIdsForProject(root, projectSlug);
+  const highest = allocated.reduce((maximum, goalId) => Math.max(maximum, goalSequence(goalId, projectSlug)!), 0);
+  if (highest === 999) throw new Error(`Project ${projectSlug} has exhausted its three-digit Goal sequence`);
+  return formatGoalId(projectSlug, highest + 1);
+}
+
 function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (!normalized) throw new Error(`${label} must not be blank`);
@@ -90,7 +106,8 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   const approval = requireText(input.approval, "Operator approval");
   const constraints = (input.constraints ?? []).map((constraint) => requireText(constraint, "Constraint"));
   const repository = await discoverRepository(input.cwd);
-  const goalId = `goal-${randomBytes(16).toString("hex")}`;
+  const { slug } = (await loadProjectConfig(repository.root)).project;
+  const goalId = await nextGoalId(repository.root, slug);
   const approvedAt = (input.now ?? new Date()).toISOString();
   const metadata = goalSchema.parse({
     kind: "goal",
@@ -120,9 +137,13 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   return { root: repository.root, goal: { metadata, body }, plan };
 }
 
+export async function listAllocatedGoalIds(root: string): Promise<string[]> {
+  const { slug } = (await loadProjectConfig(root)).project;
+  return allocatedGoalIdsForProject(root, slug);
+}
+
 export async function listGoalIds(root: string): Promise<string[]> {
-  const goals = join(root, ".spike", "goals");
-  const goalIds = (await listDirectoryNames(root, goals)).filter((name) => goalIdPattern.test(name)).sort();
+  const goalIds = await listAllocatedGoalIds(root);
   const published: string[] = [];
   for (const goalId of goalIds) {
     if (!(await documentExists(root, goalPath(root, goalId)))) continue;
@@ -133,6 +154,7 @@ export async function listGoalIds(root: string): Promise<string[]> {
 }
 
 export async function loadGoal(root: string, goalId: string): Promise<Goal> {
+  await assertGoalBelongsToProject(root, goalId);
   const document = await readDocument(root, goalPath(root, goalId));
   const metadata = goalSchema.parse(document.metadata);
   if (metadata.goalId !== goalId) throw new Error(`Goal document belongs to a different Goal: ${metadata.goalId}`);

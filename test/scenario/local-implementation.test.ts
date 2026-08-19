@@ -64,7 +64,7 @@ if (bundleCode !== 0) throw new Error(bundleError);
 async function fixture() {
   const repository = await temporaryRepository();
   repositories.push(repository);
-  const goalId = "goal-00000000000000000000000000000001";
+  const goalId = "spike-001";
   const ticketId = "001";
   const baseRevision = repository.head;
   const ticketDirectory = join(repository.root, ".spike", "goals", goalId, "changes", "001", "tickets", ticketId);
@@ -109,7 +109,7 @@ async function fixture() {
   await writeFile(join(repository.root, "README.md"), "dirty host edit\n");
   await writeFile(
     join(repository.root, "spike.json"),
-    '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+    '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
   );
   const dirtyDiff = await repository.git("diff", "--", "README.md");
   const indexTree = await repository.git("write-tree");
@@ -161,6 +161,15 @@ describe("host-local implementation exchange", () => {
         },
         now: new Date("2026-03-20T10:05:00.000Z"),
       });
+
+    const configPath = join(repository.root, "spike.json");
+    const configured = await readFile(configPath, "utf8");
+    const renamed = JSON.parse(configured);
+    renamed.project.slug = "renamed";
+    await writeFile(configPath, `${JSON.stringify(renamed)}\n`);
+    await expect(publication()).rejects.toThrow("Goal spike-001 does not belong to Project renamed");
+    expect(await Bun.file(reportPath(repository.root, goalId, "001", ticketId)).exists()).toBe(false);
+    await writeFile(configPath, configured);
 
     await writeFile(join(output, "repository.bundle"), "not a Git bundle\n");
     await expect(publication()).rejects.toThrow("output repository bundle is invalid");

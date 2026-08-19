@@ -11,7 +11,7 @@ Spike should replace its current ticket-centric workflow with a smaller model bu
 - **Ticket** — one bounded assignment executed in one fresh worker session.
 - **Report** — the canonical, host-published record of one Ticket's accepted outcome.
 
-A planner-owned **Plan** provides working memory: the intended Change sequence, current direction, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history. Workers write staging Submissions; Spike validates them and publishes canonical Reports.
+A **Project** is one Git repository configured by tracked `spike.json`. It has an operator-chosen stable slug, owns its Goals, and provides their sequence scope. A planner-owned **Plan** provides working memory: the intended Change sequence, current direction, progress, decisions, open findings, and churn indicators. The Plan is intentionally revisable. Tickets and Reports are immutable history. Workers write staging Submissions; Spike validates them and publishes canonical Reports.
 
 The normal loop becomes:
 
@@ -84,7 +84,7 @@ Machine-readable identity, relationships, state, revisions, timestamps, and dige
 ---
 {
   "kind": "ticket",
-  "goalId": "goal-...",
+  "goalId": "spike-001",
   "changeId": "001",
   "ticketId": "001"
 }
@@ -137,10 +137,12 @@ The local-clone adapter provides workspace separation only and may run controlle
 
 ### Sequential work and nested identity
 
-Initially, Spike supports one planner process mutating workflow state for a repository. A Goal has at most one active Change, and a Change has at most one active Ticket. Workers write only through their assigned output paths; the planner imports those outputs and performs workflow transitions serially.
+Initially, Spike supports one planner process mutating workflow state for a Project repository. A Goal has at most one active Change, and a Change has at most one active Ticket. Workers write only through their assigned output paths; the planner imports those outputs and performs workflow transitions serially.
 
-Change and Ticket IDs reflect this ordering:
+Goal, Change, and Ticket IDs reflect this ordering:
 
+- Goal IDs combine the stable Project slug and a zero-padded decimal sequence, such as `spike-001`, allocated monotonically within one Project.
+- Goal sequences are never reused, including directories left by interrupted publication.
 - Change IDs are zero-padded decimal sequences such as `001`, allocated monotonically within one Goal.
 - Ticket IDs are zero-padded decimal sequences such as `001`, allocated monotonically within one Change.
 - IDs are never reused, including after rejection, abandonment, failure, or interruption.
@@ -163,13 +165,29 @@ Spike must not infer recoverability from PID liveness, process birth time, termi
 
 ## Domain model
 
+## Project
+
+A Project is one Git repository configured for Spike by tracked `spike.json`. Its required lowercase kebab-case slug is operator-chosen rather than inferred from a checkout directory or Git remote. The slug is stable after the first Goal allocation and is the human-facing namespace for that Project's Goals. Project slugs are expected to be unique within a future shared control plane; discovery and central registration are deferred.
+
+The Project owns Goal sequence allocation. While workflow authority is repository-local, allocation scans all matching `.spike/goals/<goal-id>/` directories, including unpublished staging directories, and selects the next three-digit sequence. The existing single-planner-writer constraint applies. A future central Spike store may take over this allocation without changing Goal IDs.
+
+Project configuration is not another workflow evidence document. Today its complete identity definition is the tracked configuration entry:
+
+```json
+{
+  "project": {
+    "slug": "spike"
+  }
+}
+```
+
 ## Goal
 
 A Goal describes the operator-approved outcome and constraints.
 
 A Goal owns:
 
-- stable Goal ID;
+- stable Project-qualified Goal ID such as `spike-001`;
 - approved Goal document;
 - operator approval statement;
 - repository identity and initial revision;
@@ -248,7 +266,7 @@ Simplify durable workflow transitions
 Use fresh ticket/report rounds while preserving exact candidate
 review and interruption evidence.
 
-Spike-Goal-Id: goal-...
+Spike-Goal-Id: spike-001
 Spike-Change-Id: change-...
 ```
 
@@ -277,7 +295,7 @@ A completed implementation Report records the Change base revision, Ticket input
 ---
 {
   "kind": "report",
-  "goalId": "goal-...",
+  "goalId": "spike-001",
   "changeId": "001",
   "ticketId": "001",
   "outcome": "completed",
@@ -591,10 +609,13 @@ Stop and cleanup are idempotent. Report publication must not depend on the worke
 
 ## Model configuration
 
-Project configuration should distinguish the planner and Phase 2's executable Ticket roles using the workflow's role names:
+Project configuration records the stable Project slug and distinguishes the planner and Phase 2's executable Ticket roles using the workflow's role names:
 
 ```json
 {
+  "project": {
+    "slug": "spike"
+  },
   "models": {
     "planner": {
       "model": "openai-codex/gpt-5.6-sol",
@@ -638,7 +659,7 @@ Every durable workflow file is one Markdown document with unversioned JSON front
 ```text
 .spike/
   goals/
-    <goal-id>/
+    spike-001/
       goal.md
       plan.md
       changes/
@@ -650,7 +671,7 @@ Every durable workflow file is one Markdown document with unversioned JSON front
               report.md
           decision.md
   exchange/
-    goals/<goal-id>/changes/001/tickets/001/
+    goals/spike-001/changes/001/tickets/001/
       input/
         ticket.md
         context.md
@@ -660,10 +681,10 @@ Every durable workflow file is one Markdown document with unversioned JSON front
         repository.bundle
         artifacts/
   runtime/
-    workers/goals/<goal-id>/changes/001/tickets/001/worker.md
+    workers/goals/spike-001/changes/001/tickets/001/worker.md
 ```
 
-Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The `001` directories illustrate parent-relative sequential IDs. Files under `exchange/` and `runtime/` are staging inputs and operational projections rather than authoritative workflow documents. Structured files use Markdown with JSON frontmatter; Git bundles and worker artifacts retain their native formats.
+Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The Goal directory illustrates a Project-qualified Goal ID; the other `001` directories illustrate parent-relative sequential IDs. Files under `exchange/` and `runtime/` are staging inputs and operational projections rather than authoritative workflow documents. Structured files use Markdown with JSON frontmatter; Git bundles and worker artifacts retain their native formats.
 
 ## Module direction
 
@@ -851,6 +872,7 @@ Run the same Worker module contract suite against the local-clone adapter in Pha
 The implementation succeeds when:
 
 - one Goal can execute an evolving ordered Plan of sequential Changes;
+- Goal IDs combine a stable Project slug with a monotonic Project-relative `nnn` sequence;
 - Change and Ticket IDs are monotonic parent-relative `nnn` sequences;
 - each landed Change is exactly one reviewed commit;
 - multiple sequential fresh-session Tickets can contribute to one Change;

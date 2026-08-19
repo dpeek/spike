@@ -281,7 +281,7 @@ describe("Change rejection and abandonment", () => {
     await expect(
       rejectChange({
         cwd: repository.root,
-        goalId: "goal-ffffffffffffffffffffffffffffffff",
+        goalId: "spike-999",
         changeId: "001",
         statement: "Wrong Goal identity.",
       }),

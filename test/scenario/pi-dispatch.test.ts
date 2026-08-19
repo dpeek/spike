@@ -223,7 +223,7 @@ describe("controlled Pi dispatch", () => {
       "--network-access", "unrestricted", "--model", "frozen-implementation-model", "--thinking", "medium",
     ]);
     expect(issued.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n');
 
     for (const override of ["--model", "--thinking", "--role", "--prompt", "--extension"]) {
       const rejected = await spike(repository.root, [
@@ -265,7 +265,7 @@ describe("controlled Pi dispatch", () => {
       "--network-access", "unrestricted", "--model", "frozen-review-model", "--thinking", "high",
     ]);
     expect(reviewIssue.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"models":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off"},"review":{"model":"later","thinking":"off"}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"models":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off"},"review":{"model":"later","thinking":"off"}}}\n');
 
     const reviewed = await spike(repository.root, [
       "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer", "--host", "direct",

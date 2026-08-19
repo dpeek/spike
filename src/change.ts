@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { z } from "zod";
+import { assertGoalBelongsToProject } from "./config.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
   documentExists,
@@ -10,6 +11,7 @@ import {
 } from "./durable-state.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
+import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import {
   deriveCurrentApproval,
   deriveCurrentCandidate,
@@ -17,8 +19,6 @@ import {
   loadChangeReportHistory,
 } from "./report.ts";
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const changeSchema = z
@@ -203,6 +203,7 @@ export async function listChangeIds(root: string, goalId: string): Promise<strin
 }
 
 export async function loadChange(root: string, goalId: string, changeId: string): Promise<Change> {
+  await assertGoalBelongsToProject(root, goalId);
   const document = await readDocument(root, changePath(root, goalId, changeId));
   const metadata = changeSchema.parse(document.metadata);
   if (metadata.goalId !== goalId || metadata.changeId !== changeId) {
@@ -216,6 +217,7 @@ export async function loadChangeDecision(
   goalId: string,
   changeId: string,
 ): Promise<ChangeDecision> {
+  await assertGoalBelongsToProject(root, goalId);
   const document = await readDocument(root, changeDecisionPath(root, goalId, changeId));
   const metadata = changeDecisionSchema.parse(document.metadata);
   if (metadata.goalId !== goalId || metadata.changeId !== changeId) {

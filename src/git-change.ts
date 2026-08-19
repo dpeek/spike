@@ -2,10 +2,9 @@ import { randomUUID } from "node:crypto";
 import { chmod, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git } from "./git.ts";
+import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
 
 function requireRevision(revision: string, label: string): void {
   if (!revisionPattern.test(revision)) throw new Error(`${label} must be an exact commit hash`);

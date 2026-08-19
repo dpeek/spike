@@ -884,7 +884,7 @@ export async function dispatchHerdrTicket(
   try {
     handles = await host.createTab({
       cwd: checkout,
-      label: `spike-${input.goalId.slice(-8)}-${input.changeId}-${input.ticketId}`,
+      label: `${input.goalId}-${input.changeId}-${input.ticketId}`,
       environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket),
     });
     workerRecord = await recordLocalCloneWorker(repository.root, {

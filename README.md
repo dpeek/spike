@@ -19,9 +19,24 @@ bun run check
 bin/spike --help
 ```
 
-Spike reads tracked project model defaults from `spike.json`. Ticket issuance
-freezes the selected model and thinking level into `ticket.md`; later dispatch
-never rereads configuration or accepts model overrides.
+Spike reads the stable Project slug and model defaults from tracked `spike.json`:
+
+```json
+{
+  "project": { "slug": "spike" },
+  "models": {
+    "planner": { "model": "...", "thinking": "high" },
+    "implement": { "model": "...", "thinking": "medium" },
+    "review": { "model": "...", "thinking": "high" }
+  }
+}
+```
+
+The Project slug qualifies monotonic Project-local Goal sequences, producing IDs
+such as `spike-001`. It is operator-chosen rather than inferred and cannot change
+after Goal allocation. Ticket issuance freezes the selected model and thinking
+level into `ticket.md`; later dispatch never rereads configuration or accepts
+model overrides.
 
 Workflow guidance is tracked as Markdown at
 `spike/guidance/{goal,plan,change,implement,review,remediate,decide,recover}.md`.
@@ -39,14 +54,14 @@ spike goal create \
   --approval "Approved to proceed"
 
 spike change create \
-  --goal <goal-id> \
+  --goal spike-001 \
   --title "Add allocation" \
   --intent "Allocate sequential Changes and Tickets" \
   --rationale "Durable work needs stable nested identity" \
   --acceptance "IDs are monotonic and never reused"
 
 spike ticket issue \
-  --goal <goal-id> \
+  --goal spike-001 \
   --change 001 \
   --instruction "Implement the Change" \
   --context "Preserve the current filesystem contract" \

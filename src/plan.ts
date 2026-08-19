@@ -1,10 +1,10 @@
 import { join } from "node:path";
 import { z } from "zod";
+import { assertGoalBelongsToProject } from "./config.ts";
 import { installImmutable, readDocument, replaceAtomic, serializeDocument } from "./durable-state.ts";
+import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { loadChangeReportHistory, type ChangeReportHistory } from "./report.ts";
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const changePlanSchema = z
   .object({
@@ -94,6 +94,7 @@ export async function createInitialPlan(
 }
 
 export async function loadPlan(root: string, goalId: string): Promise<Plan> {
+  await assertGoalBelongsToProject(root, goalId);
   const document = await readDocument(root, planPath(root, goalId));
   const metadata = planSchema.parse(document.metadata);
   if (metadata.goalId !== goalId) throw new Error(`Plan belongs to a different Goal: ${metadata.goalId}`);

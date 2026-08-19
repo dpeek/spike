@@ -4,7 +4,8 @@ import { changePath, deriveGoalIntegratedRevision } from "./change.ts";
 import { documentExists, listDirectoryNames } from "./durable-state.ts";
 import { candidateRef } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
-import { goalPath, integratedRef, loadGoal } from "./goal.ts";
+import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
+import { sequenceIdPattern } from "./identity.ts";
 import {
   deriveCurrentCandidate,
   loadReportIfPresent,
@@ -209,9 +210,6 @@ export async function recoverInterruptedTicket(
   return { root: repository.root, report: interruptedReport, cleanup };
 }
 
-const goalIdPattern = /^goal-[0-9a-f]{32}$/;
-const sequenceIdPattern = /^(?!000)[0-9]{3}$/;
-
 export type ReconcileRepositoryInput = {
   cwd: string;
   reason?: string;
@@ -396,10 +394,7 @@ export async function reconcileRepository(
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<RepositoryReconciliation> {
   const repository = await discoverRepository(input.cwd);
-  const goalsDirectory = join(repository.root, ".spike", "goals");
-  const goalIds = (await listDirectoryNames(repository.root, goalsDirectory))
-    .filter((name) => goalIdPattern.test(name))
-    .sort();
+  const goalIds = await listAllocatedGoalIds(repository.root);
   const goals: ReconciledGoal[] = [];
   const ignoredUnpublishedGoalIds: string[] = [];
   for (const goalId of goalIds) {

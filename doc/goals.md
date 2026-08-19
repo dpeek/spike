@@ -10,6 +10,5 @@ Supervisor planning inbox. These are ideas, fixes, and improvements—not approv
 - Record model usage, duration, and cost with Report execution provenance to inform model policy.
 - Let supervisors propose maintenance work in this inbox without approving or executing it automatically.
 - Move workflow authority to a central Spike store that coordinates priorities and dependencies across Projects.
-- Use stable Project slugs and Project-relative sequences for human-friendly Goal references such as `formless-001`.
 - Schedule work across Projects against shared model quotas, renewal windows, priorities, and usage analytics.
 - Run leased Tickets on capability-matched execution nodes over Tailscale using the standard bundle and Submission exchange.

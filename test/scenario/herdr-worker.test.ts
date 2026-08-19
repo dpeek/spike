@@ -218,7 +218,7 @@ console.log("terminal output is observational only");
     });
     expect(dispatched).toMatchObject({ hosting: "herdr", status: "working" });
     const execution = await loadFinishedWorkerExecution(repository.root, identity);
-    expect(tabInput!.label).toMatch(/^spike-[0-9a-f]{8}-001-001$/);
+    expect(tabInput!.label).toBe("spike-001-001-001");
     expect(tabInput!.environment).toMatchObject({
       SPIKE_GOAL_ID: identity.goalId,
       SPIKE_CHANGE_ID: "001",

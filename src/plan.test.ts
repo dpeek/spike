@@ -14,7 +14,7 @@ import {
 } from "./plan.ts";
 import { reportPath, ticketPath } from "./ticket.ts";
 
-const goalId = "goal-00000000000000000000000000000001";
+const goalId = "spike-001";
 const baseRevision = "0".repeat(40);
 const candidateRevision = "1".repeat(40);
 const workerRevision = "2".repeat(40);
@@ -27,6 +27,20 @@ const execution = {
   startedAt: "2026-03-25T10:00:00.000Z",
   finishedAt: "2026-03-25T10:01:00.000Z",
 };
+
+async function installProjectConfig(root: string): Promise<void> {
+  await writeFile(
+    join(root, "spike.json"),
+    JSON.stringify({
+      project: { slug: "spike" },
+      models: {
+        planner: { model: "planner", thinking: "high" },
+        implement: { model: "implementer", thinking: "medium" },
+        review: { model: "reviewer", thinking: "high" },
+      },
+    }),
+  );
+}
 
 async function installChurnHistory(root: string): Promise<string[]> {
   await installImmutable(
@@ -167,6 +181,7 @@ describe("Plan", () => {
   test("refreshes churn guidance from durable Ticket and Report history", async () => {
     const root = await mkdtemp(join(tmpdir(), "spike-plan-"));
     try {
+      await installProjectConfig(root);
       await createInitialPlan(root, goalId, "Detect churn", "Warn after repeated feedback.", "2026-03-25T09:00:00.000Z");
       await setPlannedTicketCount(root, goalId, "001", 1, "2026-03-25T09:01:00.000Z");
       const ticketIds = await installChurnHistory(root);
@@ -198,6 +213,7 @@ describe("Plan", () => {
     const root = await mkdtemp(join(tmpdir(), "spike-plan-"));
     const goalPath = join(root, ".spike", "goals", goalId, "goal.md");
     try {
+      await installProjectConfig(root);
       await createInitialPlan(
         root,
         goalId,

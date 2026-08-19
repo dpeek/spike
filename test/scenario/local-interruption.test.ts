@@ -57,7 +57,7 @@ describe("interrupted Ticket recovery", () => {
     });
     await writeFile(
       join(repository.root, "spike.json"),
-      '{"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+      '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
     const identity = { goalId, changeId: "001", ticketId: "001" };

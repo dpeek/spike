@@ -15,6 +15,7 @@ async function fixture(): Promise<string> {
   await writeFile(
     join(root, "spike.json"),
     `${JSON.stringify({
+      project: { slug: "example-project" },
       models: {
         planner: { model: "planner", thinking: "high" },
         implement: { model: "implementer", thinking: "medium" },
@@ -29,6 +30,7 @@ describe("project model configuration", () => {
   test("loads role defaults and applies one-Ticket overrides", async () => {
     const root = await fixture();
 
+    expect((await loadProjectConfig(root)).project).toEqual({ slug: "example-project" });
     expect((await loadProjectConfig(root)).models.planner).toEqual({ model: "planner", thinking: "high" });
     expect(await resolveTicketModelSelection(root, "implement")).toEqual({
       model: "implementer",
@@ -49,6 +51,19 @@ describe("project model configuration", () => {
     await expect(loadProjectConfig(root)).rejects.toThrow("not valid JSON");
 
     await writeFile(join(root, "spike.json"), '{"models":{}}\n');
+    await expect(loadProjectConfig(root)).rejects.toThrow();
+
+    await writeFile(
+      join(root, "spike.json"),
+      `${JSON.stringify({
+        project: { slug: "Invalid Slug" },
+        models: {
+          planner: { model: "planner", thinking: "high" },
+          implement: { model: "implementer", thinking: "medium" },
+          review: { model: "reviewer", thinking: "high" },
+        },
+      })}\n`,
+    );
     await expect(loadProjectConfig(root)).rejects.toThrow();
   });
 });

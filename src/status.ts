@@ -5,6 +5,7 @@ import {
   loadChangeDecisionIfPresent,
   type ChangeDecision,
 } from "./change.ts";
+import { loadProjectConfig } from "./config.ts";
 import { git, discoverRepository } from "./git.ts";
 import { integratedRef, listGoalIds, loadGoal } from "./goal.ts";
 import { detectChangeChurn, loadPlan, type ChurnIndicator } from "./plan.ts";
@@ -69,6 +70,7 @@ export type DerivedGoalStatus = {
 
 export type DerivedRepositoryStatus = {
   root: string;
+  project: { slug: string };
   goals: DerivedGoalStatus[];
   cleanup: CleanupHealth;
 };
@@ -192,6 +194,7 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
 
 export async function deriveRepositoryStatus(cwd: string): Promise<DerivedRepositoryStatus> {
   const repository = await discoverRepository(cwd);
+  const project = (await loadProjectConfig(repository.root)).project;
   const goals: DerivedGoalStatus[] = [];
   for (const goalId of await listGoalIds(repository.root)) {
     goals.push(await deriveGoalStatus(repository.root, goalId));
@@ -199,6 +202,7 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
   const warnings = goals.flatMap((goal) => goal.cleanup.warnings);
   return {
     root: repository.root,
+    project,
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
   };

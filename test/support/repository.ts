@@ -44,6 +44,7 @@ export async function temporaryRepository(): Promise<{
       join(root, "spike.json"),
       `${JSON.stringify(
         {
+          project: { slug: "spike" },
           models: {
             planner: { model: "planner-model", thinking: "high" },
             implement: { model: "implementation-model", thinking: "medium" },
