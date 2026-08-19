@@ -2,7 +2,6 @@
 
 Supervisor planning inbox. These are ideas, fixes, and improvements—not approved Goals.
 
-- Wake the planner when a Ticket worker reaches marker-backed `done` instead of requiring repeated `spike_worker_status` polling. Keep the notification operational and Report publication explicit.
 - Surface durable operator requests with rationale, a recommendation, alternatives, and blocking scope.
 - Open Hunk against an exact Candidate and feed human review notes into a fresh Ticket.
 - Launch operator-facing previews from published Candidates, including verified services, screenshots, and artifacts, without preserving worker sessions.

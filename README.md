@@ -79,13 +79,21 @@ Inspect or attach to the attended terminal by Ticket identity:
 
 ```bash
 spike worker status --goal <goal-id> --change 001 --ticket 001 --json
+spike worker wait --goal <goal-id> --change 001 --ticket 001 --json
 spike worker read --goal <goal-id> --change 001 --ticket 001 --lines 120
 spike worker attach --goal <goal-id> --change 001 --ticket 001
 ```
 
 Herdr `working`, `blocked`, `done`, or unavailable status and terminal output
-cannot complete the Ticket or publish a Report. Report publication validates only
-the standard exchange and then closes the tab; stop and cleanup can be retried.
+cannot complete the Ticket or publish a Report. `worker wait` emits one operational
+notification only after the attended wrapper's execution marker exists. The
+supervisor extension waits in the background and queues a full-identity recheck
+message that wakes an idle planner. If an attended waiter fails unexpectedly, it
+queues a distinct operational failure recheck instead of silently disabling wake-up.
+The planner must call `spike_status` and then explicitly publish the Report; either
+notification remains non-authoritative. Report
+publication validates only the standard exchange and then closes the tab; stop
+and cleanup can be retried.
 
 Direct Pi launch is an explicit headless `--print --no-session` controlled-test fallback:
 
@@ -142,8 +150,11 @@ spike planner
 The supervisor extension exposes sequential structured tools for status, Plan
 revision, Change creation and decisions, Ticket issuance and Pi dispatch, Report
 publication, and recovery. Every tool invokes Spike with an argument array and
-parses its single `--json` response. Planner prose, worker terminal output, and
-Pi exit status never become workflow facts; a successful Report publication or
+parses its single `--json` response. While a Ticket worker runs, the extension
+owns a cancellable one-shot `worker wait`; marker-backed completion queues an
+operational follow-up keyed by full Ticket identity, while unexpected waiter failure
+queues a distinct recheck. Planner prose, wake messages, worker terminal output,
+and Pi exit status never become workflow facts; a successful Report publication or
 Change decision remains the relevant immutable commit point.
 
 Planner-facing commands derive status from durable documents, atomically revise

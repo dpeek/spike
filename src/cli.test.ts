@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, loadChangeDecision } from "./change.ts";
 import { createGoal } from "./goal.ts";
@@ -60,17 +60,20 @@ describe("spike CLI", () => {
   });
 
   test("emits one stable JSON object for success and failure", async () => {
-    const status = await spike("status", "--json");
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const canonicalRoot = await realpath(repository.root);
+    const status = await spikeAt(repository.root, ["status", "--json"]);
     expect(status.exitCode).toBe(0);
     expect(status.stderr).toBe("");
     expect(status.stdout.trim().split("\n")).toHaveLength(1);
     expect(JSON.parse(status.stdout)).toEqual({
       ok: true,
       command: "status",
-      data: { root, goals: [], cleanup: { healthy: true, warnings: [] } },
+      data: { root: canonicalRoot, goals: [], cleanup: { healthy: true, warnings: [] } },
     });
 
-    const failed = await spike("change", "reject", "--json");
+    const failed = await spikeAt(repository.root, ["change", "reject", "--json"]);
     expect(failed.exitCode).toBe(2);
     expect(failed.stderr).toBe("");
     expect(JSON.parse(failed.stdout)).toEqual({
@@ -79,7 +82,7 @@ describe("spike CLI", () => {
       error: { code: "usage", message: "--goal is required" },
     });
 
-    const duplicate = await spike("status", "--json", "--json");
+    const duplicate = await spikeAt(repository.root, ["status", "--json", "--json"]);
     expect(duplicate.exitCode).toBe(2);
     expect(duplicate.stderr).toBe("");
     expect(JSON.parse(duplicate.stdout)).toEqual({

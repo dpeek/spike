@@ -1,3 +1,4 @@
+import { watch } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -185,6 +186,13 @@ export type WorkerRuntimeOperations = {
 export type WorkerObservation = {
   hosting: "direct" | "herdr" | null;
   status: "working" | "blocked" | "done" | "unavailable";
+};
+
+export type WorkerDoneNotification = {
+  ticket: TicketIdentity;
+  key: string;
+  hosting: "herdr";
+  status: "done";
 };
 
 type LiveDirectWorker = {
@@ -403,13 +411,15 @@ const herdrExecutionSchema = z.object({
   finishedAt: timestamp,
 }).strict();
 
+type HerdrExecutionMarker = z.infer<typeof herdrExecutionSchema>;
+
 function herdrExecutionPath(resource: Extract<LocalCloneRuntime, { host: "herdr" }>): string {
   return join(resource.workspace, "herdr-execution.json");
 }
 
-async function refreshHerdrExecution(root: string, record: RecordedWorker): Promise<RecordedWorker> {
-  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
-  if (record.metadata.finishedAt !== undefined || resource?.host !== "herdr") return record;
+async function loadHerdrExecutionMarker(
+  resource: Extract<LocalCloneRuntime, { host: "herdr" }>,
+): Promise<HerdrExecutionMarker | undefined> {
   const path = herdrExecutionPath(resource);
   try {
     const stat = await lstat(path);
@@ -417,10 +427,17 @@ async function refreshHerdrExecution(root: string, record: RecordedWorker): Prom
       throw new Error("Herdr execution marker must be a bounded regular file");
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return record;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
-  const execution = herdrExecutionSchema.parse(JSON.parse(await readFile(path, "utf8")));
+  return herdrExecutionSchema.parse(JSON.parse(await readFile(path, "utf8")));
+}
+
+async function refreshHerdrExecution(root: string, record: RecordedWorker): Promise<RecordedWorker> {
+  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (record.metadata.finishedAt !== undefined || resource?.host !== "herdr") return record;
+  const execution = await loadHerdrExecutionMarker(resource);
+  if (execution === undefined) return record;
   const started = Date.parse(record.metadata.startedAt);
   const observedFinish = Date.parse(execution.finishedAt);
   const finishedAt = observedFinish < started && started - observedFinish < 1_000
@@ -591,6 +608,87 @@ export async function observeWorker(
 ): Promise<WorkerObservation> {
   const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
   return selectWorkerAdapter(ticket.metadata.executionPolicy).observe(root, identity, herdr);
+}
+
+function workerDoneKey(identity: TicketIdentity): string {
+  return `worker-done:${identity.goalId}/${identity.changeId}/${identity.ticketId}`;
+}
+
+async function markerBackedHerdrDone(
+  root: string,
+  identity: TicketIdentity,
+): Promise<WorkerDoneNotification | undefined> {
+  if ((await ticketStatus(root, identity.goalId, identity.changeId, identity.ticketId)) !== "open") {
+    throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} is already reported`);
+  }
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record === undefined) throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker record`);
+  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (resource?.host !== "herdr") throw new Error("Ticket has no attended Herdr worker");
+  if ((await loadHerdrExecutionMarker(resource)) === undefined) return undefined;
+  return { ticket: identity, key: workerDoneKey(identity), hosting: "herdr", status: "done" };
+}
+
+/**
+ * Wait for the local attended wrapper's execution marker. This is an
+ * operational notification only: it does not publish a Report or close the
+ * Ticket. Docker should add its own concrete completion pressure later.
+ */
+export async function waitForWorkerDone(
+  root: string,
+  identity: TicketIdentity,
+  signal?: AbortSignal,
+): Promise<WorkerDoneNotification> {
+  signal?.throwIfAborted();
+  const initial = await markerBackedHerdrDone(root, identity);
+  if (initial !== undefined) return initial;
+
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  const resource = record?.metadata.runtime?.resource as LocalCloneRuntime | undefined;
+  if (resource?.host !== "herdr") throw new Error("Ticket has no attended Herdr worker");
+
+  return new Promise<WorkerDoneNotification>((resolve, reject) => {
+    let settled = false;
+    let checking = false;
+    let checkAgain = false;
+    const finish = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      watcher.close();
+      signal?.removeEventListener("abort", abort);
+      operation();
+    };
+    const abort = () => finish(() => reject(new Error("Worker wait was cancelled")));
+    const check = async () => {
+      if (settled) return;
+      if (checking) {
+        checkAgain = true;
+        return;
+      }
+      checking = true;
+      try {
+        do {
+          checkAgain = false;
+          const notification = await markerBackedHerdrDone(root, identity);
+          if (notification !== undefined) {
+            finish(() => resolve(notification));
+            return;
+          }
+        } while (checkAgain && !settled);
+      } catch (error) {
+        finish(() => reject(error));
+      } finally {
+        checking = false;
+      }
+    };
+    const watcher = watch(resource.workspace, (_event, filename) => {
+      if (filename === null || filename === "herdr-execution.json") void check();
+    });
+    watcher.on("error", (error) => finish(() => reject(error)));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    else void check(); // Close the race between the initial check and watcher installation.
+  });
 }
 
 async function readLocalCloneWorkerTerminal(

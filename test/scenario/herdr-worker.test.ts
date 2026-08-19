@@ -15,6 +15,7 @@ import {
   readWorkerTerminal,
   recordLocalCloneWorker,
   stopAndFinalizeRecordedWorker,
+  waitForWorkerDone,
   workerRecordPath,
   type TicketIdentity,
 } from "../../src/worker.ts";
@@ -94,10 +95,38 @@ describe("ephemeral Herdr worker hosting", () => {
     expect(await observeWorker(repository.root, identity, observationalHerdr("blocked", transcript))).toEqual({ hosting: "herdr", status: "blocked" });
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "working" });
     await expect(loadFinishedWorkerExecution(repository.root, identity)).rejects.toThrow("Worker has not finished");
+    let woke = false;
+    const waiting = waitForWorkerDone(repository.root, identity).then((notification) => {
+      woke = true;
+      return notification;
+    });
+    expect(woke).toBe(false);
     await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":0,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
+    expect(await waiting).toEqual({
+      ticket: identity,
+      key: `worker-done:${identity.goalId}/001/001`,
+      hosting: "herdr",
+      status: "done",
+    });
+    expect((await loadRecordedWorkerIfPresent(repository.root, identity))?.metadata.finishedAt).toBeUndefined();
     expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
     expect(await loadFinishedWorkerExecution(repository.root, identity)).toMatchObject({ exitCode: 0 });
     expect(await readWorkerTerminal(repository.root, identity, {}, herdr)).toBe(transcript);
+    const waited = Bun.spawn([
+      join(import.meta.dir, "..", "..", "bin", "spike"), "worker", "wait",
+      "--goal", identity.goalId, "--change", "001", "--ticket", "001", "--json",
+    ], { cwd: repository.root, stdout: "pipe", stderr: "pipe" });
+    const [waitExit, waitOutput, waitError] = await Promise.all([
+      waited.exited,
+      new Response(waited.stdout).text(),
+      new Response(waited.stderr).text(),
+    ]);
+    expect({ waitExit, waitError }).toEqual({ waitExit: 0, waitError: "" });
+    expect(JSON.parse(waitOutput)).toMatchObject({
+      ok: true,
+      command: "worker wait",
+      data: { ticket: identity, key: `worker-done:${identity.goalId}/001/001`, status: "done" },
+    });
     expect(await ticketStatus(repository.root, identity.goalId, identity.changeId, identity.ticketId)).toBe("open");
     expect(await Bun.file(reportPath(repository.root, identity.goalId, identity.changeId, identity.ticketId)).exists()).toBe(false);
   });

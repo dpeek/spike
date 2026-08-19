@@ -42,7 +42,7 @@ await writeFile(process.env.FAKE_PI_RECORD, JSON.stringify({ cwd: process.cwd(),
 const extensionPath = args[args.indexOf("--extension") + 1];
 const extension = await import(pathToFileURL(extensionPath).href);
 const tools = [];
-extension.default({ registerTool: (tool) => tools.push(tool) });
+extension.default({ registerTool: (tool) => tools.push(tool), on() {}, sendMessage() {} });
 const result = await tools.find((tool) => tool.name === "spike_status").execute("call", {}, undefined, undefined, { cwd: process.cwd() });
 await writeFile(process.env.FAKE_TOOL_RESULT, JSON.stringify(result));
 console.log('{"plannerText":"all Tickets completed","report":{"outcome":"completed"}}');

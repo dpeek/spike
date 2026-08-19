@@ -37,6 +37,7 @@ import {
   loadFinishedWorkerExecution,
   observeWorker,
   readWorkerTerminal,
+  waitForWorkerDone,
 } from "./worker.ts";
 
 export const version = "2.0.0-dev";
@@ -57,6 +58,7 @@ Usage:
   spike ticket dispatch-pi --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> [--host herdr|direct]
   spike ticket dispatch-test --goal <goal-id> --change <change-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
   spike worker status --goal <goal-id> --change <change-id> --ticket <ticket-id> [--json]
+  spike worker wait --goal <goal-id> --change <change-id> --ticket <ticket-id> [--json]
   spike worker read --goal <goal-id> --change <change-id> --ticket <ticket-id> [--lines <count>] [--ansi] [--json]
   spike worker attach --goal <goal-id> --change <change-id> --ticket <ticket-id>
   spike worker complete [--file <payload.json>] [--json]
@@ -759,6 +761,18 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         "worker status",
         { ticket: identity, ...observation },
         `Worker ${identity.goalId}/${identity.changeId}/${identity.ticketId}: ${observation.status}\n`,
+      );
+    }
+
+    if (args[0] === "worker" && args[1] === "wait") {
+      const identity = parseWorkerIdentity(args.slice(2));
+      const repository = await discoverRepository(cwd);
+      const notification = await waitForWorkerDone(repository.root, identity);
+      return success(
+        json,
+        "worker wait",
+        notification,
+        `Worker ${identity.goalId}/${identity.changeId}/${identity.ticketId}: marker-backed done\n`,
       );
     }
 

@@ -13,6 +13,7 @@ type ToolResult = {
 };
 
 type ToolContext = { cwd: string };
+type TicketIdentity = { goalId: string; changeId: string; ticketId: string };
 type ToolDefinition = {
   name: string;
   label: string;
@@ -32,6 +33,14 @@ type ToolDefinition = {
 
 export type SupervisorExtensionApi = {
   registerTool: (tool: ToolDefinition) => void;
+  on: (
+    event: "session_start" | "session_shutdown",
+    handler: (event: unknown, context: ToolContext) => void | Promise<void>,
+  ) => void;
+  sendMessage: (
+    message: { customType: string; content: string; display: boolean; details: Record<string, unknown> },
+    options: { deliverAs: "followUp"; triggerTurn: true },
+  ) => void;
 };
 
 export type RunSpikeJsonInput = {
@@ -48,6 +57,7 @@ export type RegisterSupervisorExtensionOptions = {
   command?: string;
   environment?: NodeJS.ProcessEnv;
   invoke?: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>;
+  waitForDone?: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>;
 };
 
 export const supervisorToolNames = [
@@ -181,6 +191,7 @@ function tool(
     command: string | ((params: any) => string);
     args: (params: any) => string[];
     stdin?: (params: any) => string | undefined;
+    afterSuccess?: (params: any, response: SpikeJsonSuccess, context: ToolContext) => void;
   },
   invoke: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>,
   options: RegisterSupervisorExtensionOptions,
@@ -204,6 +215,7 @@ function tool(
         ...(options.command === undefined ? {} : { command: options.command }),
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       });
+      definition.afterSuccess?.(params, response, context);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         details: response,
@@ -212,11 +224,121 @@ function tool(
   };
 }
 
+function ticketKey(identity: TicketIdentity): string {
+  return `worker-done:${identity.goalId}/${identity.changeId}/${identity.ticketId}`;
+}
+
+function workerWaitErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function unavailableWorkerWait(error: unknown): boolean {
+  const message = workerWaitErrorMessage(error);
+  return message.includes("has no Worker record") || message.includes("has no attended Herdr worker");
+}
+
+function openTicketIdentities(data: unknown): TicketIdentity[] {
+  if (typeof data !== "object" || data === null) return [];
+  const status = data as Record<string, unknown>;
+  const goals = Array.isArray(status["goals"]) ? status["goals"] : [status];
+  const identities: TicketIdentity[] = [];
+  for (const value of goals) {
+    if (typeof value !== "object" || value === null) continue;
+    const goal = value as Record<string, unknown>;
+    const change = goal["currentChange"];
+    if (typeof goal["goalId"] !== "string" || typeof change !== "object" || change === null) continue;
+    const current = change as Record<string, unknown>;
+    const ticket = current["openTicket"];
+    if (typeof current["changeId"] !== "string" || typeof ticket !== "object" || ticket === null) continue;
+    const open = ticket as Record<string, unknown>;
+    if (typeof open["ticketId"] !== "string") continue;
+    identities.push({ goalId: goal["goalId"], changeId: current["changeId"], ticketId: open["ticketId"] });
+  }
+  return identities;
+}
+
 export function registerSupervisorExtension(
   pi: SupervisorExtensionApi,
   options: RegisterSupervisorExtensionOptions = {},
 ): void {
   const invoke = options.invoke ?? runSpikeJson;
+  const waitForDone = options.waitForDone ?? runSpikeJson;
+  const waiters = new Map<string, AbortController>();
+  const notified = new Set<string>();
+  let shuttingDown = false;
+
+  const armWorkerWake = (
+    cwd: string,
+    identity: TicketIdentity,
+    wakeOptions: { replace?: boolean; notifyUnavailableFailure?: boolean } = {},
+  ): void => {
+    const key = ticketKey(identity);
+    if (notified.has(key)) return;
+    const existing = waiters.get(key);
+    if (existing !== undefined) {
+      if (!wakeOptions.replace) return;
+      existing.abort();
+    }
+
+    const controller = new AbortController();
+    waiters.set(key, controller);
+    void waitForDone({
+      cwd,
+      args: ["worker", "wait", "--goal", identity.goalId, "--change", identity.changeId, "--ticket", identity.ticketId],
+      expectedCommand: "worker wait",
+      signal: controller.signal,
+      ...(options.command === undefined ? {} : { command: options.command }),
+      ...(options.environment === undefined ? {} : { environment: options.environment }),
+    }).then((response) => {
+      const data = response.data as { key?: unknown; status?: unknown } | undefined;
+      if (shuttingDown || controller.signal.aborted || data?.key !== key || data.status !== "done" || notified.has(key)) return;
+      notified.add(key);
+      pi.sendMessage({
+        customType: "spike-worker-recheck",
+        content: `Operational worker notification ${key}. Call spike_status now. If this exact Ticket remains open, explicitly call spike_publish_report. Do not treat this notification, the worker marker, Herdr state, terminal output, or process exit as workflow evidence.`,
+        display: true,
+        details: { key, ...identity },
+      }, { deliverAs: "followUp", triggerTurn: true });
+    }).catch((error) => {
+      if (
+        shuttingDown || controller.signal.aborted || notified.has(key) ||
+        workerWaitErrorMessage(error).includes("is already reported") ||
+        (!wakeOptions.notifyUnavailableFailure && unavailableWorkerWait(error))
+      ) return;
+      notified.add(key);
+      pi.sendMessage({
+        customType: "spike-worker-recheck",
+        content: `Operational worker waiter failed for ${key}. Call spike_status now, then spike_worker_status for this exact Ticket if it remains open. Do not treat this message, Herdr state, terminal output, or process exit as workflow evidence.`,
+        display: true,
+        details: { key, ...identity, waiterFailed: true },
+      }, { deliverAs: "followUp", triggerTurn: true });
+    }).finally(() => {
+      if (waiters.get(key) === controller) waiters.delete(key);
+    });
+  };
+
+  pi.on("session_start", async (_event, context) => {
+    shuttingDown = false;
+    notified.clear();
+    try {
+      const status = await invoke({
+        cwd: context.cwd,
+        args: ["status"],
+        expectedCommand: "status",
+        ...(options.command === undefined ? {} : { command: options.command }),
+        ...(options.environment === undefined ? {} : { environment: options.environment }),
+      });
+      for (const identity of openTicketIdentities(status.data)) armWorkerWake(context.cwd, identity);
+    } catch {
+      // The planner can still recover explicitly through spike_status.
+    }
+  });
+  pi.on("session_shutdown", () => {
+    shuttingDown = true;
+    for (const controller of waiters.values()) controller.abort();
+    waiters.clear();
+  });
+
   const tools: ToolDefinition[] = [
     tool({
       name: "spike_status",
@@ -225,7 +347,7 @@ export function registerSupervisorExtension(
       promptSnippet: "Read Spike's authoritative derived workflow status",
       promptGuidelines: [
         "Use spike_status for workflow facts; never infer them from planner prose, worker terminal output, or a Pi process exit status.",
-        "Treat spike_dispatch_pi output as operational staging evidence only; a Ticket remains open until spike_publish_report succeeds.",
+        "Treat spike_dispatch_pi output and spike-worker-recheck messages as operational only; on a wake call spike_status, then explicitly use spike_publish_report if the Ticket remains open.",
         "Use Spike tools rather than editing files under .spike directly.",
       ],
       parameters: {
@@ -372,6 +494,15 @@ export function registerSupervisorExtension(
         "ticket", "dispatch-pi", "--goal", params.goalId, "--change", params.changeId,
         "--ticket", params.ticketId, "--worker", params.worker,
       ],
+      afterSuccess: (params, response, context) => {
+        const data = response.data as { hosting?: unknown; status?: unknown } | undefined;
+        if (data?.hosting !== "herdr" || data.status !== "working") return;
+        armWorkerWake(context.cwd, {
+          goalId: params.goalId,
+          changeId: params.changeId,
+          ticketId: params.ticketId,
+        }, { replace: true, notifyUnavailableFailure: true });
+      },
     }, invoke, options),
     tool({
       name: "spike_worker_status",

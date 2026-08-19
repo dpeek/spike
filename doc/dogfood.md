@@ -30,7 +30,7 @@ From a Herdr-managed planner pane:
      --worker pi-implementer --json
    ```
    Confirm the ephemeral tab shows Pi's interactive TUI and that the immutable Ticket/context prompt was submitted automatically. The launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
-6. Observe with `spike worker status` and `spike worker read`, then exercise `spike worker attach` from a real TTY and detach without ending the worker. Treat all terminal interaction as operational only. A rejected completion remains in the same headed Ticket for retry. An accepted completion ends the turn and asks Pi to shut down gracefully. Wait for Spike to report `done`, which still requires the wrapper execution marker with Pi's exit result; terminal or Herdr agent state does not complete the Ticket.
+6. Observe with `spike worker status` and `spike worker read`, then exercise `spike worker attach` from a real TTY and detach without ending the worker. Treat all terminal interaction as operational only. A rejected completion remains in the same headed Ticket for retry. An accepted completion ends the turn and asks Pi to shut down gracefully. Do not poll from the planner: the supervisor's one-shot waiter should wake it with a full-identity operational recheck only after the wrapper execution marker records Pi's exit. Confirm the planner calls `spike_status`; terminal, wake-message, or Herdr agent state does not complete the Ticket.
 7. Publish the implementation Report and normalized Candidate:
    ```sh
    spike report publish --goal <goal> --change 001 --ticket 001 \
@@ -43,7 +43,7 @@ From a Herdr-managed planner pane:
      --implementation-ticket 001 --instruction "..." \
      --network-access unrestricted --json
    ```
-9. Dispatch a fresh real Pi reviewer, wait for Spike `done`, and inspect staging `submission.md`. Confirm it assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket.
+9. Dispatch a fresh real Pi reviewer and let the marker-backed notification wake the planner, then inspect staging `submission.md`. Confirm the planner rechecks `spike_status`, and that the Submission assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket.
 10. Publish the review Report:
     ```sh
     spike report publish --goal <goal> --change 001 --ticket 002 --json

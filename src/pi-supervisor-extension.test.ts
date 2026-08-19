@@ -6,6 +6,8 @@ import {
   registerSupervisorExtension,
   runSpikeJson,
   supervisorToolNames,
+  type RunSpikeJsonInput,
+  type SpikeJsonSuccess,
   type SupervisorExtensionApi,
 } from "./pi-supervisor-extension.ts";
 
@@ -39,11 +41,141 @@ process.exit(29);
 
 function registeredTools(command: string, environment: NodeJS.ProcessEnv) {
   const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
-  registerSupervisorExtension({ registerTool: (tool) => tools.push(tool) }, { command, environment });
+  registerSupervisorExtension({
+    registerTool: (tool) => tools.push(tool),
+    on() {},
+    sendMessage() {},
+  }, {
+    command,
+    environment,
+    waitForDone: () => new Promise(() => undefined),
+  });
   return new Map(tools.map((tool) => [tool.name, tool]));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("Pi supervisor extension", () => {
+  test("wakes the planner once with an operational recheck for a marker-backed open Ticket", async () => {
+    const goalId = "goal-1";
+    const identity = { goalId, changeId: "001", ticketId: "003" };
+    const key = `worker-done:${goalId}/001/003`;
+    const waiting = deferred<SpikeJsonSuccess>();
+    const notified = deferred<void>();
+    const waits: RunSpikeJsonInput[] = [];
+    const messages: Array<{ message: any; options: any }> = [];
+    const handlers = new Map<string, (event: unknown, context: { cwd: string }) => void | Promise<void>>();
+
+    registerSupervisorExtension({
+      registerTool() {},
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage(message, options) {
+        messages.push({ message, options });
+        notified.resolve();
+      },
+    }, {
+      invoke: async (input) => ({
+        ok: true,
+        command: input.expectedCommand,
+        data: {
+          goals: [{ goalId, currentChange: { changeId: "001", openTicket: { ticketId: "003" } } }],
+        },
+      }),
+      waitForDone(input) {
+        waits.push(input);
+        return waiting.promise;
+      },
+    });
+
+    await handlers.get("session_start")!({}, { cwd: "/project" });
+    expect(waits).toHaveLength(1);
+    expect(waits[0]!.args).toEqual([
+      "worker", "wait", "--goal", goalId, "--change", "001", "--ticket", "003",
+    ]);
+    expect(messages).toEqual([]);
+
+    waiting.resolve({ ok: true, command: "worker wait", data: { ticket: identity, key, hosting: "herdr", status: "done" } });
+    await notified.promise;
+    expect(messages).toEqual([{
+      message: {
+        customType: "spike-worker-recheck",
+        content: expect.stringContaining("Call spike_status now"),
+        display: true,
+        details: { key, ...identity },
+      },
+      options: { deliverAs: "followUp", triggerTurn: true },
+    }]);
+  });
+
+  test("wakes the planner with an operational recheck when an attended waiter fails", async () => {
+    const identity = { goalId: "goal-1", changeId: "001", ticketId: "003" };
+    const key = `worker-done:${identity.goalId}/001/003`;
+    const notified = deferred<void>();
+    const messages: Array<{ message: any; options: any }> = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+
+    registerSupervisorExtension({
+      registerTool(tool) { tools.push(tool); },
+      on() {},
+      sendMessage(message, options) {
+        messages.push({ message, options });
+        notified.resolve();
+      },
+    }, {
+      invoke: async (input) => ({
+        ok: true,
+        command: input.expectedCommand,
+        data: input.expectedCommand === "ticket dispatch-pi"
+          ? { ticket: identity, hosting: "herdr", status: "working" }
+          : {},
+      }),
+      waitForDone: async () => { throw new Error("watcher unavailable"); },
+    });
+
+    const dispatch = tools.find((tool) => tool.name === "spike_dispatch_pi")!;
+    await dispatch.execute("call", { ...identity, worker: "pi-worker" }, undefined, undefined, { cwd: "/project" });
+    await notified.promise;
+
+    expect(messages).toEqual([{
+      message: {
+        customType: "spike-worker-recheck",
+        content: expect.stringContaining("waiter failed"),
+        display: true,
+        details: { key, ...identity, waiterFailed: true },
+      },
+      options: { deliverAs: "followUp", triggerTurn: true },
+    }]);
+  });
+
+  test("cancels an open worker wait when the planner session shuts down", async () => {
+    const handlers = new Map<string, (event: unknown, context: { cwd: string }) => void | Promise<void>>();
+    let waitSignal: AbortSignal | undefined;
+    registerSupervisorExtension({
+      registerTool() {},
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage() {},
+    }, {
+      invoke: async (input) => ({
+        ok: true,
+        command: input.expectedCommand,
+        data: { goals: [{ goalId: "goal-1", currentChange: { changeId: "001", openTicket: { ticketId: "001" } } }] },
+      }),
+      waitForDone(input) {
+        waitSignal = input.signal;
+        return new Promise(() => undefined);
+      },
+    });
+
+    await handlers.get("session_start")!({}, { cwd: "/project" });
+    expect(waitSignal?.aborted).toBe(false);
+    await handlers.get("session_shutdown")!({}, { cwd: "/project" });
+    expect(waitSignal?.aborted).toBe(true);
+  });
+
   test("registers the complete sequential planner control plane", async () => {
     const fake = await fakeSpike();
     const tools = registeredTools(fake.executable, { ...process.env, FAKE_SPIKE_CALLS: fake.calls });
