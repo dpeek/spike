@@ -19,5 +19,6 @@ Every blocking finding must identify the affected criterion, regression, securit
 ## Boundaries
 
 - Do not turn architectural preference, optional hardening, deferred work, or an ideal extension point into a blocker.
+- If a blocking conclusion depends on an unstated threat model or interpretation of an absolute constraint, assess the affected criterion as unclear and use `ask-operator` rather than requesting implementation remediation.
 - Label non-required improvements as non-blocking.
 - Approve only the exact Candidate that satisfies every criterion; never infer approval from implementation confidence or passing tests alone.

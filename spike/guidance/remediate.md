@@ -7,8 +7,9 @@ Close the explicit accepted findings from the selected review Report in a fresh 
 ## Required work
 
 - Address the finding set and stop conditions named by the Ticket.
-- Preserve stable finding IDs in evidence and verify each finding's concrete reproduction no longer holds.
-- Run required regression checks and verify affected external postconditions.
+- State the root cause for each stable finding ID, verify its concrete reproduction no longer holds, and test adjacent members of the same defect class.
+- For validation defects, cover applicable blank or whitespace-only, missing, wrong-type, malformed, unknown, and mismatched cases. For side-effect defects, inspect every path that invokes the same external mechanism.
+- Run required regression checks and verify affected external postconditions, including that refusals occur before side effects.
 - Keep unrelated Candidate behavior intact.
 
 ## Completion
