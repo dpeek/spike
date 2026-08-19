@@ -65,6 +65,7 @@ export type RegisterSupervisorExtensionOptions = {
 export const supervisorToolNames = [
   "spike_begin_step",
   "spike_status",
+  "spike_apply_goal",
   "spike_create_goal",
   "spike_revise_plan",
   "spike_create_change",
@@ -81,6 +82,7 @@ export const supervisorToolNames = [
 
 const maximumProcessOutputBytes = 1024 * 1024;
 const nonBlankString = { type: "string", minLength: 1 } as const;
+const requiredNonBlankString = { type: "string", minLength: 1, pattern: "\\S" } as const;
 const optionalIdentity = { type: "string", minLength: 1 } as const;
 const thinking = { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh"] } as const;
 const plannerSteps = ["goal", "plan", "change", "implement", "review", "remediate", "decide", "recover"] as const;
@@ -431,6 +433,26 @@ export function registerSupervisorExtension(
         optional(args, "--goal", params.goalId);
         return args;
       },
+    }, invoke, options),
+    tool({
+      name: "spike_apply_goal",
+      label: "Apply completed Goal",
+      description: "Apply a completed Goal's reviewed integration revision to an explicitly selected local target branch after explicit operator approval.",
+      promptSnippet: "Apply one completed Goal only with explicit operator approval",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "targetBranch", "approval"],
+        properties: {
+          goalId: requiredNonBlankString,
+          targetBranch: requiredNonBlankString,
+          approval: requiredNonBlankString,
+        },
+      },
+      command: "goal apply",
+      args: (params) => [
+        "goal", "apply", "--goal", params.goalId, "--target", params.targetBranch, "--approval", params.approval,
+      ],
     }, invoke, options),
     tool({
       name: "spike_create_goal",
