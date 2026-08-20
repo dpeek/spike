@@ -17,6 +17,7 @@ import { applyGoalIntegration } from "./goal-apply.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
+import { closeRequest, createRequest, listRequests, loadRequest, requestDataRoot, type ClosureDisposition } from "./request.ts";
 import { launchPlanner } from "./planner.ts";
 import {
   loadSubmissionOutcome,
@@ -57,6 +58,10 @@ Usage:
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike goal apply --goal <goal-id> --target <local-branch> --approval <statement> [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
+  spike request create --title <title> --statement <statement> [--project <slug>] [--json]
+  spike request list [--project <slug> | --unassigned] [--closed] [--json]
+  spike request show --request <request-id> [--json]
+  spike request close --request <request-id> --disposition <addressed|declined|withdrawn> --statement <statement> [--json]
   spike change create --goal <goal-id> --title <title> --intent <intent> --rationale <rationale> --acceptance <criterion> [options]
   spike change land --goal <goal-id> --change <change-id> [--statement <statement>] [--json]
   spike change reject --goal <goal-id> --change <change-id> --statement <statement> [--json]
@@ -94,6 +99,12 @@ Goal apply options:
   --goal <goal-id>               Completed Goal to apply
   --target <local-branch>        Currently checked-out local branch to fast-forward
   --approval <statement>         Explicit operator approval for this mutation
+
+Request options:
+  --project <slug>              Repeat for each Project affinity
+  --unassigned                  Select Requests with no Project affinity
+  --closed                      Select closed Requests (list defaults to open)
+  --disposition <value>         addressed, declined, or withdrawn
 
 Change creation options:
   --acceptance <criterion>       Repeat for each acceptance criterion
@@ -179,6 +190,65 @@ function valueAfter(args: string[], index: number, option: string): string {
   const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) throw new UsageError(`${option} requires a value`);
   return value;
+}
+
+function parseRequestCreate(args: string[]): { title: string; statement: string; projects: string[] } {
+  let title: string | undefined;
+  let statement: string | undefined;
+  const projects: string[] = [];
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--title") title = value;
+    else if (option === "--statement") statement = value;
+    else if (option === "--project") projects.push(value);
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (title === undefined) throw new UsageError("--title is required");
+  if (statement === undefined) throw new UsageError("--statement is required");
+  return { title, statement, projects };
+}
+
+function parseRequestList(args: string[]): { project?: string; unassigned?: boolean; closed?: boolean } {
+  let project: string | undefined;
+  let unassigned = false;
+  let closed = false;
+  for (let index = 0; index < args.length;) {
+    const option = args[index]!;
+    if (option === "--unassigned") { unassigned = true; index++; continue; }
+    if (option === "--closed") { closed = true; index++; continue; }
+    const value = valueAfter(args, index, option);
+    if (option === "--project") project = value;
+    else throw new UsageError(`unknown option: ${option}`);
+    index += 2;
+  }
+  if (project !== undefined && unassigned) throw new UsageError("--project cannot be combined with --unassigned");
+  return { ...(project === undefined ? {} : { project }), ...(unassigned ? { unassigned: true } : {}), ...(closed ? { closed: true } : {}) };
+}
+
+function parseRequestShow(args: string[]): { requestId: string } {
+  if (args.length !== 2 || args[0] !== "--request") throw new UsageError(args.length === 0 ? "--request is required" : `unknown option: ${args[0]}`);
+  return { requestId: valueAfter(args, 0, "--request") };
+}
+
+function parseRequestClose(args: string[]): { requestId: string; disposition: ClosureDisposition; statement: string } {
+  let requestId: string | undefined;
+  let disposition: ClosureDisposition | undefined;
+  let statement: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!;
+    const value = valueAfter(args, index, option);
+    if (option === "--request") requestId = value;
+    else if (option === "--statement") statement = value;
+    else if (option === "--disposition") {
+      if (!["addressed", "declined", "withdrawn"].includes(value)) throw new UsageError(`invalid Request disposition: ${value}`);
+      disposition = value as ClosureDisposition;
+    } else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (requestId === undefined) throw new UsageError("--request is required");
+  if (disposition === undefined) throw new UsageError("--disposition is required");
+  if (statement === undefined) throw new UsageError("--statement is required");
+  return { requestId, disposition, statement };
 }
 
 function parseGoalCreate(args: string[]): {
@@ -670,6 +740,27 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     }
     if (args.length === 1 && ["--version", "-V"].includes(args[0]!)) {
       return success(json, "version", { version }, `${version}\n`);
+    }
+
+    if (args[0] === "request" && args[1] === "create") {
+      const created = await createRequest(parseRequestCreate(args.slice(2)));
+      return success(json, "request create", created, `Created Request ${created.metadata.requestId}\n`);
+    }
+
+    if (args[0] === "request" && args[1] === "list") {
+      const requests = await listRequests(parseRequestList(args.slice(2)));
+      const human = requests.map((request) => `${request.metadata.requestId} ${request.state} ${request.metadata.projects.join(",") || "unassigned"}`).join("\n");
+      return success(json, "request list", requests, human ? `${human}\n` : "");
+    }
+
+    if (args[0] === "request" && args[1] === "show") {
+      const request = await loadRequest(requestDataRoot(), parseRequestShow(args.slice(2)).requestId);
+      return success(json, "request show", request, `Request ${request.metadata.requestId} (${request.state})\n\n${request.body}`);
+    }
+
+    if (args[0] === "request" && args[1] === "close") {
+      const closed = await closeRequest(parseRequestClose(args.slice(2)));
+      return success(json, "request close", closed, `Closed Request ${closed.metadata.requestId} (${closed.closure!.metadata.disposition})\n`);
     }
 
     if (args[0] === "planner") {

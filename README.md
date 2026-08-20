@@ -70,6 +70,25 @@ spike ticket issue \
   --thinking medium
 ```
 
+## Request inbox
+
+Requests are host-local, Git-independent unapproved intake. `spike request create`
+uses `SPIKE_DATA_DIR`, then `${XDG_DATA_HOME}/spike`, then
+`${HOME}/.local/share/spike`. It stores immutable Markdown under that root; no
+Project checkout is required. A Request may have no `--project` flags (unassigned)
+or several stable Project slugs.
+
+```bash
+spike request create --title "Consider faster checks" --statement "Measure the slow suite." --project spike
+spike request list --project spike
+spike request show --request request-001
+spike request close --request request-001 --disposition declined --statement "Not needed now."
+```
+
+`list` shows open Requests by default; use `--closed` or `--unassigned` to filter.
+Closures are immutable and use one of `addressed`, `declined`, or `withdrawn`.
+Capturing or closing a Request neither approves nor starts Project work.
+
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
 `--network-access unrestricted` is the explicit acknowledgement required by the

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChange, loadChangeDecision } from "./change.ts";
 import { createGoal } from "./goal.ts";
@@ -19,9 +20,10 @@ afterEach(async () => {
   }));
 });
 
-async function spikeAt(cwd: string, args: string[], stdin?: string) {
+async function spikeAt(cwd: string, args: string[], stdin?: string, env?: NodeJS.ProcessEnv) {
   const process = Bun.spawn([join(root, "bin", "spike"), ...args], {
     cwd,
+    ...(env === undefined ? {} : { env }),
     stdin: stdin === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -90,6 +92,61 @@ describe("spike CLI", () => {
       command: "status",
       error: { code: "usage", message: "--json may be specified only once" },
     });
+  });
+
+  test("operates Request JSON commands outside Git with an isolated data root", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "spike-request-cwd-"));
+    const dataRoot = await mkdtemp(join(tmpdir(), "spike-request-data-"));
+    try {
+      const gitProbe = Bun.spawn(["git", "rev-parse", "--is-inside-work-tree"], { cwd, stdout: "pipe", stderr: "pipe" });
+      expect(await gitProbe.exited).not.toBe(0);
+      const env = { ...process.env, SPIKE_DATA_DIR: dataRoot };
+
+      const create = await spikeAt(cwd, ["request", "create", "--title", "Outside Git", "--statement", "Keep this work.", "--project", "spike", "--json"], undefined, env);
+      expect(create).toMatchObject({ exitCode: 0, stderr: "" });
+      const created = JSON.parse(create.stdout);
+      expect(created).toEqual({
+        ok: true,
+        command: "request create",
+        data: expect.objectContaining({
+          metadata: expect.objectContaining({ requestId: "request-001", projects: ["spike"] }),
+          body: "# Outside Git\n\nKeep this work.\n",
+          state: "open",
+          closure: null,
+        }),
+      });
+
+      const listed = await spikeAt(cwd, ["request", "list", "--json"], undefined, env);
+      expect(listed).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(listed.stdout)).toEqual({ ok: true, command: "request list", data: [created.data] });
+
+      const shown = await spikeAt(cwd, ["request", "show", "--request", "request-001", "--json"], undefined, env);
+      expect(shown).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(shown.stdout)).toEqual({ ok: true, command: "request show", data: created.data });
+
+      const closed = await spikeAt(cwd, ["request", "close", "--request", "request-001", "--disposition", "addressed", "--statement", "Completed outside Git.", "--json"], undefined, env);
+      expect(closed).toMatchObject({ exitCode: 0, stderr: "" });
+      expect(JSON.parse(closed.stdout)).toEqual({
+        ok: true,
+        command: "request close",
+        data: expect.objectContaining({
+          metadata: created.data.metadata,
+          state: "closed",
+          closure: expect.objectContaining({
+            metadata: expect.objectContaining({ requestId: "request-001", disposition: "addressed" }),
+            body: "Completed outside Git.\n",
+          }),
+        }),
+      });
+
+      expect(await Bun.file(join(dataRoot, "requests", "request-001", "request.md")).exists()).toBe(true);
+      expect(await Bun.file(join(dataRoot, "requests", "request-001", "closure.md")).exists()).toBe(true);
+      const closedList = await spikeAt(cwd, ["request", "list", "--closed", "--json"], undefined, env);
+      expect(JSON.parse(closedList.stdout)).toMatchObject({ ok: true, command: "request list", data: [expect.objectContaining({ state: "closed" })] });
+      expect(await Bun.file(join(cwd, ".git")).exists()).toBe(false);
+    } finally {
+      await Promise.all([rm(cwd, { recursive: true, force: true }), rm(dataRoot, { recursive: true, force: true })]);
+    }
   });
 
   test("shows exact committed guidance with its selected source revision", async () => {
