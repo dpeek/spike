@@ -26,6 +26,8 @@ export type Request = { metadata: z.infer<typeof requestSchema>; body: string };
 export type RequestClosure = { metadata: z.infer<typeof closureSchema>; body: string };
 export type RequestState = "open" | "closed";
 export type RequestView = Request & { state: RequestState; closure: RequestClosure | null };
+/** Lightweight Inbox projection; full documents remain available through loadRequest. */
+export type RequestSummary = { metadata: Request["metadata"]; title: string; state: RequestState };
 
 export function requestDataRoot(environment: NodeJS.ProcessEnv = process.env): string {
   const configured = environment["SPIKE_DATA_DIR"];
@@ -73,6 +75,28 @@ function text(value: string, label: string): string {
   if (!normalized) throw new Error(`${label} must not be blank`);
   return normalized;
 }
+
+function requestTitle(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Request title must be a string");
+  if (/\r|\n/.test(value)) throw new Error("Request title must be a single line");
+  const title = value.trim();
+  if (!title) throw new Error("Request title must not be blank");
+  if (Array.from(title).length > 200) throw new Error("Request title must be at most 200 characters");
+  return title;
+}
+
+function titleFromBody(value: string): string {
+  const firstLine = value.split(/\r\n|\r|\n/, 1)[0] ?? "";
+  if (!firstLine.startsWith("# ")) {
+    throw new Error("Request body must start with a nonempty '# <title>' heading");
+  }
+  try {
+    return requestTitle(firstLine.slice(2));
+  } catch {
+    throw new Error("Request body must start with a nonempty '# <title>' heading of at most 200 characters");
+  }
+}
+
 function body(title: string, statement: string): string {
   return `# ${title}\n\n${statement}\n`;
 }
@@ -88,7 +112,7 @@ function nextId(ids: string[]): string {
 }
 
 export async function createRequest(input: { title: string; statement: string; projects?: string[]; root?: string; now?: Date }): Promise<RequestView> {
-  const title = text(input.title, "Request title");
+  const title = requestTitle(input.title);
   const statement = text(input.statement, "Request statement");
   const projects = (input.projects ?? []).map((project) => text(project, "Project slug"));
   const root = input.root === undefined ? requestDataRoot() : resolve(input.root);
@@ -115,7 +139,7 @@ export async function loadRequest(rootInput: string, requestId: string): Promise
   const requestDocument = await readDocument(root, requestPath(root, requestId));
   const metadata = requestSchema.parse(requestDocument.metadata);
   if (metadata.requestId !== requestId) throw new Error(`Request document belongs to a different Request: ${metadata.requestId}`);
-  if (!requestDocument.body.trim()) throw new Error("Request body must not be blank");
+  titleFromBody(requestDocument.body);
   const closureFile = closurePath(root, requestId);
   if (!(await documentExists(root, closureFile))) return { metadata, body: requestDocument.body, state: "open", closure: null };
   const closureDocument = await readDocument(root, closureFile);
@@ -125,7 +149,7 @@ export async function loadRequest(rootInput: string, requestId: string): Promise
   return { metadata, body: requestDocument.body, state: "closed", closure: { metadata: closureMetadata, body: closureDocument.body } };
 }
 
-export async function listRequests(input: { root?: string; project?: string; unassigned?: boolean; closed?: boolean }): Promise<RequestView[]> {
+export async function listRequests(input: { root?: string; project?: string; unassigned?: boolean; closed?: boolean }): Promise<RequestSummary[]> {
   if (input.project !== undefined && input.unassigned) throw new Error("--project cannot be combined with --unassigned");
   const root = input.root === undefined ? requestDataRoot() : resolve(input.root);
   const project = input.project === undefined ? undefined : z.string().regex(projectSlugPattern).parse(input.project);
@@ -133,7 +157,8 @@ export async function listRequests(input: { root?: string; project?: string; una
   const views = await Promise.all((await allocatedIds(root)).map((requestId) => loadRequest(root, requestId)));
   return views.filter((view) => (input.closed ? view.state === "closed" : view.state === "open"))
     .filter((view) => project === undefined || view.metadata.projects.includes(project))
-    .filter((view) => !input.unassigned || view.metadata.projects.length === 0);
+    .filter((view) => !input.unassigned || view.metadata.projects.length === 0)
+    .map((view) => ({ metadata: view.metadata, title: titleFromBody(view.body), state: view.state }));
 }
 
 export async function closeRequest(input: { requestId: string; disposition: ClosureDisposition; statement: string; root?: string; now?: Date }): Promise<RequestView> {

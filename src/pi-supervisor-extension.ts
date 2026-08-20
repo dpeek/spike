@@ -107,7 +107,7 @@ const thinking = { type: "string", enum: ["off", "minimal", "low", "medium", "hi
 const plannerSteps = ["goal", "plan", "change", "implement", "review", "remediate", "decide", "recover"] as const;
 const requestId = { type: "string", pattern: "^request-(?!0+$)[0-9]{3,}$", maxLength: 64 } as const;
 const projectSlug = { type: "string", pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", minLength: 1, maxLength: 63 } as const;
-const requestTitle = { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" } as const;
+const requestTitle = { type: "string", minLength: 1, maxLength: 200, pattern: "^[^\\r\\n]*\\S[^\\r\\n]*$" } as const;
 const requestBody = { type: "string", minLength: 1, maxLength: 20000, pattern: "\\S" } as const;
 
 function object(value: unknown): any {
@@ -266,10 +266,11 @@ function commandSummary(response: SpikeJsonSuccess): string {
       return [`Inbox ${requests.length} Request${requests.length === 1 ? "" : "s"}`, ...requests.map((value) => {
         const request = object(value);
         const id = string(object(request?.metadata)?.requestId) ?? "unknown";
+        const title = string(request?.title) ?? "untitled";
         const state = string(request?.state) ?? "unknown";
         const projects = Array.isArray(object(request?.metadata)?.projects) ? object(request?.metadata)?.projects : [];
         const affinity = projects.filter((project: unknown): project is string => typeof project === "string").join(", ") || "unassigned";
-        return `${id} · ${state} · ${affinity}`;
+        return `${id} · ${title} · ${state} · ${affinity}`;
       })].join("\n");
     }
     case "plan revise": return `Revised Plan ${identity(object(data?.metadata)) ?? "unknown"}`;

@@ -462,7 +462,7 @@ describe("Pi supervisor extension", () => {
           return { ok: true, command: "guidance show", data: { step: "goal", path: "spike/guidance/goal.md", sourceRevision: "a".repeat(40), markdown: "# Goal" } };
         }
         if (input.expectedCommand === "request list") {
-          return { ok: true, command: "request list", data: [{ metadata: { requestId: "request-001", projects: ["spike"] }, state: "open" }] };
+          return { ok: true, command: "request list", data: [{ metadata: { requestId: "request-001", projects: ["spike"] }, title: "Future work", state: "open" }] };
         }
         if (input.expectedCommand.startsWith("request")) {
           return { ok: true, command: input.expectedCommand, data: { metadata: { requestId: "request-001", projects: [] }, state: "open" } };
@@ -494,7 +494,7 @@ describe("Pi supervisor extension", () => {
     ]);
     expect(calls[1]!.stdin).toBe("Capture this without approval.");
     expect(renderSupervisorResponse(created.details, false)).toBe("Created Request request-001 · open · unassigned");
-    expect(renderSupervisorResponse(listed.details, false)).toBe("Inbox 1 Request\nrequest-001 · open · spike");
+    expect(renderSupervisorResponse(listed.details, false)).toBe("Inbox 1 Request\nrequest-001 · Future work · open · spike");
 
     const fake = await fakeSpike();
     const fakeTools = registeredTools(fake.executable, { ...process.env, FAKE_SPIKE_CALLS: fake.calls });

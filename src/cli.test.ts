@@ -118,7 +118,11 @@ describe("spike CLI", () => {
 
       const listed = await spikeAt(cwd, ["request", "list", "--json"], undefined, env);
       expect(listed).toMatchObject({ exitCode: 0, stderr: "" });
-      expect(JSON.parse(listed.stdout)).toEqual({ ok: true, command: "request list", data: [created.data] });
+      expect(JSON.parse(listed.stdout)).toEqual({
+        ok: true,
+        command: "request list",
+        data: [{ metadata: created.data.metadata, title: "Outside Git", state: "open" }],
+      });
 
       const shown = await spikeAt(cwd, ["request", "show", "--request", "request-001", "--json"], undefined, env);
       expect(shown).toMatchObject({ exitCode: 0, stderr: "" });
@@ -142,7 +146,13 @@ describe("spike CLI", () => {
       expect(await Bun.file(join(dataRoot, "requests", "request-001", "request.md")).exists()).toBe(true);
       expect(await Bun.file(join(dataRoot, "requests", "request-001", "closure.md")).exists()).toBe(true);
       const closedList = await spikeAt(cwd, ["request", "list", "--closed", "--json"], undefined, env);
-      expect(JSON.parse(closedList.stdout)).toMatchObject({ ok: true, command: "request list", data: [expect.objectContaining({ state: "closed" })] });
+      expect(JSON.parse(closedList.stdout)).toEqual({
+        ok: true,
+        command: "request list",
+        data: [{ metadata: created.data.metadata, title: "Outside Git", state: "closed" }],
+      });
+      const humanList = await spikeAt(cwd, ["request", "list", "--closed"], undefined, env);
+      expect(humanList.stdout).toBe("request-001 Outside Git closed spike\n");
       expect(await Bun.file(join(cwd, ".git")).exists()).toBe(false);
     } finally {
       await Promise.all([rm(cwd, { recursive: true, force: true }), rm(dataRoot, { recursive: true, force: true })]);

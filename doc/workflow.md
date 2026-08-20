@@ -34,7 +34,7 @@ Spike needs a workflow that remains understandable across fresh planner and work
 
 The model separates six concerns:
 
-- a Request is unapproved host-local intake for possible future work; the Inbox is its open-Request view;
+- a Request is unapproved host-local intake for possible future work; its first Markdown line is a required nonblank single-line `# <title>` of at most 200 characters, and the Inbox is its lightweight open-Request view (metadata, derived title, and state only);
 - a Goal records the approved outcome;
 - a Plan holds mutable planner working memory;
 - a Change defines one integration unit;

@@ -85,7 +85,11 @@ spike request show --request request-001
 spike request close --request request-001 --disposition declined --statement "Not needed now."
 ```
 
-`list` shows open Requests by default; use `--closed` or `--unassigned` to filter.
+A Request title is its required first Markdown line, `# <title>`: it must be
+nonblank, single-line, and at most 200 characters. `list` shows open Requests by
+default; use `--closed` or `--unassigned` to filter. List JSON and Inbox views
+return only Request metadata, this derived title, and state—not Request or closure
+bodies—while `show`, `create`, and `close` retain complete individual documents.
 Closures are immutable and use one of `addressed`, `declined`, or `withdrawn`.
 Capturing or selecting a Request neither approves nor starts Project work. In the
 Pi supervisor, use `spike_create_request`, `spike_list_requests`, and

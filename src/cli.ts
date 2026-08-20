@@ -753,7 +753,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "request" && args[1] === "list") {
       const requests = await listRequests(parseRequestList(args.slice(2)));
-      const human = requests.map((request) => `${request.metadata.requestId} ${request.state} ${request.metadata.projects.join(",") || "unassigned"}`).join("\n");
+      const human = requests.map((request) => `${request.metadata.requestId} ${request.title} ${request.state} ${request.metadata.projects.join(",") || "unassigned"}`).join("\n");
       return success(json, "request list", requests, human ? `${human}\n` : "");
     }
 
