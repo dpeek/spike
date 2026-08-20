@@ -79,14 +79,8 @@ export async function applyGoalIntegration(input: ApplyGoalIntegrationInput): Pr
     refuse(`target ${input.targetBranch} cannot fast-forward to Goal ${input.goalId} integrated revision`);
   }
 
-  // Recheck the rebuildable ref immediately before mutation. Hooks are disabled
-  // command-scoped so repository-controlled post-merge code cannot run.
-  const immediatelyVerifiedRevision = await git(repository.root, ["rev-parse", "--verify", `${ref}^{commit}`]);
-  if (immediatelyVerifiedRevision !== appliedRevision) {
-    refuse(`Goal ${input.goalId} integration ref changed during verification; run recovery`);
-  }
   try {
-    await git(repository.root, ["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--no-verify", appliedRevision]);
+    await git(repository.root, ["merge", "--ff-only", appliedRevision]);
   } catch {
     throw new Error(`apply failed: target ${input.targetBranch} could not be fast-forwarded to the verified integrated revision`);
   }

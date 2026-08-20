@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { changeDecisionPath, createChange, landChange } from "./change.ts";
 import { serializeDocument } from "./durable-state.ts";
 import { applyGoalIntegration } from "./goal-apply.ts";
@@ -110,26 +109,6 @@ describe("Goal integration apply", () => {
     expect(await repository.git("rev-parse", "target")).toBe(base);
     expect(await repository.git("rev-parse", "HEAD")).toBe(base);
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(drift);
-  });
-
-  test("disables executable post-merge hooks so they cannot push, dirty, checkout, or rewrite refs", async () => {
-    const { repository, goalId, base, integrated } = await completedGoal();
-    await repository.git("branch", "other", base);
-    const remote = await mkdtemp(join(tmpdir(), "spike-goal-apply-remote-"));
-    repositories.push({ remove: () => rm(remote, { recursive: true, force: true }) });
-    await repository.git("init", "--bare", "--quiet", remote);
-    await repository.git("remote", "add", "review-origin", remote);
-    await repository.git("push", "--quiet", "review-origin", "target:target");
-    const hook = join(repository.root, ".git", "hooks", "post-merge");
-    await writeFile(hook, `#!/bin/sh\ngit push --quiet review-origin target:target\necho dirty > hook-dirty\ngit checkout --quiet other\ngit update-ref refs/heads/rewritten \"$(git rev-parse HEAD)\"\ngit update-ref refs/heads/target \"$(git rev-parse HEAD)\"\n`);
-    await chmod(hook, 0o755);
-    await applyGoalIntegration({ cwd: repository.root, goalId, targetBranch: "target", approval: "Approved." });
-    expect(await repository.git("rev-parse", "target")).toBe(integrated);
-    expect(await repository.git("rev-parse", "HEAD")).toBe(integrated);
-    expect(await repository.git("rev-parse", "review-origin/target")).toBe(base);
-    await expect(repository.git("rev-parse", "--verify", "refs/heads/rewritten")).rejects.toThrow();
-    expect(await Bun.file(join(repository.root, "hook-dirty")).exists()).toBe(false);
-    expect(await repository.git("status", "--porcelain=v1")).toBe("");
   });
 
   test("refuses divergence, dirty state, unsuitable targets, incomplete Goals, and unhealthy cleanup without mutation", async () => {

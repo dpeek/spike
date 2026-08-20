@@ -241,16 +241,12 @@ fast-forward. A refusal changes no target ref or worktree state through Spike's
 apply logic and JSON reports a machine-readable `workflow` error with the
 refusal reason.
 
-On success, the single mutation performed by Spike's apply logic is Git's
-verified `--ff-only` fast-forward. The JSON data contains `goalId`,
-`targetBranch`, `previousTargetRevision`, `appliedRevision`, and
-`resultingTargetRevision`; the latter two are the exact Goal integration commit.
-Spike never invokes `git push` or another remote-mutating command, and never
-checks out branches, creates merge commits, rebases, cherry-picks, force-updates,
-or resolves conflicts. This contract does not defend against arbitrary commands
-an operator deliberately configures Git to execute (for example hooks,
-`core.fsmonitor`, or filters); their side effects are outside Spike's apply
-logic and this local-apply safety boundary.
+On success, Spike's only mutation command is Git's local, verified
+`merge --ff-only`. The JSON data contains `goalId`, `targetBranch`,
+`previousTargetRevision`, `appliedRevision`, and `resultingTargetRevision`; the
+latter two are the exact Goal integration commit. Goal apply does not invoke
+`git push`, check out branches, create merge commits, rebase, cherry-pick,
+force-update, or resolve conflicts.
 
 JSON mode emits exactly one `{ ok, command, data }` success object or one
 `{ ok, command, error }` failure object.
