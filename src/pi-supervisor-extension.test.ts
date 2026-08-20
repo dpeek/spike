@@ -32,6 +32,10 @@ if (process.env.FAKE_SPIKE_RESPONSE) {
   process.stdout.write(process.env.FAKE_SPIKE_RESPONSE);
   process.exit(Number(process.env.FAKE_SPIKE_EXIT || 0));
 }
+if (args[0] === "goal" && args[1] === "create" && process.env.FAKE_SPIKE_GOAL_RESPONSE) {
+  process.stdout.write(process.env.FAKE_SPIKE_GOAL_RESPONSE);
+  process.exit(Number(process.env.FAKE_SPIKE_GOAL_EXIT || 0));
+}
 const command = args[0] === "status" || args[0] === "recover" ? args[0] : args.slice(0, 2).join(" ");
 console.log(JSON.stringify({ ok: true, command, data: { arguments: args.slice(0, -1) } }));
 process.exit(29);
@@ -442,6 +446,111 @@ describe("Pi supervisor extension", () => {
       body: "# Restarted\n",
     }, undefined, undefined, context)).rejects.toThrow("Call spike_begin_step for plan on goal-1");
     expect(calls.at(-1)!.args).toEqual(["status"]);
+  });
+
+  test("forwards Request commands and stdin without consuming Goal guidance", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    registerSupervisorExtension({
+      registerTool(tool) { tools.push(tool); },
+      on() {},
+      sendMessage() {},
+    }, {
+      async invoke(input) {
+        calls.push(input);
+        if (input.expectedCommand === "guidance show") {
+          return { ok: true, command: "guidance show", data: { step: "goal", path: "spike/guidance/goal.md", sourceRevision: "a".repeat(40), markdown: "# Goal" } };
+        }
+        if (input.expectedCommand === "request list") {
+          return { ok: true, command: "request list", data: [{ metadata: { requestId: "request-001", projects: ["spike"] }, state: "open" }] };
+        }
+        if (input.expectedCommand.startsWith("request")) {
+          return { ok: true, command: input.expectedCommand, data: { metadata: { requestId: "request-001", projects: [] }, state: "open" } };
+        }
+        return { ok: true, command: "goal create", data: { goal: { goalId: "spike-001" } } };
+      },
+    });
+    const registered = new Map(tools.map((tool) => [tool.name, tool]));
+    const context = { cwd: "/project" };
+
+    await registered.get("spike_begin_step")!.execute("call", { step: "goal" }, undefined, undefined, context);
+    const created = await registered.get("spike_create_request")!.execute("call", {
+      title: "Future work", body: "Capture this without approval.", projectSlugs: ["spike", "other-project"],
+    }, undefined, undefined, context);
+    const listed = await registered.get("spike_list_requests")!.execute("call", {
+      projectSlug: "spike", closed: true,
+    }, undefined, undefined, context);
+    await registered.get("spike_show_request")!.execute("call", { requestId: "request-001" }, undefined, undefined, context);
+    await registered.get("spike_create_goal")!.execute("call", {
+      title: "Approved", outcome: "Use selected intake.", approval: "Approved.", sourceRequestIds: ["request-001", "request-002"],
+    }, undefined, undefined, context);
+
+    expect(calls.map((call) => call.args)).toEqual([
+      ["guidance", "show", "--step", "goal"],
+      ["request", "create", "--title", "Future work", "--statement", "Capture this without approval.", "--project", "spike", "--project", "other-project"],
+      ["request", "list", "--project", "spike", "--closed"],
+      ["request", "show", "--request", "request-001"],
+      ["goal", "create", "--title", "Approved", "--outcome", "Use selected intake.", "--approval", "Approved.", "--request", "request-001", "--request", "request-002"],
+    ]);
+    expect(calls[1]!.stdin).toBe("Capture this without approval.");
+    expect(renderSupervisorResponse(created.details, false)).toBe("Created Request request-001 · open · unassigned");
+    expect(renderSupervisorResponse(listed.details, false)).toBe("Inbox 1 Request\nrequest-001 · open · spike");
+
+    const fake = await fakeSpike();
+    const fakeTools = registeredTools(fake.executable, { ...process.env, FAKE_SPIKE_CALLS: fake.calls });
+    await fakeTools.get("spike_create_request")!.execute("call", {
+      title: "Future work", body: "Read from stdin.", projectSlugs: ["spike"],
+    }, undefined, undefined, { cwd: fake.directory });
+    await fakeTools.get("spike_list_requests")!.execute("call", { unassigned: true, closed: true }, undefined, undefined, { cwd: fake.directory });
+    await fakeTools.get("spike_show_request")!.execute("call", { requestId: "request-001" }, undefined, undefined, { cwd: fake.directory });
+    const fakeCalls = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(fakeCalls.map(({ args, stdin }) => ({ args, stdin }))).toEqual([
+      { args: ["request", "create", "--title", "Future work", "--statement", "Read from stdin.", "--project", "spike", "--json"], stdin: "Read from stdin." },
+      { args: ["request", "list", "--unassigned", "--closed", "--json"], stdin: "" },
+      { args: ["request", "show", "--request", "request-001", "--json"], stdin: "" },
+    ]);
+  });
+
+  test("propagates sourced Goal refusal and consumes its selected guidance", async () => {
+    const fake = await fakeSpike();
+    const tools = registeredTools(fake.executable, {
+      ...process.env,
+      FAKE_SPIKE_CALLS: fake.calls,
+      FAKE_SPIKE_GOAL_RESPONSE: JSON.stringify({
+        ok: false,
+        command: "goal create",
+        error: { code: "approval", message: "the approval statement was rejected" },
+      }) + "\n",
+    });
+    const context = { cwd: fake.directory };
+    const params = {
+      title: "Approved source intake",
+      outcome: "Retain the selected Requests.",
+      approval: "Operator approves this exact Goal.",
+      sourceRequestIds: ["request-001", "request-002"],
+    };
+
+    await tools.get("spike_begin_step")!.execute("call", { step: "goal" }, undefined, undefined, context);
+    await expect(tools.get("spike_create_goal")!.execute("call", params, undefined, undefined, context))
+      .rejects.toThrow("Spike rejected goal create: the approval statement was rejected");
+
+    const calls = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(calls.map(({ args, stdin }) => ({ args, stdin }))).toEqual([
+      { args: ["guidance", "show", "--step", "goal", "--json"], stdin: "" },
+      {
+        args: [
+          "goal", "create", "--title", "Approved source intake", "--outcome", "Retain the selected Requests.",
+          "--approval", "Operator approves this exact Goal.", "--request", "request-001", "--request", "request-002", "--json",
+        ],
+        stdin: "",
+      },
+    ]);
+    expect(calls[1]!.args.filter((arg: string) => arg === "request-001")).toHaveLength(1);
+    expect(calls[1]!.args.filter((arg: string) => arg === "request-002")).toHaveLength(1);
+
+    await expect(tools.get("spike_create_goal")!.execute("call", params, undefined, undefined, context))
+      .rejects.toThrow("Call spike_begin_step for goal before this mutation");
+    expect((await readFile(fake.calls, "utf8")).trim().split("\n")).toHaveLength(2);
   });
 
   test("trusts only Spike's parsed envelope, not process status, and rejects malformed or failed envelopes", async () => {

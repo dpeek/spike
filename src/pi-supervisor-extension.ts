@@ -83,6 +83,9 @@ export const supervisorToolNames = [
   "spike_status",
   "spike_apply_goal",
   "spike_create_goal",
+  "spike_create_request",
+  "spike_list_requests",
+  "spike_show_request",
   "spike_revise_plan",
   "spike_create_change",
   "spike_decide_change",
@@ -102,6 +105,10 @@ const requiredNonBlankString = { type: "string", minLength: 1, pattern: "\\S" } 
 const optionalIdentity = { type: "string", minLength: 1 } as const;
 const thinking = { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh"] } as const;
 const plannerSteps = ["goal", "plan", "change", "implement", "review", "remediate", "decide", "recover"] as const;
+const requestId = { type: "string", pattern: "^request-(?!0+$)[0-9]{3,}$", maxLength: 64 } as const;
+const projectSlug = { type: "string", pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", minLength: 1, maxLength: 63 } as const;
+const requestTitle = { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" } as const;
+const requestBody = { type: "string", minLength: 1, maxLength: 20000, pattern: "\\S" } as const;
 
 function object(value: unknown): any {
   return typeof value === "object" && value !== null ? value : undefined;
@@ -244,6 +251,27 @@ function commandSummary(response: SpikeJsonSuccess): string {
     case "guidance show": return `Loaded ${string(data?.step) ?? "workflow"} guidance`;
     case "goal apply": return `Applied Goal ${string(data?.goalId) ?? "unknown"} to ${string(data?.targetBranch) ?? "unknown"}`;
     case "goal create": return `Created Goal ${identity(object(data?.goal)) ?? "unknown"}`;
+    case "request create":
+    case "request show": {
+      const request = object(data);
+      const id = string(request?.metadata && object(request.metadata)?.requestId) ?? "unknown";
+      const state = string(request?.state) ?? "unknown";
+      const projects = Array.isArray(object(request?.metadata)?.projects) ? object(request?.metadata)?.projects : [];
+      const affinity = projects.filter((project: unknown): project is string => typeof project === "string").join(", ") || "unassigned";
+      return `${response.command === "request create" ? "Created" : "Request"} Request ${id} · ${state} · ${affinity}`;
+    }
+    case "request list": {
+      const requests = Array.isArray(response.data) ? response.data : [];
+      if (requests.length === 0) return "Inbox empty";
+      return [`Inbox ${requests.length} Request${requests.length === 1 ? "" : "s"}`, ...requests.map((value) => {
+        const request = object(value);
+        const id = string(object(request?.metadata)?.requestId) ?? "unknown";
+        const state = string(request?.state) ?? "unknown";
+        const projects = Array.isArray(object(request?.metadata)?.projects) ? object(request?.metadata)?.projects : [];
+        const affinity = projects.filter((project: unknown): project is string => typeof project === "string").join(", ") || "unassigned";
+        return `${id} · ${state} · ${affinity}`;
+      })].join("\n");
+    }
     case "plan revise": return `Revised Plan ${identity(object(data?.metadata)) ?? "unknown"}`;
     case "change create": return `Created Change ${identity(object(data?.change)) ?? "unknown"}`;
     case "change land":
@@ -715,6 +743,7 @@ export function registerSupervisorExtension(
           outcome: nonBlankString,
           approval: { type: "string", minLength: 1, description: "The operator's explicit approval statement." },
           constraints: { type: "array", items: nonBlankString },
+          sourceRequestIds: { type: "array", maxItems: 100, uniqueItems: true, items: requestId },
           repositoryIdentity: nonBlankString,
         },
       },
@@ -722,10 +751,71 @@ export function registerSupervisorExtension(
       args(params) {
         const args = ["goal", "create", "--title", params.title, "--outcome", params.outcome, "--approval", params.approval];
         repeated(args, "--constraint", params.constraints);
+        repeated(args, "--request", params.sourceRequestIds);
         optional(args, "--repository-id", params.repositoryIdentity);
         return args;
       },
       beforeInvoke: (params) => requireStep("goal", params),
+    }, invoke, options),
+    tool({
+      name: "spike_create_request",
+      label: "Capture Request",
+      description: "Capture unapproved future work in the host-local Request inbox. Capturing a Request does not approve or start work.",
+      promptSnippet: "Capture unapproved future work without changing workflow state",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["title", "body"],
+        properties: {
+          title: requestTitle,
+          body: requestBody,
+          projectSlugs: { type: "array", maxItems: 20, uniqueItems: true, items: projectSlug },
+        },
+      },
+      command: "request create",
+      args(params) {
+        const args = ["request", "create", "--title", params.title, "--statement", params.body];
+        repeated(args, "--project", params.projectSlugs);
+        return args;
+      },
+      stdin: (params) => params.body,
+    }, invoke, options),
+    tool({
+      name: "spike_list_requests",
+      label: "Request Inbox",
+      description: "List host-local Requests. The Inbox shows open Requests by default.",
+      promptSnippet: "Inspect unapproved Request inbox without changing workflow state",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          projectSlug,
+          unassigned: { type: "boolean" },
+          closed: { type: "boolean" },
+        },
+      },
+      command: "request list",
+      args(params) {
+        const args = ["request", "list"];
+        optional(args, "--project", params.projectSlug);
+        if (params.unassigned === true) args.push("--unassigned");
+        if (params.closed === true) args.push("--closed");
+        return args;
+      },
+    }, invoke, options),
+    tool({
+      name: "spike_show_request",
+      label: "Show Request",
+      description: "Show one host-local Request without approving, closing, or starting work.",
+      promptSnippet: "Inspect one unapproved Request without changing workflow state",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["requestId"],
+        properties: { requestId },
+      },
+      command: "request show",
+      args: (params) => ["request", "show", "--request", params.requestId],
     }, invoke, options),
     tool({
       name: "spike_revise_plan",

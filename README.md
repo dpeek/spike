@@ -87,7 +87,13 @@ spike request close --request request-001 --disposition declined --statement "No
 
 `list` shows open Requests by default; use `--closed` or `--unassigned` to filter.
 Closures are immutable and use one of `addressed`, `declined`, or `withdrawn`.
-Capturing or closing a Request neither approves nor starts Project work.
+Capturing or selecting a Request neither approves nor starts Project work. In the
+Pi supervisor, use `spike_create_request`, `spike_list_requests`, and
+`spike_show_request` to capture and inspect this intake; the Inbox is the
+open-Request view. During explicitly approved Goal creation,
+`spike_create_goal` can cite selected source Request IDs. Approval approves the
+Goal's outcome and constraints only: an approved Goal may remain queued without
+an active Change.
 
 `--model` and `--thinking` are optional one-Ticket overrides. Without them, the
 Ticket uses its role's `implement` or `review` selection from `spike.json`.
