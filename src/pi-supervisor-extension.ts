@@ -12,6 +12,16 @@ type ToolResult = {
   details: SpikeJsonSuccess;
 };
 
+type RenderComponent = {
+  render: (width: number) => string[];
+  invalidate: () => void;
+};
+
+type ToolRenderResult = {
+  content: Array<{ type: string; text?: string }>;
+  details?: SpikeJsonSuccess;
+};
+
 type ToolContext = { cwd: string };
 type TicketIdentity = { goalId: string; changeId: string; ticketId: string };
 type PlannerStep = "goal" | "plan" | "change" | "implement" | "review" | "remediate" | "decide" | "recover";
@@ -31,6 +41,12 @@ type ToolDefinition = {
     onUpdate: unknown,
     context: ToolContext,
   ) => Promise<ToolResult>;
+  renderResult: (
+    result: ToolRenderResult,
+    options: { expanded: boolean; isPartial: boolean },
+    theme: unknown,
+    context: unknown,
+  ) => RenderComponent;
 };
 
 export type SupervisorExtensionApi = {
@@ -86,6 +102,236 @@ const requiredNonBlankString = { type: "string", minLength: 1, pattern: "\\S" } 
 const optionalIdentity = { type: "string", minLength: 1 } as const;
 const thinking = { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh"] } as const;
 const plannerSteps = ["goal", "plan", "change", "implement", "review", "remediate", "decide", "recover"] as const;
+
+function object(value: unknown): any {
+  return typeof value === "object" && value !== null ? value : undefined;
+}
+
+function string(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function identity(value: unknown): string | undefined {
+  const record = object(value);
+  const parts = [record?.goalId, record?.changeId, record?.ticketId];
+  return parts.every((part) => typeof part === "string")
+    ? (parts as string[]).join("/")
+    : parts.slice(0, 2).every((part) => typeof part === "string")
+      ? (parts.slice(0, 2) as string[]).join("/")
+      : typeof parts[0] === "string" ? parts[0] : undefined;
+}
+
+function shortRevision(value: unknown): string {
+  const revision = string(value);
+  return revision === undefined ? "none" : revision.slice(0, 10);
+}
+
+function findingSummary(findings: unknown): string | undefined {
+  const severities = ["critical", "high", "medium", "low"] as const;
+  const counts = Object.fromEntries(severities.map((severity) => [severity, 0])) as Record<typeof severities[number], number>;
+  if (Array.isArray(findings)) {
+    for (const finding of findings) {
+      const severity = string(object(finding)?.severity);
+      if (severity !== undefined && severity in counts) counts[severity as keyof typeof counts] += 1;
+    }
+  } else {
+    const recorded = object(findings);
+    if (recorded === undefined) return undefined;
+    for (const severity of severities) {
+      if (typeof recorded[severity] === "number") counts[severity] = recorded[severity];
+    }
+  }
+  const total = severities.reduce((sum, severity) => sum + counts[severity], 0);
+  if (total === 0) return "no findings";
+  const breakdown = severities.filter((severity) => counts[severity] > 0)
+    .map((severity) => `${counts[severity]} ${severity}`)
+    .join(", ");
+  return `${total} finding${total === 1 ? "" : "s"} (${breakdown})`;
+}
+
+function goalStatusLines(value: unknown): string[] {
+  const goal = object(value);
+  if (goal === undefined) return ["Invalid Goal status"];
+  const goalId = string(goal.goalId) ?? "unknown Goal";
+  const cleanup = object(goal.cleanup);
+  const cleanupText = cleanup?.healthy === true
+    ? "cleanup healthy"
+    : `${Array.isArray(cleanup?.warnings) ? cleanup.warnings.length : "?"} cleanup warning(s)`;
+  const change = object(goal.currentChange);
+  if (change === undefined) {
+    const decisions = Array.isArray(goal.decisions) ? goal.decisions.length : 0;
+    return [`Goal ${goalId}`, `No active Change · ${decisions} resolved · ${cleanupText}`];
+  }
+
+  const lines = [`Goal ${goalId} · Change ${string(change.changeId) ?? "unknown"}`];
+  const openTicket = object(change.openTicket);
+  lines.push(openTicket === undefined
+    ? "Open Ticket none"
+    : `Open Ticket ${string(openTicket.ticketId) ?? "unknown"} (${string(openTicket.role) ?? "unknown"})`);
+  const candidate = object(change.candidate);
+  lines.push(candidate === undefined
+    ? "Candidate none"
+    : `Candidate ${shortRevision(candidate.revision)} (Ticket ${string(candidate.producingImplementationTicketId) ?? "unknown"})`);
+  const review = object(change.review);
+  if (review !== undefined) {
+    const findings = findingSummary(review.findingCounts);
+    lines.push(`Review ${string(review.verdict) ?? "unknown"} (Ticket ${string(review.ticketId) ?? "unknown"})${findings === undefined ? "" : ` · ${findings}`}`);
+  } else {
+    const latest = object(change.latestReport);
+    lines.push(latest === undefined
+      ? "Latest Report none"
+      : `Latest Report ${string(latest.ticketId) ?? "unknown"} ${string(latest.outcome) ?? "unknown"}`);
+  }
+  const churn = Array.isArray(change.churnWarnings) ? change.churnWarnings.length : 0;
+  if (churn > 0) lines.push(`${churn} churn warning(s)`);
+  lines.push(cleanupText);
+  return lines;
+}
+
+function statusText(data: unknown): string {
+  const status = object(data);
+  if (status === undefined) return "Invalid Spike status";
+  if (typeof status.goalId === "string") return goalStatusLines(status).join("\n");
+  const project = object(status.project);
+  const goals = Array.isArray(status.goals) ? status.goals : [];
+  const lines = [`Project ${string(project?.slug) ?? "unknown"}`];
+  if (goals.length === 0) lines.push("No Goals");
+  for (const goal of goals) lines.push(...goalStatusLines(goal));
+  const cleanup = object(status.cleanup);
+  if (cleanup?.healthy === false) {
+    lines.push(`${Array.isArray(cleanup.warnings) ? cleanup.warnings.length : "?"} repository cleanup warning(s)`);
+  }
+  return lines.join("\n");
+}
+
+function readableLabel(value: string): string {
+  const spaced = value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replaceAll("_", " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+function readableLines(value: unknown, indent = ""): string[] {
+  if (value === null) return [`${indent}none`];
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [`${indent}none`];
+    return value.flatMap((item) => {
+      const lines = readableLines(item, `${indent}  `);
+      return [`${indent}- ${lines[0]!.slice(indent.length + 2)}`, ...lines.slice(1)];
+    });
+  }
+  const record = object(value);
+  if (record !== undefined) {
+    const entries = Object.entries(record);
+    if (entries.length === 0) return [`${indent}none`];
+    return entries.flatMap(([key, item]) => {
+      const label = readableLabel(key);
+      if (item !== null && typeof item === "object") {
+        return [`${indent}${label}:`, ...readableLines(item, `${indent}  `)];
+      }
+      const itemText = String(item);
+      if (itemText.includes("\n")) {
+        return [`${indent}${label}:`, ...itemText.replace(/\n$/, "").split("\n").map((line) => `${indent}  ${line}`)];
+      }
+      return [`${indent}${label}: ${itemText}`];
+    });
+  }
+  return [`${indent}${String(value)}`];
+}
+
+function commandSummary(response: SpikeJsonSuccess): string {
+  const data = object(response.data);
+  switch (response.command) {
+    case "status": return statusText(response.data);
+    case "guidance show": return `Loaded ${string(data?.step) ?? "workflow"} guidance`;
+    case "goal apply": return `Applied Goal ${string(data?.goalId) ?? "unknown"} to ${string(data?.targetBranch) ?? "unknown"}`;
+    case "goal create": return `Created Goal ${identity(object(data?.goal)) ?? "unknown"}`;
+    case "plan revise": return `Revised Plan ${identity(object(data?.metadata)) ?? "unknown"}`;
+    case "change create": return `Created Change ${identity(object(data?.change)) ?? "unknown"}`;
+    case "change land":
+    case "change reject":
+    case "change abandon":
+      return `${readableLabel(response.command.split(" ")[1]!)}ed Change ${identity(data) ?? "unknown"}`;
+    case "ticket issue": {
+      const ticket = object(data?.ticket);
+      const role = string(ticket?.role);
+      return `Issued${role === undefined ? "" : ` ${readableLabel(role)}`} Ticket ${identity(ticket) ?? "unknown"}`;
+    }
+    case "ticket dispatch-pi":
+      return `Dispatched Ticket ${identity(data?.ticket) ?? "unknown"} · ${string(data?.status) ?? string(data?.classification) ?? "started"}`;
+    case "worker status":
+      return `Worker ${identity(data?.ticket) ?? "unknown"} · ${string(data?.status) ?? "unknown"}`;
+    case "worker read": return `Read worker terminal ${identity(data?.ticket) ?? "unknown"}`;
+    case "report publish": {
+      const report = object(data?.report);
+      const outcome = string(report?.outcome) ?? "unknown";
+      const verdict = string(report?.verdict);
+      const candidate = report?.candidateRevision;
+      const findings = findingSummary(report?.findings);
+      const suffix = verdict !== undefined
+        ? ` · ${verdict}${findings === undefined ? "" : ` · ${findings}`}`
+        : candidate !== undefined ? ` · Candidate ${shortRevision(candidate)}` : "";
+      return `Published ${outcome} Report ${identity(report) ?? "unknown"}${suffix}`;
+    }
+    case "recover": return "Reconciled Spike workflow state";
+    default: return readableLabel(response.command);
+  }
+}
+
+export function renderSupervisorResponse(response: SpikeJsonSuccess, expanded: boolean): string {
+  const summary = commandSummary(response);
+  if (response.command === "status") return summary;
+  const data = object(response.data);
+  if (response.command === "guidance show" && expanded) {
+    const markdown = string(data?.markdown) ?? "";
+    return `${summary}\n${string(data?.path) ?? ""}\nSource ${shortRevision(data?.sourceRevision)}\n\n${markdown}`.trimEnd();
+  }
+  if (response.command === "plan revise" && expanded && typeof data?.body === "string") {
+    return `${summary}\n\n${data.body}`.trimEnd();
+  }
+  if (response.command === "worker read" && expanded && typeof data?.terminal === "string") {
+    return `${summary}\n\n${data.terminal}`.trimEnd();
+  }
+  return expanded ? `${summary}\n\n${readableLines(response.data).join("\n")}` : summary;
+}
+
+function wrapLine(line: string, width: number): string[] {
+  const characters = Array.from(line);
+  if (characters.length <= width) return [line];
+  const lines: string[] = [];
+  let remaining = characters;
+  while (remaining.length > width) {
+    let cut = width;
+    for (let index = width; index > Math.floor(width / 2); index--) {
+      if (/\s/.test(remaining[index - 1] ?? "")) {
+        cut = index;
+        break;
+      }
+    }
+    lines.push(remaining.slice(0, cut).join("").trimEnd());
+    remaining = remaining.slice(cut);
+    while (/\s/.test(remaining[0] ?? "")) remaining = remaining.slice(1);
+  }
+  lines.push(remaining.join(""));
+  return lines;
+}
+
+function textComponent(text: string): RenderComponent {
+  return {
+    render(width) {
+      const available = Math.max(1, width);
+      return text.split("\n").flatMap((line) => wrapLine(line, available));
+    },
+    invalidate() {},
+  };
+}
+
+function renderToolResult(result: ToolRenderResult, options: { expanded: boolean; isPartial: boolean }): RenderComponent {
+  if (options.isPartial) return textComponent("Working…");
+  if (result.details?.ok === true) {
+    return textComponent(renderSupervisorResponse(result.details, options.expanded));
+  }
+  const fallback = result.content.find((content) => content.type === "text")?.text ?? "Spike tool completed";
+  return textComponent(fallback);
+}
 
 function parseResponse(stdout: string, expectedCommand: string): SpikeJsonSuccess | SpikeJsonFailure {
   let value: unknown;
@@ -196,7 +442,7 @@ function repeated(args: string[], option: string, values: string[] | undefined):
 }
 
 function tool(
-  definition: Omit<ToolDefinition, "executionMode" | "execute"> & {
+  definition: Omit<ToolDefinition, "executionMode" | "execute" | "renderResult"> & {
     command: string | ((params: any) => string);
     args: (params: any) => string[];
     stdin?: (params: any) => string | undefined;
@@ -214,6 +460,7 @@ function tool(
     ...(definition.promptGuidelines === undefined ? {} : { promptGuidelines: definition.promptGuidelines }),
     parameters: definition.parameters,
     executionMode: "sequential",
+    renderResult: (result, renderOptions) => renderToolResult(result, renderOptions),
     async execute(_toolCallId, params, signal, _onUpdate, context) {
       definition.beforeInvoke?.(params, context);
       const stdin = definition.stdin?.(params);

@@ -40,6 +40,12 @@ export type DerivedChangeStatus = {
     verdict: "remediate" | "approve" | "reject" | "ask-operator";
     reviewedRevision: string;
     producingImplementationTicketId: string;
+    findingCounts: {
+      critical: number;
+      high: number;
+      medium: number;
+      low: number;
+    };
   };
   openTicket: null | {
     ticketId: string;
@@ -144,6 +150,12 @@ async function deriveActiveChangeStatus(
             verdict: review.reviewReport.metadata.verdict,
             reviewedRevision: review.reviewReport.metadata.reviewedRevision,
             producingImplementationTicketId: review.producingImplementationTicketId,
+            findingCounts: {
+              critical: review.reviewReport.metadata.findings.filter((finding) => finding.severity === "critical").length,
+              high: review.reviewReport.metadata.findings.filter((finding) => finding.severity === "high").length,
+              medium: review.reviewReport.metadata.findings.filter((finding) => finding.severity === "medium").length,
+              low: review.reviewReport.metadata.findings.filter((finding) => finding.severity === "low").length,
+            },
           },
     openTicket:
       openTicket === undefined

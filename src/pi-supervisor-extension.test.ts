@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   registerSupervisorExtension,
+  renderSupervisorResponse,
   runSpikeJson,
   supervisorToolNames,
   type RunSpikeJsonInput,
@@ -60,6 +61,98 @@ function deferred<T>() {
 }
 
 describe("Pi supervisor extension", () => {
+  test("renders operator-readable workflow progress without changing model-visible JSON", async () => {
+    const status: SpikeJsonSuccess = {
+      ok: true,
+      command: "status",
+      data: {
+        project: { slug: "example" },
+        goals: [{
+          goalId: "example-001",
+          currentChange: {
+            changeId: "002",
+            openTicket: { ticketId: "003", role: "review" },
+            candidate: { revision: "a".repeat(40), producingImplementationTicketId: "001" },
+            review: {
+              ticketId: "004",
+              verdict: "remediate",
+              findingCounts: { critical: 0, high: 1, medium: 1, low: 0 },
+            },
+            latestReport: { ticketId: "004", outcome: "completed" },
+            churnWarnings: [],
+          },
+          decisions: [{ changeId: "001", disposition: "land" }],
+          cleanup: { healthy: true, warnings: [] },
+        }],
+        cleanup: { healthy: true, warnings: [] },
+      },
+    };
+    expect(renderSupervisorResponse(status, false)).toBe(
+      "Project example\n" +
+      "Goal example-001 · Change 002\n" +
+      "Open Ticket 003 (review)\n" +
+      "Candidate aaaaaaaaaa (Ticket 001)\n" +
+      "Review remediate (Ticket 004) · 2 findings (1 high, 1 medium)\n" +
+      "cleanup healthy",
+    );
+
+    const review: SpikeJsonSuccess = {
+      ok: true,
+      command: "report publish",
+      data: {
+        report: {
+          goalId: "example-001",
+          changeId: "002",
+          ticketId: "004",
+          outcome: "completed",
+          verdict: "remediate",
+          findings: [
+            { id: "F-1", severity: "high", statement: "Fix it." },
+            { id: "F-2", severity: "medium", statement: "Check it." },
+          ],
+        },
+      },
+    };
+    expect(renderSupervisorResponse(review, false)).toBe(
+      "Published completed Report example-001/002/004 · remediate · 2 findings (1 high, 1 medium)",
+    );
+
+    const guidance: SpikeJsonSuccess = {
+      ok: true,
+      command: "guidance show",
+      data: {
+        step: "review",
+        path: "spike/guidance/review.md",
+        sourceRevision: "b".repeat(40),
+        markdown: "# Review\n\n- Assess every criterion.\n",
+      },
+    };
+    expect(renderSupervisorResponse(guidance, true)).toBe(
+      "Loaded review guidance\n" +
+      "spike/guidance/review.md\n" +
+      "Source bbbbbbbbbb\n\n" +
+      "# Review\n\n" +
+      "- Assess every criterion.",
+    );
+
+    const fake = await fakeSpike();
+    const tools = registeredTools(fake.executable, {
+      ...process.env,
+      FAKE_SPIKE_CALLS: fake.calls,
+      FAKE_SPIKE_RESPONSE: JSON.stringify(status),
+    });
+    const result = await tools.get("spike_status")!.execute("call", {}, undefined, undefined, { cwd: fake.directory });
+    expect(JSON.parse(result.content[0]!.text)).toEqual(status);
+    const rendered = tools.get("spike_status")!.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      undefined,
+    ).render(30);
+    expect(rendered.join(" ").replace(/\s+/g, " ")).toContain("2 findings (1 high, 1 medium)");
+    expect(rendered.every((line) => Array.from(line).length <= 30)).toBe(true);
+  });
+
   test("wakes the planner once with an operational recheck for a marker-backed open Ticket", async () => {
     const goalId = "goal-1";
     const identity = { goalId, changeId: "001", ticketId: "003" };
