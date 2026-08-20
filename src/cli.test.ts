@@ -341,4 +341,43 @@ describe("spike CLI", () => {
       data: { goals: [{ goalId, cleanupWarnings: [] }], ignoredUnpublishedGoalIds: [] },
     });
   });
+
+  test("creates zero-source Goals through CLI JSON without Request-store configuration", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const env = { ...process.env, SPIKE_DATA_DIR: "", XDG_DATA_HOME: "/dev/null/spike-request-store", HOME: "/dev/null/spike-home" };
+
+    const created = await spikeAt(repository.root, ["goal", "create", "--title", "No requests", "--outcome", "Preserve old path.", "--approval", "Approved.", "--json"], undefined, env);
+    expect(created.exitCode).toBe(0);
+    expect(JSON.parse(created.stdout)).toMatchObject({ ok: true, command: "goal create", data: { goal: { goalId: "spike-001" } } });
+    expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-001", "goal.md")).exists()).toBe(true);
+    expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-001", "plan.md")).exists()).toBe(true);
+
+    const refused = await spikeAt(repository.root, ["goal", "create", "--title", "With request", "--outcome", "Validate request root.", "--approval", "Approved.", "--request", "request-001", "--json"], undefined, env);
+    expect(refused.exitCode).toBe(1);
+    expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, command: "goal create", error: { code: "workflow", message: "SPIKE_DATA_DIR must not be blank" } });
+    expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-002", "goal.md")).exists()).toBe(false);
+    expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-002", "plan.md")).exists()).toBe(false);
+  });
+
+  test("creates cited Goals through CLI JSON and refuses duplicate source IDs without mutations", async () => {
+    const repository = await temporaryRepository();
+    repositories.push(repository);
+    const dataRoot = await mkdtemp(join(tmpdir(), "spike-goal-cli-data-"));
+    try {
+      const env = { ...process.env, SPIKE_DATA_DIR: dataRoot };
+      const request = await spikeAt(repository.root, ["request", "create", "--title", "Source", "--statement", "Future work.", "--project", "spike", "--json"], undefined, env);
+      const requestId = JSON.parse(request.stdout).data.metadata.requestId;
+      const requestFile = await readFile(join(dataRoot, "requests", requestId, "request.md"), "utf8");
+      const created = await spikeAt(repository.root, ["goal", "create", "--title", "Cite", "--outcome", "Keep provenance.", "--approval", "Approved.", "--request", requestId, "--json"], undefined, env);
+      expect(JSON.parse(created.stdout)).toMatchObject({ ok: true, command: "goal create", data: { goal: { goalId: "spike-001" } } });
+      expect(await readFile(join(repository.root, ".spike", "goals", "spike-001", "goal.md"), "utf8")).toContain(`## Source Requests\n\n- ${requestId}`);
+      const refused = await spikeAt(repository.root, ["goal", "create", "--title", "Duplicate", "--outcome", "Refuse.", "--approval", "Approved.", "--request", requestId, "--request", requestId, "--json"], undefined, env);
+      expect(refused.exitCode).toBe(1);
+      expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, command: "goal create", error: { code: "workflow", message: `duplicate Source Request ID: ${requestId}` } });
+      expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-002", "goal.md")).exists()).toBe(false);
+      expect(await Bun.file(join(repository.root, ".spike", "goals", "spike-002", "plan.md")).exists()).toBe(false);
+      expect(await readFile(join(dataRoot, "requests", requestId, "request.md"), "utf8")).toBe(requestFile);
+    } finally { await rm(dataRoot, { recursive: true, force: true }); }
+  });
 });

@@ -12,6 +12,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { formatGoalId, goalIdPattern, goalSequence } from "./identity.ts";
 import { createInitialPlan, type Plan } from "./plan.ts";
+import { loadRequest, requestDataRoot } from "./request.ts";
 
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -46,6 +47,7 @@ export type CreateGoalInput = {
   outcome: string;
   approval: string;
   constraints?: string[];
+  sourceRequests?: string[];
   repositoryIdentity?: string;
   now?: Date;
   crash?: CrashInjector;
@@ -82,8 +84,9 @@ function requireText(value: string, label: string): string {
   return normalized;
 }
 
-function goalBody(title: string, outcome: string, approval: string, constraints: string[]): string {
+function goalBody(title: string, outcome: string, approval: string, constraints: string[], sourceRequests: string[]): string {
   const constraintList = constraints.length > 0 ? constraints.map((constraint) => `- ${constraint}`).join("\n") : "None.";
+  const sourceRequestList = sourceRequests.length > 0 ? sourceRequests.map((requestId) => `- ${requestId}`).join("\n") : "None.";
   return `# ${title}
 
 ## Outcome
@@ -94,10 +97,37 @@ ${outcome}
 
 ${constraintList}
 
+## Source Requests
+
+${sourceRequestList}
+
 ## Operator approval
 
 ${approval}
 `;
+}
+
+/** Validate host-local provenance before any Goal workflow document is staged. */
+async function validateSourceRequests(sourceRequests: unknown, projectSlug: string): Promise<string[]> {
+  if (!Array.isArray(sourceRequests)) throw new Error("Source Requests must be an array");
+  const requestIds: string[] = [];
+  for (const requestId of sourceRequests) {
+    if (typeof requestId !== "string") throw new Error("Source Request ID must be a string");
+    if (new Set(requestIds).has(requestId)) throw new Error(`duplicate Source Request ID: ${requestId}`);
+    requestIds.push(requestId);
+  }
+  // Zero-source Goals preserve the pre-Request-inbox workflow and must not
+  // consult host Request-store configuration.
+  if (requestIds.length === 0) return requestIds;
+  const root = requestDataRoot();
+  const requests = await Promise.all(requestIds.map((requestId) => loadRequest(root, requestId)));
+  for (const request of requests) {
+    const projects = request.metadata.projects;
+    if (projects.length > 0 && !projects.includes(projectSlug)) {
+      throw new Error(`Source Request ${request.metadata.requestId} is not eligible for Project ${projectSlug}`);
+    }
+  }
+  return requestIds;
 }
 
 export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
@@ -107,6 +137,8 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   const constraints = (input.constraints ?? []).map((constraint) => requireText(constraint, "Constraint"));
   const repository = await discoverRepository(input.cwd);
   const { slug } = (await loadProjectConfig(repository.root)).project;
+  // This is deliberately before allocation, Plan staging, Goal publication, and ref creation.
+  const sourceRequests = await validateSourceRequests(input.sourceRequests ?? [], slug);
   const goalId = await nextGoalId(repository.root, slug);
   const approvedAt = (input.now ?? new Date()).toISOString();
   const metadata = goalSchema.parse({
@@ -121,7 +153,7 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
       initialRevision: repository.head,
     },
   });
-  const body = goalBody(title, outcome, approval, constraints);
+  const body = goalBody(title, outcome, approval, constraints, sourceRequests);
 
   // The Goal document is the authoritative commit point. The Plan prepared
   // before it is staging; the integration ref written after it is rebuildable.

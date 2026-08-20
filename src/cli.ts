@@ -93,6 +93,7 @@ Plan revision options:
 
 Goal creation options:
   --constraint <constraint>      Repeat for each constraint
+  --request <request-id>         Repeat for each source Request
   --repository-id <identity>     Override the inferred repository identity
 
 Goal apply options:
@@ -256,6 +257,7 @@ function parseGoalCreate(args: string[]): {
   outcome: string;
   approval: string;
   constraints: string[];
+  sourceRequests: string[];
   repositoryIdentity?: string;
 } {
   let title: string | undefined;
@@ -263,6 +265,7 @@ function parseGoalCreate(args: string[]): {
   let approval: string | undefined;
   let repositoryIdentity: string | undefined;
   const constraints: string[] = [];
+  const sourceRequests: string[] = [];
 
   for (let index = 0; index < args.length; index += 2) {
     const option = args[index]!;
@@ -272,6 +275,7 @@ function parseGoalCreate(args: string[]): {
       case "--outcome": outcome = value; break;
       case "--approval": approval = value; break;
       case "--constraint": constraints.push(value); break;
+      case "--request": sourceRequests.push(value); break;
       case "--repository-id": repositoryIdentity = value; break;
       default: throw new UsageError(`unknown option: ${option}`);
     }
@@ -280,7 +284,7 @@ function parseGoalCreate(args: string[]): {
   if (title === undefined) throw new UsageError("--title is required");
   if (outcome === undefined) throw new UsageError("--outcome is required");
   if (approval === undefined) throw new UsageError("--approval is required");
-  return { title, outcome, approval, constraints, ...(repositoryIdentity === undefined ? {} : { repositoryIdentity }) };
+  return { title, outcome, approval, constraints, sourceRequests, ...(repositoryIdentity === undefined ? {} : { repositoryIdentity }) };
 }
 
 function parseGoalApply(args: string[]): { goalId: string; targetBranch: string; approval: string } {
