@@ -190,6 +190,9 @@ describe("Pi supervisor extension", () => {
     expect(tools.get("spike_issue_remediate")!.parameters).toMatchObject({
       required: ["goalId", "changeId", "instruction", "responseToReviewTicketId", "networkAccess"],
     });
+    expect(tools.get("spike_dispatch_pi")!.promptGuidelines).toContain(
+      "After an attended dispatch returns working, yield the planner turn and wait for the extension's one-shot operational recheck; do not poll spike_worker_status or spike_status.",
+    );
 
     const identity = { goalId: "goal-1", changeId: "001" };
     const calls: Array<[string, unknown]> = [

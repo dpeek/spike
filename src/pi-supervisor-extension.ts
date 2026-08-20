@@ -672,6 +672,10 @@ export function registerSupervisorExtension(
       label: "Dispatch Pi Ticket",
       description: "Ask Spike to launch a fresh Pi worker for an issued Ticket. Output is operational staging evidence, never a Report.",
       promptSnippet: "Dispatch an issued Ticket to a fresh Pi worker",
+      promptGuidelines: [
+        "After an attended dispatch returns working, yield the planner turn and wait for the extension's one-shot operational recheck; do not poll spike_worker_status or spike_status.",
+        "When the recheck arrives, call spike_status and explicitly publish the Report if the exact Ticket remains open.",
+      ],
       parameters: {
         type: "object",
         additionalProperties: false,
