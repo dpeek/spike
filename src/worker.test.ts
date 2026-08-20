@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { stopDirectProcess, type DirectProcess } from "./worker.ts";
+import { selectPiHost, stopDirectProcess, type DirectProcess } from "./worker.ts";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -8,6 +8,23 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   });
   return { promise, resolve };
 }
+
+describe("Pi host selection", () => {
+  test("defaults workspace Tickets to attended Herdr and container Tickets to direct dispatch", () => {
+    expect(selectPiHost({ isolation: "workspace" })).toBe("herdr");
+    expect(selectPiHost({ isolation: "container" })).toBe("direct");
+  });
+
+  test("preserves explicit direct dispatch for either isolation", () => {
+    expect(selectPiHost({ isolation: "workspace" }, "direct")).toBe("direct");
+    expect(selectPiHost({ isolation: "container" }, "direct")).toBe("direct");
+  });
+
+  test("refuses an attended override for container isolation without dispatching", () => {
+    expect(() => selectPiHost({ isolation: "container" }, "herdr"))
+      .toThrow("Herdr hosting is incompatible with container Ticket isolation");
+  });
+});
 
 describe("direct worker termination", () => {
   test("waits for graceful exit after SIGTERM", async () => {

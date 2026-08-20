@@ -159,7 +159,6 @@ describe("controlled Pi dispatch", () => {
       cwd: repository.root,
       ...identity,
       worker: "headed-pi-implementer",
-      host: "herdr",
       piExecutable: pi,
       herdr,
     });

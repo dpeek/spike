@@ -104,6 +104,21 @@ export type PiDispatchClassification =
   | "missing-submission"
   | "failed-execution";
 
+/**
+ * Resolve Pi hosting from the Ticket's frozen isolation policy. Container
+ * workers have no attended adapter, so reject that incompatible override
+ * before any exchange, runtime, or host-worker side effects begin.
+ */
+export function selectPiHost(
+  policy: { isolation: "workspace" | "container" },
+  requested?: "herdr" | "direct",
+): "herdr" | "direct" {
+  if (requested === "herdr" && policy.isolation === "container") {
+    throw new Error("Herdr hosting is incompatible with container Ticket isolation");
+  }
+  return requested ?? (policy.isolation === "container" ? "direct" : "herdr");
+}
+
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const nonBlankString = z.string().refine((value) => value.trim().length > 0, "must not be blank");
 const workerRecordSchema = z
@@ -1302,6 +1317,7 @@ export async function dispatchPiTicket(
   const repository = await discoverRepository(input.cwd);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const host = selectPiHost(ticket.metadata.executionPolicy, input.host);
   const container = selectWorkerAdapter(ticket.metadata.executionPolicy) === dockerWorkerAdapter;
   // Docker receives no host checkout paths. The pinned image contains both Pi
   // and this extension, while its entrypoint clones the immutable input bundle.
@@ -1310,7 +1326,7 @@ export async function dispatchPiTicket(
   const extension = container ? "/opt/spike/src/pi-worker-extension.ts" : resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
     container ? "/usr/local/bin/pi" : input.piExecutable ?? "pi",
-    ...(input.host === "direct" ? ["--print"] : []),
+    ...(host === "direct" ? ["--print"] : []),
     "--no-session",
     ...(container ? [] : ["--no-approve"]),
     "--model",
@@ -1330,7 +1346,7 @@ export async function dispatchPiTicket(
     `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish with ${terminalTools.complete}, or use ${terminalTools.blocked} only when a condition outside the worker's control prevents completion.`,
   ];
   const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
-  if (input.host !== "direct") {
+  if (host === "herdr") {
     if (adapter.dispatchAttended === undefined) throw new Error(`Worker adapter ${adapter.adapter} does not support attended dispatch`);
     const attended = await adapter.dispatchAttended({
       ...identity,

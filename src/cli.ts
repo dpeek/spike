@@ -125,7 +125,7 @@ Ticket issuance options:
 
 Pi dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
-  --host <herdr|direct>           Herdr (default); direct is the controlled-test fallback
+  --host <herdr|direct>           Override Ticket-based default (Herdr for workspace; direct for container)
 
 Worker observation options:
   --lines <count>                 Terminal rows to read (default 120)
