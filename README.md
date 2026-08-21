@@ -72,7 +72,7 @@ spike ticket issue \
 
 ## Attended container workers
 
-When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in one ephemeral Herdr tab. The tab can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary.
+When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in one ephemeral Herdr tab. The tab can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary. Their bounded `/tmp` and `/work` tmpfs locations are writable and executable for generated coding tools while remaining `nosuid`.
 
 ## Request inbox
 

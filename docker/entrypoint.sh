@@ -8,7 +8,8 @@ if [ -n "${SPIKE_PI_AUTH_B64:-}" ]; then
   printf '%s' "$SPIKE_PI_AUTH_B64" | base64 -d > "$PI_CODING_AGENT_DIR/auth.json"
   unset SPIKE_PI_AUTH_B64
 fi
-# /work is a container tmpfs. The host repository is never mounted.
+# /tmp and /work are bounded executable container tmpfs locations. The host
+# repository is never mounted.
 git clone --quiet --no-checkout /exchange/input/repository.bundle /work/repository
 git -C /work/repository checkout --quiet --detach "$SPIKE_INPUT_REVISION"
 actual=$(git -C /work/repository rev-parse --verify HEAD^{commit})

@@ -1224,7 +1224,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   const startedAt = (input.clock ?? (() => new Date()))().toISOString();
   try {
     containerId = await dockerRequired([
-      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
+      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
@@ -1290,7 +1290,7 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
   let recorded = false;
   try {
     containerId = await dockerRequired([
-      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
+      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
