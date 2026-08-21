@@ -15,7 +15,7 @@ import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
-import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, recoverApplicationTicket } from "./application-ticket.ts";
+import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, publishApplicationPartialReport, recoverApplicationTicket } from "./application-ticket.ts";
 import { deriveApplicationReviewStatus, issueApplicationReviewTicket, prepareApplicationReviewExchange, publishApplicationReviewReport, recoverApplicationReviewTicket } from "./application-review.ts";
 import { dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker, loadFinishedApplicationReviewWorker, observeApplicationReviewWorker, readApplicationReviewWorker } from "./application-review-worker.ts";
 import { dispatchApplicationPiTicket, dispatchApplicationWorker, loadFinishedApplicationWorker, observeApplicationWorker, readApplicationWorker } from "./application-worker.ts";
@@ -82,6 +82,8 @@ Usage:
   spike application worker read --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
   spike application status --goal <goal-id> --application <application-id> [--json]
   spike application report publish --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> --commit-summary <summary> [--json]
+  spike application report blocked --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> [--json]
+  spike application report partial --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> --reason <reason> [--json]
   spike application recover --goal <goal-id> --application <application-id> --ticket <ticket-id> [--reason <reason>] [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike request create --title <title> --statement <statement> [--project <slug>] [--json]
@@ -349,6 +351,12 @@ function parseApplicationReportPublish(args: string[]): { goalId: string; applic
   let goalId: string | undefined; let applicationId: string | undefined; let ticketId: string | undefined; let worker: string | undefined; let summary: string | undefined;
   for (let index = 0; index < args.length; index += 2) { const option = args[index]!; const value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else if (option === "--commit-summary") summary = value; else throw new UsageError(`unknown option: ${option}`); }
   if (goalId === undefined) throw new UsageError("--goal is required"); if (applicationId === undefined) throw new UsageError("--application is required"); if (ticketId === undefined) throw new UsageError("--ticket is required"); if (worker === undefined) throw new UsageError("--worker is required"); if (summary === undefined) throw new UsageError("--commit-summary is required"); return { goalId, applicationId, ticketId, worker, summary };
+}
+
+function parseApplicationPartialPublish(args: string[]): { goalId: string; applicationId: string; ticketId: string; worker: string; reason: string } {
+  let goalId: string | undefined, applicationId: string | undefined, ticketId: string | undefined, worker: string | undefined, reason: string | undefined;
+  for (let index = 0; index < args.length; index += 2) { const option = args[index]!, value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else if (option === "--reason") reason = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (!goalId) throw new UsageError("--goal is required"); if (!applicationId) throw new UsageError("--application is required"); if (!ticketId) throw new UsageError("--ticket is required"); if (!worker) throw new UsageError("--worker is required"); if (!reason) throw new UsageError("--reason is required"); return { goalId, applicationId, ticketId, worker, reason };
 }
 
 function parseApplicationApplyHead(args: string[]): { goalId: string; applicationId: string } {
@@ -806,7 +814,7 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
   }
   for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
   if (status.application.length === 0) lines.push("  Applications none");
-  else for (const application of status.application) lines.push(`  Application ${application.applicationId} ${application.state}`);
+  else for (const application of status.application) lines.push(`  Application ${application.applicationId} ${application.state}${application.churnWarnings.length ? `; churn warnings ${application.churnWarnings.length}` : ""}`);
   lines.push(status.frozen ? "  Goal frozen by Application evidence" : "  Goal unfrozen");
   lines.push(status.cleanup.healthy ? "  Cleanup healthy" : `  Cleanup warnings ${status.cleanup.warnings.length}`);
   return `${lines.join("\n")}\n`;
@@ -815,7 +823,7 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
 function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
   const heading = `Project ${status.project.slug}\nRepository ${status.root}\n`;
   if (status.goals.length === 0) return `${heading}  No Goals\n  Cleanup healthy\n`;
-  const queue = status.applicationQueue.length === 0 ? "  Application queue empty\n" : `${status.applicationQueue.map((entry) => `  Queue ${entry.queuePosition} ${entry.goalId}/${entry.applicationId} ${entry.state}`).join("\n")}\n`;
+  const queue = status.applicationQueue.length === 0 ? "  Application queue empty\n" : `${status.applicationQueue.map((entry) => `  Queue ${entry.queuePosition} ${entry.goalId}/${entry.applicationId} ${entry.state}${entry.churnWarnings.length ? `; churn warnings ${entry.churnWarnings.length}` : ""}`).join("\n")}\n`;
   const head = status.queueHead === null ? "  Queue head none\n" : `  Queue head ${status.queueHead.goalId}/${status.queueHead.applicationId} (${status.queueHead.queuePosition})\n`;
   return `${heading}${queue}${head}${status.goals.map(humanGoalStatus).join("")}`;
 }
@@ -1015,6 +1023,21 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       return success(json, "application ticket prepare", exchange, `Prepared Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
+    if (args[0] === "application" && args[1] === "report" && args[2] === "blocked") {
+      const input = parseApplicationPiDispatch(args.slice(3)); const repository = await discoverRepository(cwd), execution = await loadFinishedApplicationWorker(repository.root, input);
+      if (execution.worker !== input.worker) throw new UsageError("application blocked publish worker does not match the recorded Application Worker");
+      const published = await publishApplicationImplementationReport({ cwd: repository.root, ...input, message: { summary: "Blocked Application Ticket" }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      return success(json, "application report blocked", { report: published.report.metadata }, `Published blocked Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "report" && args[2] === "partial") {
+      const input = parseApplicationPartialPublish(args.slice(3)); const repository = await discoverRepository(cwd);
+      const execution = await loadFinishedApplicationWorker(repository.root, input);
+      if (execution.worker !== input.worker) throw new UsageError("application partial publish worker does not match the recorded Application Worker");
+      const published = await publishApplicationPartialReport({ cwd: repository.root, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      return success(json, "application report partial", { report: published.report.metadata }, `Published partial Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
     if (args[0] === "application" && args[1] === "report" && args[2] === "publish") {
       const input = parseApplicationReportPublish(args.slice(3)); const repository = await discoverRepository(cwd);
       const execution = await loadFinishedApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId });
@@ -1025,7 +1048,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "application" && args[1] === "status") {
       const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, input.goalId, input.applicationId);
-      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n`);
+      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n  Churn warnings ${status.churnWarnings.length}\n`);
     }
 
     if (args[0] === "application" && args[1] === "recover") {

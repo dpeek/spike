@@ -7,7 +7,7 @@ import { serializeDocument } from "../../src/durable-state.ts";
 import { applyQueueHead, queueGoalIntegration } from "../../src/goal-apply.ts";
 import { createGoal, integratedRef } from "../../src/goal.ts";
 import { reconcileGoal } from "../../src/recovery.ts";
-import { applicationCandidateRef, applicationExchangePath, applicationReportPath, deriveApplicationStatus, issueApplicationTicket, loadApplicationReportIfPresent, prepareApplicationTicketExchange, publishApplicationImplementationReport, recoverApplicationTicket } from "../../src/application-ticket.ts";
+import { applicationCandidateRef, applicationExchangePath, applicationReportPath, applicationTicketPath, deriveApplicationStatus, issueApplicationTicket, loadApplicationReportIfPresent, prepareApplicationTicketExchange, publishApplicationImplementationReport, publishApplicationPartialReport, recoverApplicationTicket } from "../../src/application-ticket.ts";
 import { applicationWorkerRecordPath, dispatchApplicationWorker } from "../../src/application-worker.ts";
 import { applicationReviewWorkerRecordPath, dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker } from "../../src/application-review-worker.ts";
 import { applicationReviewExchangePath, applicationReviewReportPath, deriveApplicationReviewStatus, issueApplicationReviewTicket, loadApplicationReviewReportIfPresent, publishApplicationReviewReport, recoverApplicationReviewTicket } from "../../src/application-review.ts";
@@ -19,6 +19,21 @@ afterEach(async () => { await Promise.all(repositories.splice(0).map((repository
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 const timestamp = new Date(0).toISOString();
 const workerCompletionModule = join(import.meta.dir, "../../src/worker-completion.ts");
+type ScenarioRepository = Awaited<ReturnType<typeof temporaryRepository>>;
+/** The externally owned refs are the Goal integration refs, not per-Candidate retention projections. */
+async function externalSnapshot(repository: ScenarioRepository) {
+  const refs = (await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"))
+    .split("\n").filter((line) => line && !line.includes("/applications/")).join("\n");
+  return { main: await repository.git("rev-parse", "main"), goalRefs: refs, worktree: await repository.git("status", "--porcelain") };
+}
+function applicationExecution(run: Awaited<ReturnType<typeof dispatchApplicationWorker>>) {
+  const { adapter, isolation, worker, model, thinking, startedAt, finishedAt } = run.execution;
+  return { adapter, isolation, worker, model, thinking, startedAt, finishedAt };
+}
+function reviewExecution(run: Awaited<ReturnType<typeof dispatchApplicationReviewWorker>>) {
+  const { adapter, isolation, worker, model, thinking, startedAt, finishedAt } = run.execution;
+  return { adapter, isolation, worker, model, thinking, startedAt, finishedAt };
+}
 /** Exercise the worker's production completion boundary inside its dispatched checkout. */
 function reviewCompletionCommand(payload: Record<string, unknown>): string[] {
   return ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))});`];
@@ -92,6 +107,39 @@ await Bun.$\`git bundle create \${out}/repository.bundle HEAD\`;
 await Bun.write(\`\${out}/submission.md\`, "---\\n" + JSON.stringify({ kind: "application-submission", goalId: process.env.SPIKE_GOAL_ID, applicationId: process.env.SPIKE_APPLICATION_ID, ticketId: process.env.SPIKE_TICKET_ID, outcome: "completed", workerRevision: worker, artifacts: [] }, null, 2) + "\\n---\\n\\n## Summary\\n\\nDone.\\n\\n## Verification\\n\\nReal Git.\\n\\n## Assumptions\\n\\nNone.\\n\\n## Limitations\\n\\nNone.\\n\\n## Risks\\n\\nNone.\\n\\n## Follow-up\\n\\nNone.\\n");
 `;
 
+async function remediationSource() {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Remediation churn fixture." });
+  const issued = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const identity = { goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
+  const run = await dispatchApplicationWorker({ cwd: repository.root, ...identity, worker: "churn-source", command: ["bun", "-e", workerCommand] });
+  const published = await publishApplicationImplementationReport({ cwd: repository.root, ...identity, message: { summary: "Churn source" }, execution: applicationExecution(run) });
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, identity.ticketId);
+  return { repository, goalId, applicationId: queued.applicationId, source: { identity, published } };
+}
+
+async function publishRemediateReview(repository: ScenarioRepository, goalId: string, applicationId: string, findingId: string) {
+  const review = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId, instruction: `Review ${findingId}.`, executionPolicy: policy });
+  const identity = { goalId, applicationId, ticketId: review.ticket.metadata.ticketId };
+  const run = await dispatchApplicationReviewWorker({ cwd: repository.root, ...identity, worker: "churn-reviewer", command: reviewCompletionCommand({ reviewStatement: `Remediate ${findingId}.`, verdict: "remediate", findings: [{ id: findingId, severity: "high", statement: `Repair ${findingId}.` }], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "not-met", evidence: `${findingId} remains.` }], artifacts: [] }) });
+  await publishApplicationReviewReport({ cwd: repository.root, ...identity, execution: reviewExecution(run) });
+  return identity;
+}
+
+async function publishPartialRemediation(repository: ScenarioRepository, goalId: string, applicationId: string) {
+  const ticket = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId, instruction: "Publish partial remediation.", executionPolicy: policy });
+  const identity = { goalId, applicationId, ticketId: ticket.ticket.metadata.ticketId };
+  const run = await dispatchApplicationWorker({ cwd: repository.root, ...identity, worker: "partial-remediator", command: ["bun", "-e", "process.exit(0)"] });
+  await publishApplicationPartialReport({ cwd: repository.root, ...identity, reason: "Partial evidence only.", execution: applicationExecution(run) });
+  await recoverApplicationTicket(repository.root, goalId, applicationId, identity.ticketId);
+  return identity;
+}
+
+function blockedCompletionCommand() {
+  return ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).blockWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reason: "Blocked.", evidence: "Scenario block.", artifacts: [] }))});`];
+}
+
 test("scenario: diverged Application uses supported content merges, verified custom refs, and recorded execution", async () => {
   const { repository, goalId, base } = await readyGoal();
   // M and G both edit shared.txt, but different lines: a real content merge
@@ -128,6 +176,109 @@ test("scenario: diverged Application uses supported content merges, verified cus
   expect((await deriveApplicationStatus(repository.root, goalId, queued.applicationId)).cleanupWarnings).toEqual([]);
   expect(await repository.git("rev-parse", "main")).toBe(target);
 });
+
+test("scenario: remediate review issues one response from its Candidate and requires fresh review", async () => {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Remediate candidate." });
+  const first = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const firstIdentity = { goalId, applicationId: queued.applicationId, ticketId: first.ticket.metadata.ticketId };
+  const firstRun = await dispatchApplicationWorker({ cwd: repository.root, ...firstIdentity, worker: "remediate-source", command: ["bun", "-e", workerCommand] });
+  const firstReport = await publishApplicationImplementationReport({ cwd: repository.root, ...firstIdentity, message: { summary: "Source candidate" }, execution: { adapter: firstRun.execution.adapter, isolation: firstRun.execution.isolation, worker: firstRun.execution.worker, model: firstRun.execution.model, thinking: firstRun.execution.thinking, startedAt: firstRun.execution.startedAt, finishedAt: firstRun.execution.finishedAt } });
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, firstIdentity.ticketId);
+  const review = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Find a fix.", executionPolicy: policy });
+  const reviewIdentity = { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId };
+  const reviewRun = await dispatchApplicationReviewWorker({ cwd: repository.root, ...reviewIdentity, worker: "remediate-reviewer", command: reviewCompletionCommand({ reviewStatement: "Needs a repair.", verdict: "remediate", findings: [{ id: "repair-me", severity: "high", statement: "Repair the Candidate." }], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "not-met", evidence: "Finding remains." }], artifacts: [] }) });
+  await publishApplicationReviewReport({ cwd: repository.root, ...reviewIdentity, execution: { adapter: reviewRun.execution.adapter, isolation: reviewRun.execution.isolation, worker: reviewRun.execution.worker, model: reviewRun.execution.model, thinking: reviewRun.execution.thinking, startedAt: reviewRun.execution.startedAt, finishedAt: reviewRun.execution.finishedAt } });
+  const response = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Repair exact finding.", executionPolicy: policy });
+  expect(response.ticket.metadata.responseToReviewTicketId).toBe(reviewIdentity.ticketId); expect(response.ticket.metadata.replacesTicketId).toBe(firstIdentity.ticketId); expect(response.ticket.metadata.inputRevision).toBe(firstReport.report.metadata.candidateRevision!); expect(response.ticket.metadata.targetRevision).toBe(first.ticket.metadata.targetRevision); expect(response.ticket.body).toContain("repair-me");
+  // The response gets the one complete canonical immutable authorizing Report,
+  // including evidence that is only present in Report metadata.
+  expect(response.ticket.body).toContain('"acceptanceAssessment"');
+  expect(response.ticket.body).toContain("Finding remains.");
+  expect(response.ticket.body).toContain('"execution"');
+  expect(response.ticket.body).toContain("# Review evidence");
+  const responseIdentity = { goalId, applicationId: queued.applicationId, ticketId: response.ticket.metadata.ticketId };
+  // Completion is confined to the Application Candidate projection: neither
+  // main, any Goal integration ref, nor the host worktree may move.
+  const beforeReplacement = await externalSnapshot(repository);
+  const responseRun = await dispatchApplicationWorker({ cwd: repository.root, ...responseIdentity, worker: "remediator", command: ["bun", "-e", workerCommand.replaceAll("worker-result.txt", "remediation-result.txt")] });
+  if (responseRun.execution.exitCode !== 0) throw new Error(responseRun.execution.stderr || responseRun.execution.stdout);
+  const replacement = await publishApplicationImplementationReport({ cwd: repository.root, ...responseIdentity, message: { summary: "Repaired candidate" }, execution: { adapter: responseRun.execution.adapter, isolation: responseRun.execution.isolation, worker: responseRun.execution.worker, model: responseRun.execution.model, thinking: responseRun.execution.thinking, startedAt: responseRun.execution.startedAt, finishedAt: responseRun.execution.finishedAt } });
+  expect(replacement.report.metadata.candidateRevision).not.toBe(firstReport.report.metadata.candidateRevision); expect((await repository.git("rev-list", "--parents", "-n", "1", replacement.report.metadata.candidateRevision!)).split(" ").length).toBe(2);
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, responseIdentity.ticketId);
+  expect(await externalSnapshot(repository)).toEqual(beforeReplacement);
+  expect((await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId)).approvalUsable).toBe(false);
+  // The consumed remediate Report is now stale for the replacement and cannot
+  // authorize another response before a new exact review is published.
+  await expect(issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Stale response.", executionPolicy: policy })).rejects.toThrow("exact current Candidate and producer");
+  const fresh = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Approve replacement.", executionPolicy: policy });
+  expect(fresh.ticket.metadata.candidateRevision).toBe(replacement.report.metadata.candidateRevision!); expect(fresh.ticket.metadata.producingImplementationTicketId).toBe(responseIdentity.ticketId);
+  const approveRun = await dispatchApplicationReviewWorker({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: fresh.ticket.metadata.ticketId, worker: "replacement-approver", command: reviewCompletionCommand({ reviewStatement: "Replacement is approved.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Replacement Candidate is exact." }], artifacts: [] }) });
+  await publishApplicationReviewReport({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: fresh.ticket.metadata.ticketId, execution: reviewExecution(approveRun) });
+  expect((await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId)).approvalUsable).toBe(true);
+  // An approve Report is the wrong authorizing verdict for implementation issuance.
+  await expect(issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Wrong verdict response.", executionPolicy: policy })).rejects.toThrow("highest exact review verdict to be remediate");
+  expect(await repository.git("rev-parse", "main")).toBe(first.ticket.metadata.targetRevision);
+
+  // Oversized reports are refused whole: issuance cannot silently truncate the
+  // authorizing Report or create an input ref/Ticket as a side effect.
+  const hugeReview = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Find an oversized repair.", executionPolicy: policy });
+  const huge = "e".repeat(40 * 1024);
+  const hugeRun = await dispatchApplicationReviewWorker({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: hugeReview.ticket.metadata.ticketId, worker: "oversized-reviewer", command: reviewCompletionCommand({ reviewStatement: huge, verdict: "remediate", findings: [{ id: "large-evidence", severity: "high", statement: "This report is deliberately too large." }], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "not-met", evidence: "The exact Report must fit intact." }], artifacts: [] }) });
+  await publishApplicationReviewReport({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: hugeReview.ticket.metadata.ticketId, execution: reviewExecution(hugeRun) });
+  const beforeOversize = { main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") };
+  await expect(issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Do not truncate review evidence.", executionPolicy: policy })).rejects.toThrow("exceeds the 65536-byte context limit");
+  expect(await Bun.file(applicationTicketPath(repository.root, goalId, queued.applicationId, "003")).exists()).toBe(false);
+  expect(await repository.git("for-each-ref", "--format=%(refname)", "refs/spike/application-input")).toBe("");
+  expect({ main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") }).toEqual(beforeOversize);
+});
+
+test("scenario: remediation partial and blocked Reports stay terminal and derive warning-only churn", async () => {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Exercise remediation terminals." });
+  const first = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const firstIdentity = { goalId, applicationId: queued.applicationId, ticketId: first.ticket.metadata.ticketId };
+  const firstRun = await dispatchApplicationWorker({ cwd: repository.root, ...firstIdentity, worker: "churn-source", command: ["bun", "-e", workerCommand] });
+  const firstPublished = await publishApplicationImplementationReport({ cwd: repository.root, ...firstIdentity, message: { summary: "Churn source" }, execution: { adapter: firstRun.execution.adapter, isolation: firstRun.execution.isolation, worker: firstRun.execution.worker, model: firstRun.execution.model, thinking: firstRun.execution.thinking, startedAt: firstRun.execution.startedAt, finishedAt: firstRun.execution.finishedAt } });
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, firstIdentity.ticketId);
+  const publishRemediate = async () => {
+    const review = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Find the same repair.", executionPolicy: policy });
+    const identity = { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId };
+    const run = await dispatchApplicationReviewWorker({ cwd: repository.root, ...identity, worker: "churn-reviewer", command: reviewCompletionCommand({ reviewStatement: "Remediation is needed.", verdict: "remediate", findings: [{ id: "repeat-repair", severity: "high", statement: "Repair the exact Candidate." }], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "not-met", evidence: "repeat-repair remains." }], artifacts: [] }) });
+    await publishApplicationReviewReport({ cwd: repository.root, ...identity, execution: { adapter: run.execution.adapter, isolation: run.execution.isolation, worker: run.execution.worker, model: run.execution.model, thinking: run.execution.thinking, startedAt: run.execution.startedAt, finishedAt: run.execution.finishedAt } });
+  };
+  await publishRemediate();
+  const partial = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Attempt repair but report partial.", executionPolicy: policy });
+  const partialIdentity = { goalId, applicationId: queued.applicationId, ticketId: partial.ticket.metadata.ticketId };
+  const partialRun = await dispatchApplicationWorker({ cwd: repository.root, ...partialIdentity, worker: "partial-remediator", command: ["bun", "-e", "process.exit(0)"] });
+  const partialReport = await (await import("../../src/application-ticket.ts")).publishApplicationPartialReport({ cwd: repository.root, ...partialIdentity, reason: "Partial evidence only.", execution: { adapter: partialRun.execution.adapter, isolation: partialRun.execution.isolation, worker: partialRun.execution.worker, model: partialRun.execution.model, thinking: partialRun.execution.thinking, startedAt: partialRun.execution.startedAt, finishedAt: partialRun.execution.finishedAt } });
+  expect(partialReport.report.metadata.outcome).toBe("partial"); expect(partialReport.report.metadata.candidateRevision).toBeUndefined();
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, partialIdentity.ticketId);
+  // A terminal partial response consumes its exact review even though it did
+  // not replace the Candidate, so the same Report cannot issue another Ticket.
+  await expect(issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Reuse consumed review.", executionPolicy: policy })).rejects.toThrow("already authorizes a remediation response");
+  await publishRemediate();
+  const blocked = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Attempt repair but report blocked.", executionPolicy: policy });
+  const blockedIdentity = { goalId, applicationId: queued.applicationId, ticketId: blocked.ticket.metadata.ticketId };
+  const blockedRun = await dispatchApplicationWorker({ cwd: repository.root, ...blockedIdentity, worker: "blocked-remediator", command: ["bun", "-e", `await Bun.write(process.env.SPIKE_OUTPUT_DIR + "/submission.md", "---\\n" + JSON.stringify({ kind: "application-submission", goalId: process.env.SPIKE_GOAL_ID, applicationId: process.env.SPIKE_APPLICATION_ID, ticketId: process.env.SPIKE_TICKET_ID, outcome: "blocked", artifacts: [] }, null, 2) + "\\n---\\n\\n## Reason\\n\\nBlocked.\\n\\n## Evidence\\n\\nExternal dependency unavailable.\\n");`] });
+  const blockedReport = await publishApplicationImplementationReport({ cwd: repository.root, ...blockedIdentity, message: { summary: "unused" }, execution: { adapter: blockedRun.execution.adapter, isolation: blockedRun.execution.isolation, worker: blockedRun.execution.worker, model: blockedRun.execution.model, thinking: blockedRun.execution.thinking, startedAt: blockedRun.execution.startedAt, finishedAt: blockedRun.execution.finishedAt } });
+  expect(blockedReport.report.metadata.outcome).toBe("blocked"); expect(blockedReport.report.metadata.candidateRevision).toBeUndefined();
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, blockedIdentity.ticketId);
+  const status = await deriveApplicationStatus(repository.root, goalId, queued.applicationId);
+  expect(status.churnWarnings.map((warning) => warning.kind).sort()).toEqual(["non-progress", "remediation-rounds", "reopened-finding"]);
+  expect(status.candidate?.revision).toBe(firstPublished.report.metadata.candidateRevision);
+  const beforeStatus = { main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") };
+  expect(await runCli(["--json", "application", "status", "--goal", goalId, "--application", queued.applicationId], repository.root)).toBe(0);
+  expect({ main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") }).toEqual(beforeStatus);
+  // Target movement is refused before a remediation Ticket, exchange, or
+  // runtime record can be created.
+  await writeFile(join(repository.root, "moved-before-remediation.txt"), "new M\n"); await repository.git("add", "moved-before-remediation.txt"); await repository.git("commit", "--quiet", "-m", "Move main before remediation issuance");
+  const movedBeforeIssue = await externalSnapshot(repository);
+  await expect(issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Do not issue after moved main.", executionPolicy: policy })).rejects.toThrow("Application target mismatch");
+  expect(await externalSnapshot(repository)).toEqual(movedBeforeIssue);
+}, 30_000);
 
 test("scenario: Application review approves only the exact current Candidate and a later review invalidates it", async () => {
   const { repository, goalId } = await readyGoal();
@@ -272,6 +423,28 @@ test("scenario: interruption before Application Report recovers moved target wit
   expect(await repository.git("status", "--porcelain")).toBe("");
 });
 
+test("scenario: live Application recovery stops the adapter worker and cannot recreate runtime state", async () => {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Interrupt a live worker." });
+  const issued = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Start a live worker.", executionPolicy: policy });
+  const identity = { goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
+  const before = { main: await repository.git("rev-parse", "main"), goal: await repository.git("rev-parse", integratedRef(goalId)), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") };
+  const started = join(applicationExchangePath(repository.root, identity), "output", "started");
+  // Attach the rejection handler immediately: recovery intentionally makes
+  // this in-flight dispatch fail after it has terminated the child.
+  const running = dispatchApplicationWorker({ cwd: repository.root, ...identity, worker: "live-worker", command: ["bun", "-e", `await Bun.write(process.env.SPIKE_OUTPUT_DIR + "/started", "started"); await new Promise(() => {});`] }).then(() => undefined, (error) => error);
+  for (let attempt = 0; !(await Bun.file(started).exists()) && attempt < 100; attempt++) await Bun.sleep(5);
+  expect(await Bun.file(started).exists()).toBe(true);
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, identity.ticketId);
+  expect(String(await running)).toContain("interrupted");
+  const interrupted = (await loadApplicationReportIfPresent(repository.root, goalId, queued.applicationId, identity.ticketId))!;
+  expect(interrupted.metadata.outcome).toBe("interrupted");
+  expect(await Bun.file(applicationWorkerRecordPath(repository.root, identity)).exists()).toBe(false);
+  expect(await Bun.file(applicationExchangePath(repository.root, identity)).exists()).toBe(false);
+  expect({ main: await repository.git("rev-parse", "main"), goal: await repository.git("rev-parse", integratedRef(goalId)), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") }).toEqual(before);
+}, 15_000);
+
 test("scenario: interruption after Application Report cleans projections and rebuilds reported retention after target movement", async () => {
   const { repository, goalId } = await readyGoal();
   await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
@@ -304,6 +477,44 @@ test("scenario: interruption after Application Report cleans projections and reb
   expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(goalRevision);
   expect(await repository.git("status", "--porcelain")).toBe("");
 });
+
+test("scenario: churn thresholds stay quiet for one remediate and distinct findings", async () => {
+  const { repository, goalId, applicationId } = await remediationSource();
+  await publishRemediateReview(repository, goalId, applicationId, "first-finding");
+  expect((await deriveApplicationStatus(repository.root, goalId, applicationId)).churnWarnings).toEqual([]);
+
+  await publishPartialRemediation(repository, goalId, applicationId);
+  await publishRemediateReview(repository, goalId, applicationId, "different-finding");
+  const warnings = await deriveApplicationStatus(repository.root, goalId, applicationId);
+  expect(warnings.churnWarnings.map((warning) => warning.kind)).toEqual(["remediation-rounds"]);
+  expect(warnings.churnWarnings.map((warning) => warning.kind)).not.toContain("reopened-finding");
+  expect(warnings.churnWarnings.map((warning) => warning.kind)).not.toContain("non-progress");
+}, 30_000);
+
+test("scenario: interrupted and nonconsecutive partial-blocked remediation outcomes break non-progress churn", async () => {
+  const { repository, goalId, applicationId } = await remediationSource();
+  await publishRemediateReview(repository, goalId, applicationId, "repeat-finding");
+  await publishPartialRemediation(repository, goalId, applicationId);
+  await publishRemediateReview(repository, goalId, applicationId, "repeat-finding");
+
+  const interrupted = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId, instruction: "Interrupt remediation.", executionPolicy: policy });
+  const interruptedIdentity = { goalId, applicationId, ticketId: interrupted.ticket.metadata.ticketId };
+  await dispatchApplicationWorker({ cwd: repository.root, ...interruptedIdentity, worker: "interrupted-remediator", command: ["bun", "-e", "process.exit(0)"] });
+  await recoverApplicationTicket(repository.root, goalId, applicationId, interruptedIdentity.ticketId);
+  expect((await loadApplicationReportIfPresent(repository.root, goalId, applicationId, interruptedIdentity.ticketId))?.metadata.outcome).toBe("interrupted");
+
+  await publishRemediateReview(repository, goalId, applicationId, "repeat-finding");
+  const blocked = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId, instruction: "Block remediation.", executionPolicy: policy });
+  const blockedIdentity = { goalId, applicationId, ticketId: blocked.ticket.metadata.ticketId };
+  const blockedRun = await dispatchApplicationWorker({ cwd: repository.root, ...blockedIdentity, worker: "blocked-remediator", command: blockedCompletionCommand() });
+  const blockedReport = await publishApplicationImplementationReport({ cwd: repository.root, ...blockedIdentity, message: { summary: "Unused for blocked." }, execution: applicationExecution(blockedRun) });
+  expect(blockedReport.report.metadata.outcome).toBe("blocked");
+  await recoverApplicationTicket(repository.root, goalId, applicationId, blockedIdentity.ticketId);
+
+  const warnings = await deriveApplicationStatus(repository.root, goalId, applicationId);
+  expect(warnings.churnWarnings.map((warning) => warning.kind).sort()).toEqual(["remediation-rounds", "reopened-finding"]);
+  expect(warnings.churnWarnings.map((warning) => warning.kind)).not.toContain("non-progress");
+}, 30_000);
 
 test("scenario: target movement refuses prepared Application production before Report effects", async () => {
   const { repository, goalId } = await readyGoal();

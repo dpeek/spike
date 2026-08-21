@@ -104,7 +104,7 @@ export const goalPlannerToolNames = [
 ] as const;
 
 export const applicationSupervisorToolNames = [
-  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
+  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_publish_application_blocked", "spike_publish_application_partial", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
 ] as const;
 
 export const supervisorToolNames = [
@@ -197,7 +197,9 @@ function goalStatusLines(value: unknown): string[] {
   const change = object(goal.currentChange);
   if (change === undefined) {
     const decisions = Array.isArray(goal.decisions) ? goal.decisions.length : 0;
-    return [`Goal ${goalId}`, `No active Change · ${decisions} resolved · ${cleanupText}`];
+    const applications = Array.isArray(goal.application) ? goal.application : [];
+    const warnings = applications.reduce((count: number, application: unknown) => { const record = object(application); return count + (Array.isArray(record?.churnWarnings) ? record.churnWarnings.length : 0); }, 0);
+    return [`Goal ${goalId}`, `No active Change · ${decisions} resolved · ${cleanupText}${warnings ? ` · ${warnings} Application churn warning(s)` : ""}`];
   }
 
   const lines = [`Goal ${goalId} · Change ${string(change.changeId) ?? "unknown"}`];
@@ -221,6 +223,8 @@ function goalStatusLines(value: unknown): string[] {
   }
   const churn = Array.isArray(change.churnWarnings) ? change.churnWarnings.length : 0;
   if (churn > 0) lines.push(`${churn} churn warning(s)`);
+  const applications = Array.isArray(goal.application) ? goal.application : [];
+  for (const application of applications) { const record = object(application); const churn = Array.isArray(record?.churnWarnings) ? record.churnWarnings.length : 0; if (churn > 0) lines.push(`Application ${string(record?.applicationId) ?? "unknown"} · ${churn} churn warning(s)`); }
   lines.push(cleanupText);
   return lines;
 }
@@ -898,6 +902,16 @@ export function registerSupervisorExtension(
       name: "spike_publish_application_report", label: "Publish Application Report", description: "Validate exact Application output and publish its Report before rebuildable Candidate retention.", promptSnippet: "Publish one exact Application Report",
       parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker", "commitSummary"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString, commitSummary: nonBlankString } }, command: "application report publish",
       args: (params) => ["application", "report", "publish", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker, "--commit-summary", params.commitSummary],
+    }, invoke, options),
+    tool({
+      name: "spike_publish_application_blocked", label: "Publish blocked Application Report", description: "Publish strict terminal blocked Application implementation evidence without a Candidate.", promptSnippet: "Publish exact blocked Application Report",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString } }, command: "application report blocked",
+      args: (params) => ["application", "report", "blocked", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker],
+    }, invoke, options),
+    tool({
+      name: "spike_publish_application_partial", label: "Publish partial Application Report", description: "Publish strict terminal partial Application implementation evidence without a Candidate.", promptSnippet: "Publish exact partial Application Report",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker", "reason"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString, reason: nonBlankString } }, command: "application report partial",
+      args: (params) => ["application", "report", "partial", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker, "--reason", params.reason],
     }, invoke, options),
     tool({
       name: "spike_recover_application", label: "Recover Application", description: "Goal-scoped supervisor recovery for one Application Ticket.", promptSnippet: "Recover one exact Application Ticket",

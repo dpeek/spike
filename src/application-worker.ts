@@ -12,7 +12,7 @@ const recordSchema = z.object({
   kind: z.literal("application-worker"), goalId: z.string().min(1), applicationId: z.string().min(1), ticketId: z.string().min(1),
   adapter: z.literal("local-clone"), isolation: z.enum(["workspace", "container"]), worker: z.string().trim().min(1), model: z.string().trim().min(1),
   thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]), startedAt: timestamp, finishedAt: timestamp.optional(), exitCode: z.number().int().optional(),
-  runtime: z.object({ workspace: z.string().min(1) }).strict().optional(),
+  runtime: z.object({ workspace: z.string().min(1), pid: z.number().int().positive().optional() }).strict().optional(),
 }).strict();
 export type ApplicationWorkerExecution = ApplicationTicketIdentity & { adapter: "local-clone"; isolation: "workspace" | "container"; worker: string; model: string; thinking: z.infer<typeof recordSchema>["thinking"]; startedAt: string; finishedAt: string; exitCode: number; stdout: string; stderr: string };
 export type ApplicationWorkerRecord = { metadata: z.infer<typeof recordSchema>; body: string };
@@ -41,10 +41,50 @@ export async function readApplicationWorker(root: string, identity: ApplicationT
   return record.body.slice(0, maximumBytes);
 }
 export async function loadFinishedApplicationWorker(root: string, identity: ApplicationTicketIdentity) { const record = await loadApplicationWorkerIfPresent(root, identity); if (record === undefined) throw new Error("Application Worker has no runtime record"); return execution(record); }
-/** Finalization releases only external runtime. It is safe to retry and keeps
- * finished execution provenance available until Report publication. */
+
+type ActiveApplicationWorker = { cancelled: boolean; settled: boolean; child?: ReturnType<typeof Bun.spawn>; terminal: Promise<void>; settle: () => void };
+const activeApplicationWorkers = new Map<string, ActiveApplicationWorker>();
+function applicationWorkerKey(root: string, identity: ApplicationTicketIdentity) { return `${root}\u0000${identity.goalId}\u0000${identity.applicationId}\u0000${identity.ticketId}`; }
+function activeWorker(): ActiveApplicationWorker {
+  let settle!: () => void;
+  const terminal = new Promise<void>((resolve) => { settle = resolve; });
+  return { cancelled: false, settled: false, terminal, settle };
+}
+function settleActiveWorker(active: ActiveApplicationWorker) { if (!active.settled) { active.settled = true; active.settle(); } }
+async function waitForStoppedProcess(pid: number): Promise<void> {
+  // A recovery process may not be the dispatcher process.  In that case the
+  // PID recorded by this adapter is its ownership handle.  Do not release its
+  // workspace until the child has actually gone away.
+  for (let attempts = 0; attempts < 500; attempts++) {
+    try { process.kill(pid, 0); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error(`Application Worker ${pid} did not terminate after stop`);
+}
+/** Stop is adapter-owned and waits for the child terminal state before a
+ * recovery caller can finalize its workspace. */
+export async function stopApplicationWorker(root: string, identity: ApplicationTicketIdentity): Promise<void> {
+  const record = await loadApplicationWorkerIfPresent(root, identity);
+  const active = activeApplicationWorkers.get(applicationWorkerKey(root, identity));
+  if (active) active.cancelled = true;
+  const pid = active?.child?.pid ?? record?.metadata.runtime?.pid;
+  if (pid !== undefined && record?.metadata.finishedAt === undefined) {
+    try { process.kill(pid, "SIGTERM"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
+  if (active) await active.terminal;
+  else if (pid !== undefined && record?.metadata.finishedAt === undefined) await waitForStoppedProcess(pid);
+}
+/** Finalization releases only an already stopped adapter-owned runtime. */
 export async function finalizeApplicationWorker(root: string, identity: ApplicationTicketIdentity): Promise<void> {
   const record = await loadApplicationWorkerIfPresent(root, identity); if (record?.metadata.runtime === undefined) return;
+  if (record.metadata.finishedAt === undefined && record.metadata.runtime.pid !== undefined) {
+    // stopApplicationWorker is the only legal transition for a live process.
+    try { process.kill(record.metadata.runtime.pid, 0); throw new Error("Application Worker must be stopped before finalization"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
   await rm(record.metadata.runtime.workspace, { recursive: true, force: true });
   await replaceRecord(root, { ...record, metadata: recordSchema.parse({ ...record.metadata, runtime: undefined }) });
 }
@@ -57,6 +97,7 @@ export async function forgetFinalizedApplicationWorker(root: string, identity: A
   await rm(applicationWorkerRecordPath(root, identity), { force: true });
 }
 export async function cleanupApplicationWorker(root: string, identity: ApplicationTicketIdentity): Promise<void> {
+  await stopApplicationWorker(root, identity);
   await finalizeApplicationWorker(root, identity);
   await forgetFinalizedApplicationWorker(root, identity);
 }
@@ -77,6 +118,8 @@ export async function dispatchApplicationWorker(input: ApplicationTicketIdentity
   if (await loadApplicationWorkerIfPresent(repository.root, input) !== undefined) throw new Error("Application Worker already has a runtime record");
   const metadata = recordSchema.parse({ kind: "application-worker", goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, adapter: "local-clone", isolation: ticket.metadata.executionPolicy.isolation, worker: input.worker, model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt, runtime: { workspace } });
   let record: ApplicationWorkerRecord = { metadata, body: "# Application Worker runtime\n" };
+  const active = activeWorker(), key = applicationWorkerKey(repository.root, input);
+  activeApplicationWorkers.set(key, active);
   await installImmutable(repository.root, applicationWorkerRecordPath(repository.root, input), serializeDocument(metadata, record.body));
   try {
     await git(workspace, ["clone", "--quiet", "--no-checkout", join(exchange.inputDirectory, "repository.bundle"), checkout]);
@@ -90,11 +133,30 @@ export async function dispatchApplicationWorker(input: ApplicationTicketIdentity
     for (const [, ref] of heads) await git(checkout, ["fetch", "--quiet", "--no-tags", join(exchange.inputDirectory, "repository.bundle"), `${ref}:${ref}`]);
     if (!heads.some(([hash]) => hash === ticket.metadata.inputRevision)) throw new Error("Application input bundle does not expose the pinned input revision");
     await git(checkout, ["checkout", "--quiet", "--detach", ticket.metadata.inputRevision]);
+    if (active.cancelled) throw new Error("Application Worker dispatch was interrupted");
     const child = Bun.spawn(input.command, { cwd: checkout, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { ...process.env, SPIKE_INPUT_DIR: exchange.inputDirectory, SPIKE_OUTPUT_DIR: exchange.outputDirectory, SPIKE_INPUT_REVISION: ticket.metadata.inputRevision, SPIKE_GOAL_ID: input.goalId, SPIKE_APPLICATION_ID: input.applicationId, SPIKE_TICKET_ID: input.ticketId, SPIKE_TICKET_ROLE: "implement", SPIKE_MODEL: ticket.metadata.model, SPIKE_THINKING: ticket.metadata.thinking } });
+    active.child = child;
+    record = { ...record, metadata: recordSchema.parse({ ...record.metadata, runtime: { workspace, pid: child.pid } }) };
+    await replaceRecord(repository.root, record);
     const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-    record = { metadata: recordSchema.parse({ ...record.metadata, finishedAt: (input.clock ?? (() => new Date()))().toISOString(), exitCode }), body: `# Application Worker runtime\n\n## stdout\n\n${stdout}\n\n## stderr\n\n${stderr}\n` }; await replaceRecord(repository.root, record);
+    settleActiveWorker(active);
+    // Recovery may have removed the runtime record while this dispatcher was
+    // awaiting its child.  Never recreate it with a late completion update.
+    if (active.cancelled || await loadApplicationWorkerIfPresent(repository.root, input) === undefined) throw new Error("Application Worker dispatch was interrupted");
+    record = { metadata: recordSchema.parse({ ...record.metadata, finishedAt: (input.clock ?? (() => new Date()))().toISOString(), exitCode }), body: `# Application Worker runtime\n\n## stdout\n\n${stdout}\n\n## stderr\n\n${stderr}\n` };
+    await replaceRecord(repository.root, record);
     return { root: repository.root, exchange, execution: { ...execution(record), stdout, stderr } };
-  } catch (error) { await cleanupApplicationWorker(repository.root, input).catch(() => undefined); throw error; }
+  } catch (error) {
+    // If setup failed after spawn, make the adapter's terminal promise mean
+    // process termination too; recovery must never finalize a live child.
+    if (active.child && !active.settled) {
+      active.cancelled = true;
+      try { process.kill(active.child.pid, "SIGTERM"); } catch (stopError) { if ((stopError as NodeJS.ErrnoException).code !== "ESRCH") throw stopError; }
+      try { await active.child.exited; } finally { settleActiveWorker(active); }
+    } else settleActiveWorker(active);
+    await cleanupApplicationWorker(repository.root, input).catch(() => undefined);
+    throw error;
+  } finally { activeApplicationWorkers.delete(key); }
 }
 
 // Application review uses this same configured Application adapter seam.  The
@@ -195,4 +257,4 @@ export async function dispatchApplicationReviewPiTicket(input: ApplicationReview
   return dispatchApplicationReviewWorker({ ...input, command: [input.piExecutable ?? "pi", "--print", "--no-session", "--no-approve", "--model", ticket.metadata.model, "--thinking", ticket.metadata.thinking, "--no-extensions", "--extension", extension, "--no-skills", "--no-prompt-templates", "--no-context-files", "--tools", "read,bash,edit,write,spike_complete_review,spike_block_review", "Execute the attached immutable Application review Ticket in this exact checkout. Finish with spike_complete_review, or use spike_block_review only when blocked."] });
 }
 /** The configured Application adapter exposes role-specific lifecycle methods. */
-export const configuredApplicationAdapter = { dispatch: dispatchApplicationWorker, review: { dispatch: dispatchApplicationReviewWorker, dispatchPi: dispatchApplicationReviewPiTicket, observe: observeApplicationReviewWorker, read: readApplicationReviewWorker, loadFinished: loadFinishedApplicationReviewWorker, stop: stopApplicationReviewWorker, finalize: finalizeApplicationReviewWorker, forget: forgetFinalizedApplicationReviewWorker } };
+export const configuredApplicationAdapter = { dispatch: dispatchApplicationWorker, observe: observeApplicationWorker, read: readApplicationWorker, loadFinished: loadFinishedApplicationWorker, stop: stopApplicationWorker, finalize: finalizeApplicationWorker, forget: forgetFinalizedApplicationWorker, review: { dispatch: dispatchApplicationReviewWorker, dispatchPi: dispatchApplicationReviewPiTicket, observe: observeApplicationReviewWorker, read: readApplicationReviewWorker, loadFinished: loadFinishedApplicationReviewWorker, stop: stopApplicationReviewWorker, finalize: finalizeApplicationReviewWorker, forget: forgetFinalizedApplicationReviewWorker } };

@@ -18,18 +18,18 @@ export const applicationTicketSchema = z.object({
   issuedAt: timestamp, role: z.literal("implement"), targetRevision: revision, goalRevision: revision, mergeBase: revision,
   inputRevision: revision, integration: z.object({ classification: z.enum(["clean", "conflict"]), cleanTree: revision.optional(), conflictEvidence: z.string().trim().min(1).optional() }).strict(),
   model: z.string().trim().min(1), thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]), executionPolicy: policy,
-  guidance: z.object({ step: z.literal("implement"), revision }).strict(), replacesTicketId: z.string().regex(sequenceIdPattern).optional(),
+  guidance: z.object({ step: z.literal("implement"), revision }).strict(), replacesTicketId: z.string().regex(sequenceIdPattern).optional(), responseToReviewTicketId: z.string().regex(sequenceIdPattern).optional(),
 }).strict().superRefine((value, ctx) => {
   if (value.integration.classification === "clean" && value.integration.cleanTree === undefined) ctx.addIssue({ code: "custom", message: "clean integration requires cleanTree" });
   if (value.integration.classification === "conflict" && value.integration.conflictEvidence === undefined) ctx.addIssue({ code: "custom", message: "conflict integration requires conflictEvidence" });
 });
 export const applicationReportSchema = z.object({
   kind: z.literal("application-report"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), ticketId: z.string().regex(sequenceIdPattern),
-  role: z.literal("implement"), outcome: z.enum(["completed", "interrupted"]), publishedAt: timestamp,
+  role: z.literal("implement"), outcome: z.enum(["completed", "blocked", "partial", "interrupted"]), publishedAt: timestamp,
   targetRevision: revision, goalRevision: revision, mergeBase: revision, integrationClassification: z.enum(["clean", "conflict"]),
   inputRevision: revision, workerRevision: revision.optional(), candidateRevision: revision.optional(), artifacts: z.array(z.object({ path: z.string(), sha256: z.string().regex(/^[0-9a-f]{64}$/), bytes: z.number().int().nonnegative() }).strict()),
   execution: z.object({ adapter: z.string().trim().min(1), isolation: z.enum(["workspace", "container"]), worker: z.string().trim().min(1), model: z.string().trim().min(1), thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]), startedAt: timestamp, finishedAt: timestamp }).strict(),
-}).strict().superRefine((value, ctx) => { if (value.outcome === "completed" && (value.workerRevision === undefined || value.candidateRevision === undefined)) ctx.addIssue({ code: "custom", message: "completed Application Report requires worker and Candidate revisions" }); });
+}).strict().superRefine((value, ctx) => { if (value.outcome === "completed" && (value.workerRevision === undefined || value.candidateRevision === undefined)) ctx.addIssue({ code: "custom", message: "completed Application Report requires worker and Candidate revisions" }); if (value.outcome !== "completed" && (value.workerRevision !== undefined || value.candidateRevision !== undefined)) ctx.addIssue({ code: "custom", message: "terminal Application Report must not contain Candidate revisions" }); });
 export type ApplicationTicket = { metadata: z.infer<typeof applicationTicketSchema>; body: string };
 export type ApplicationReport = { metadata: z.infer<typeof applicationReportSchema>; body: string };
 export type ApplicationTicketIdentity = { goalId: string; applicationId: string; ticketId: string };
@@ -77,39 +77,85 @@ async function integration(root: string, base: string, target: string, goal: str
   if (code === 1) return { classification: "conflict", evidence: `${stderr}\n${stdout}`.trim().slice(0, 32 * 1024) || "Git reported a three-way integration conflict." };
   throw new Error(`Git could not calculate exact three-way integration: ${(stderr || stdout).slice(0, 32 * 1024)}`);
 }
+const maximumRemediationReviewContextBytes = 64 * 1024;
+
+/** A response is authorized by one immutable review Report, not a summary of it. */
+function canonicalRemediationReviewContext(report: { metadata: Record<string, unknown>; body: string }): string {
+  const serialized = serializeDocument(report.metadata, report.body);
+  if (Buffer.byteLength(serialized, "utf8") > maximumRemediationReviewContextBytes) {
+    throw new Error(`Application remediation response review Report exceeds the ${maximumRemediationReviewContextBytes}-byte context limit`);
+  }
+  return serialized;
+}
+
 function body(ticket: z.infer<typeof applicationTicketSchema>, instruction: string, guidance: string) {
   return `# Implement Application Candidate\n\n## Instruction\n\n${instruction}\n\n## Pinned provenance\n\nTarget main M: \`${ticket.targetRevision}\`\n\nGoal G: \`${ticket.goalRevision}\`\n\nMerge base B: \`${ticket.mergeBase}\`\n\nIntegration: \`${ticket.integration.classification}\`\n\n${ticket.integration.conflictEvidence === undefined ? "" : `### Conflict evidence\n\n${ticket.integration.conflictEvidence}\n\n`}## Workflow guidance\n\nSelected \`${ticket.guidance.step}\` guidance from exact target M \`${ticket.guidance.revision}\`.\n\n${guidance.trimEnd()}\n`;
 }
 export type IssueApplicationTicketInput = ApplicationTicketIdentity & { cwd: string; instruction: string; executionPolicy?: Partial<z.infer<typeof policy>>; model?: string; thinking?: ThinkingLevel; now?: Date };
 /** Supervisor-only issuance for the exact diverged FIFO head. No Application Ticket may ever repin M/G/B. */
 export async function issueApplicationTicket(input: Omit<IssueApplicationTicketInput, "ticketId">): Promise<{ root: string; ticket: ApplicationTicket }> {
-  const repository = await discoverRepository(input.cwd); const head = await queuedApplicationHead(repository.root);
+  const repository = await discoverRepository(input.cwd);
+  // Every refusal below precedes assignment, guidance loading, input-commit
+  // creation, and the sole durable Ticket write.
+  const head = await queuedApplicationHead(repository.root);
   if (head === undefined || head.metadata.goalId !== input.goalId || head.metadata.applicationId !== input.applicationId || head.decision !== undefined || head.invalidDecision) throw new Error("Application Ticket issuance requires the exact unresolved FIFO head");
   const application = await loadApplication(repository.root, input.goalId, input.applicationId);
-  const warnings = await applicationCleanupWarnings(repository.root, input.goalId, input.applicationId); if (warnings.length) throw new Error(`Application issuance blocked by cleanup health: ${warnings.join("; ")}`);
   const existingIds = await listApplicationTicketIds(repository.root, input.goalId, input.applicationId);
   for (const id of existingIds) if ((await loadApplicationReportIfPresent(repository.root, input.goalId, input.applicationId, id)) === undefined) throw new Error(`Application ${input.goalId}/${input.applicationId} already has open Ticket ${id}`);
-  const currentMain = await main(repository.root); const first = existingIds.length === 0 ? undefined : await loadApplicationTicket(repository.root, input.goalId, input.applicationId, existingIds[0]!);
-  const targetRevision = first?.metadata.targetRevision ?? currentMain; const goalRevision = first?.metadata.goalRevision ?? application.metadata.integratedRevision;
+  const warnings = await applicationCleanupWarnings(repository.root, input.goalId, input.applicationId); if (warnings.length) throw new Error(`Application issuance blocked by cleanup health: ${warnings.join("; ")}`);
+  const currentMain = await main(repository.root);
+  const first = existingIds.length === 0 ? undefined : await loadApplicationTicket(repository.root, input.goalId, input.applicationId, existingIds[0]!);
+  const targetRevision = first?.metadata.targetRevision ?? currentMain;
+  const goalRevision = first?.metadata.goalRevision ?? application.metadata.integratedRevision;
   if (currentMain !== targetRevision) throw new Error(`Application target mismatch: main is ${currentMain}, pinned target is ${targetRevision}`);
-  if (first === undefined) {
-    // A clean-base head belongs to the existing apply path, never this one.
+
+  const reviews = await import("./application-review.ts");
+  const reviewIds = await reviews.listApplicationReviewTicketIds(repository.root, input.goalId, input.applicationId);
+  const reviewReports = await Promise.all(reviewIds.map(id => reviews.loadApplicationReviewReportIfPresent(repository.root, input.goalId, input.applicationId, id)));
+  if (reviewReports.some(report => report === undefined)) throw new Error("Application remediation requires every prior review Ticket to be reported");
+  const highest = reviewReports.filter(Boolean).at(-1);
+  const latestCandidate = await (async () => {
+    for (const id of [...existingIds].reverse()) {
+      const report = await loadApplicationReportIfPresent(repository.root, input.goalId, input.applicationId, id);
+      if (report?.metadata.outcome === "completed" && report.metadata.candidateRevision) return { ticketId: id, revision: report.metadata.candidateRevision };
+    }
+    return undefined;
+  })();
+  const remediation = highest?.metadata.outcome === "completed" && highest.metadata.verdict === "remediate";
+  // Validate the complete canonical authorizing Report before any operation
+  // that can create Ticket/runtime/exchange state (including an input commit).
+  // A response must never receive a silently shortened authorization context.
+  const responseReviewContext = remediation ? canonicalRemediationReviewContext(highest!) : undefined;
+  if (remediation) {
+    if (!latestCandidate || highest.metadata.candidateRevision !== latestCandidate.revision || highest.metadata.producingImplementationTicketId !== latestCandidate.ticketId) throw new Error("Application remediation requires the highest remediate review for the exact current Candidate and producer");
+    for (const ticketId of existingIds) {
+      const ticket = await loadApplicationTicket(repository.root, input.goalId, input.applicationId, ticketId);
+      if (ticket.metadata.responseToReviewTicketId === highest.metadata.ticketId) throw new Error("Application review already authorizes a remediation response");
+    }
+  } else if (first !== undefined) {
+    throw new Error("Application Ticket issuance requires the highest exact review verdict to be remediate");
+  } else {
     const goal = await (await import("./goal.ts")).loadGoal(repository.root, input.goalId);
     if (targetRevision === goal.metadata.repository.initialRevision) throw new Error("Application Ticket issuance requires main to differ from the Goal base");
   }
+
   await git(repository.root, ["rev-parse", "--verify", `${goalRevision}^{commit}`]);
   const mergeBase = first?.metadata.mergeBase ?? await git(repository.root, ["merge-base", targetRevision, goalRevision]);
-  const result = await integration(repository.root, mergeBase, targetRevision, goalRevision);
-  const inputRevision = result.classification === "clean" ? await git(repository.root, ["commit-tree", result.tree, "-p", targetRevision, "-m", "Spike Application integration input"]) : targetRevision;
+  const result = remediation ? undefined : await integration(repository.root, mergeBase, targetRevision, goalRevision);
+  const inputRevision = remediation ? latestCandidate!.revision : result!.classification === "clean" ? await git(repository.root, ["commit-tree", result!.tree, "-p", targetRevision, "-m", "Spike Application integration input"]) : targetRevision;
   const assignment = await resolveTicketAssignment(repository.root, "implement", { ...(input.model === undefined ? {} : { model: input.model }), ...(input.thinking === undefined ? {} : { thinking: input.thinking }), ...(input.executionPolicy?.isolation === undefined ? {} : { isolation: input.executionPolicy.isolation }), ...(input.executionPolicy?.networkAccess === undefined ? {} : { networkAccess: input.executionPolicy.networkAccess }), ...(input.executionPolicy?.credentialGrants === undefined ? {} : { credentialGrants: input.executionPolicy.credentialGrants }) });
   const guidance = await loadGuidance(repository.root, "implement", targetRevision);
   const ticketId = next(await ids(repository.root, input.goalId, input.applicationId));
-  const metadata = applicationTicketSchema.parse({ kind: "application-ticket", goalId: input.goalId, applicationId: input.applicationId, ticketId, issuedAt: (input.now ?? new Date()).toISOString(), role: "implement", targetRevision, goalRevision, mergeBase, inputRevision, integration: result.classification === "clean" ? { classification: "clean", cleanTree: result.tree } : { classification: "conflict", conflictEvidence: result.evidence }, model: assignment.model, thinking: assignment.thinking, executionPolicy: { isolation: assignment.isolation, networkAccess: assignment.networkAccess, credentialGrants: assignment.credentialGrants }, guidance: { step: "implement", revision: targetRevision }, ...(first === undefined ? {} : { replacesTicketId: first.metadata.ticketId }) });
-  const document = body(metadata, text(input.instruction, "Application Ticket instruction"), guidance.markdown);
+  const metadata = applicationTicketSchema.parse({ kind: "application-ticket", goalId: input.goalId, applicationId: input.applicationId, ticketId, issuedAt: (input.now ?? new Date()).toISOString(), role: "implement", targetRevision, goalRevision, mergeBase, inputRevision, integration: remediation ? { classification: "clean", cleanTree: await git(repository.root, ["rev-parse", "--verify", `${inputRevision}^{tree}`]) } : result!.classification === "clean" ? { classification: "clean", cleanTree: result!.tree } : { classification: "conflict", conflictEvidence: result!.evidence }, model: assignment.model, thinking: assignment.thinking, executionPolicy: { isolation: assignment.isolation, networkAccess: assignment.networkAccess, credentialGrants: assignment.credentialGrants }, guidance: { step: "implement", revision: targetRevision }, ...(remediation ? { replacesTicketId: latestCandidate!.ticketId, responseToReviewTicketId: highest!.metadata.ticketId } : {}) });
+  let document = body(metadata, text(input.instruction, "Application Ticket instruction"), guidance.markdown);
+  if (remediation) {
+    const goal = await (await import("./goal.ts")).loadGoal(repository.root, input.goalId);
+    const report = highest!;
+    document += `\n## Remediation response contract\n\nRespond only to exact review Ticket \`${report.metadata.ticketId}\` for Candidate \`${latestCandidate!.revision}\` produced by implementation Ticket \`${latestCandidate!.ticketId}\`. Replace that Candidate through one normalized sole-parent-M Candidate; do not mutate main, Goal refs, or the host worktree. A fresh exact review is required after publication.\n\n## Exact response review Report\n\n${responseReviewContext}\n## Goal outcome and constraints\n\n${goal.body.slice(0, 32768)}\n`;
+  }
   await installImmutable(repository.root, applicationTicketPath(repository.root, input.goalId, input.applicationId, ticketId), serializeDocument(metadata, document));
   return { root: repository.root, ticket: { metadata, body: document } };
 }
-
 async function exists(path: string) { try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; } }
 export async function applicationCleanupWarnings(root: string, goalId: string, applicationId: string): Promise<string[]> {
   const warnings: string[] = [];
@@ -183,7 +229,11 @@ export async function prepareApplicationTicketExchange(root: string, identity: A
 
 const artifactPath = z.string().refine((value) => value.startsWith("artifacts/") && !value.endsWith("/") && !value.includes("\\") && value.split("/").every((component) => component !== "" && component !== "." && component !== ".."), "artifact path must be a canonical relative path below artifacts/");
 const artifact = z.object({ path: artifactPath, sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict();
-const submission = z.object({ kind: z.literal("application-submission"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), ticketId: z.string().regex(sequenceIdPattern), outcome: z.literal("completed"), workerRevision: revision, artifacts: z.array(artifact) }).strict();
+const submission = z.discriminatedUnion("outcome", [
+  z.object({ kind: z.literal("application-submission"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), ticketId: z.string().regex(sequenceIdPattern), outcome: z.literal("completed"), workerRevision: revision, artifacts: z.array(artifact) }).strict(),
+  z.object({ kind: z.literal("application-submission"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), ticketId: z.string().regex(sequenceIdPattern), outcome: z.literal("blocked"), artifacts: z.array(artifact) }).strict(),
+  z.object({ kind: z.literal("application-submission"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), ticketId: z.string().regex(sequenceIdPattern), outcome: z.literal("partial"), artifacts: z.array(artifact) }).strict(),
+]);
 async function regular(path: string, label: string, maximum = 100 * 1024 * 1024) { const stat = await lstat(path); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maximum) throw new Error(`${label} must be a bounded regular file`); return stat.size; }
 async function validateOutput(output: string, declared: z.infer<typeof artifact>[]) {
   const allowed = new Set(["submission.md", "repository.bundle", ...declared.map((a) => a.path)]); const dirs = new Set<string>(); for (const a of declared) { const p = a.path.split("/"); for (let i = 1; i < p.length; i++) dirs.add(p.slice(0, i).join("/")); }
@@ -204,8 +254,16 @@ export async function publishApplicationImplementationReport(input: PublishAppli
   if (recorded.model !== ticket.metadata.model || recorded.thinking !== ticket.metadata.thinking || recorded.isolation !== ticket.metadata.executionPolicy.isolation) throw new Error("Application execution does not match immutable Ticket selection");
   const output = join(applicationExchangePath(repository.root, input), "output"); const document = await readDocument(repository.root, join(output, "submission.md")); const accepted = submission.parse(document.metadata);
   if (accepted.goalId !== input.goalId || accepted.applicationId !== input.applicationId || accepted.ticketId !== input.ticketId) throw new Error("Application Submission belongs to a different Ticket");
+  const artifacts = await validateOutput(output, accepted.artifacts);
+  if (accepted.outcome !== "completed") {
+    for (const heading of ["Reason", "Evidence"]) if (!new RegExp(`^## ${heading}\\s*$`, "m").test(document.body)) throw new Error(`${accepted.outcome} Application Submission is missing ${heading}`);
+    const metadata = applicationReportSchema.parse({ kind: "application-report", goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, role: "implement", outcome: accepted.outcome, publishedAt: (input.now ?? new Date()).toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, artifacts, execution: exactExecution });
+    await installImmutable(repository.root, path, serializeDocument(metadata, document.body));
+    await (await import("./application-worker.ts")).cleanupApplicationWorker(repository.root, input).catch(() => undefined);
+    return { root: repository.root, report: { metadata, body: document.body } };
+  }
   for (const heading of ["Summary", "Verification", "Assumptions", "Limitations", "Risks", "Follow-up"]) if (!new RegExp(`^## ${heading}\\s*$`, "m").test(document.body)) throw new Error(`Application Submission is missing ${heading}`);
-  const artifacts = await validateOutput(output, accepted.artifacts); const bundle = join(output, "repository.bundle"); await regular(bundle, "Application output bundle"); await git(repository.root, ["bundle", "verify", bundle]);
+  const bundle = join(output, "repository.bundle"); await regular(bundle, "Application output bundle"); await git(repository.root, ["bundle", "verify", bundle]);
   const heads = await git(repository.root, ["bundle", "list-heads", bundle]); const advertised = heads.split("\n").map((line) => line.split(/\s+/, 2)).find(([hash]) => hash === accepted.workerRevision)?.[1]; if (!advertised) throw new Error("Application output bundle does not advertise exact worker revision");
   const quarantine = `refs/spike/quarantine/goals/${input.goalId}/applications/${input.applicationId}/tickets/${input.ticketId}/${randomUUID()}`;
   try { await git(repository.root, ["fetch", "--quiet", "--no-tags", bundle, `${advertised}:${quarantine}`]); const worker = await git(repository.root, ["rev-parse", "--verify", `${quarantine}^{commit}`]); if (worker !== accepted.workerRevision) throw new Error("imported Application worker revision mismatches Submission"); const tree = await git(repository.root, ["rev-parse", "--verify", `${worker}^{tree}`]); const summary = text(input.message.summary, "Application Candidate summary"); if (summary.includes("\n")) throw new Error("Application Candidate summary must be one line"); const candidate = await git(repository.root, ["commit-tree", tree, "-p", ticket.metadata.targetRevision, "-m", `${summary}\n\nSpike-Goal-Id: ${input.goalId}`]); const metadata = applicationReportSchema.parse({ kind: "application-report", goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, role: "implement", outcome: "completed", publishedAt: (input.now ?? new Date()).toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, workerRevision: worker, candidateRevision: candidate, artifacts, execution: exactExecution });
@@ -219,7 +277,34 @@ export async function publishApplicationImplementationReport(input: PublishAppli
     return { root: repository.root, report };
   } finally { await git(repository.root, ["update-ref", "-d", quarantine]).catch(() => undefined); }
 }
-export async function deriveApplicationStatus(cwd: string, goalId: string, applicationId: string) { const repository = await discoverRepository(cwd); const application = await loadApplication(repository.root, goalId, applicationId); const ticketIds = await listApplicationTicketIds(repository.root, goalId, applicationId); const reports = await Promise.all(ticketIds.map((ticketId) => loadApplicationReportIfPresent(repository.root, goalId, applicationId, ticketId))); const open = ticketIds.find((_id, i) => reports[i] === undefined) ?? null; const completed = reports.map((report, i) => ({ report, ticketId: ticketIds[i]! })).filter((value): value is { report: ApplicationReport; ticketId: string } => value.report?.metadata.outcome === "completed").at(-1); const pinned = ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.targetRevision : null; let current: string | null = null; try { current = await main(repository.root); } catch { /* status remains inspectable */ } const review = await (await import("./application-review.ts")).deriveApplicationReviewStatus(cwd, goalId, applicationId); return { goalId, applicationId, queuePosition: application.metadata.queuePosition, openTicketId: open, latestReport: reports.filter(Boolean).at(-1)?.metadata ?? null, candidate: completed === undefined ? null : { ticketId: completed.ticketId, revision: completed.report.metadata.candidateRevision }, pinnedTargetRevision: pinned, integrationClassification: ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.integration.classification : null, targetMismatch: pinned !== null && current !== null && pinned !== current, cleanupWarnings: await applicationCleanupWarnings(repository.root, goalId, applicationId), review }; }
+export async function publishApplicationPartialReport(input: ApplicationTicketIdentity & { cwd: string; execution: PublishApplicationReportInput["execution"]; reason: string; now?: Date }): Promise<{ root: string; report: ApplicationReport }> {
+  const repository = await discoverRepository(input.cwd), ticket = await loadApplicationTicket(repository.root, input.goalId, input.applicationId, input.ticketId), path = applicationReportPath(repository.root, input.goalId, input.applicationId, input.ticketId);
+  if ((await main(repository.root)) !== ticket.metadata.targetRevision) throw new Error(`Application target mismatch: main differs from pinned target ${ticket.metadata.targetRevision}`);
+  if (await documentExists(repository.root, path)) throw new Error("immutable Application Report already exists");
+  const reason = text(input.reason, "Partial reason");
+  const recorded = await (await import("./application-worker.ts")).loadFinishedApplicationWorker(repository.root, input);
+  const execution = { adapter: recorded.adapter, isolation: recorded.isolation, worker: recorded.worker, model: recorded.model, thinking: recorded.thinking, startedAt: recorded.startedAt, finishedAt: recorded.finishedAt };
+  if (recorded.exitCode !== 0 || JSON.stringify(execution) !== JSON.stringify(input.execution)) throw new Error("Application partial publication requires the exact successful Worker execution");
+  const metadata = applicationReportSchema.parse({ kind: "application-report", goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, role: "implement", outcome: "partial", publishedAt: (input.now ?? new Date()).toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, artifacts: [], execution });
+  await installImmutable(repository.root, path, serializeDocument(metadata, `# Application Ticket partial\n\n## Reason\n\n${reason}\n`));
+  await (await import("./application-worker.ts")).cleanupApplicationWorker(repository.root, input).catch(() => undefined);
+  return { root: repository.root, report: { metadata, body: `# Application Ticket partial\n\n## Reason\n\n${reason}\n` } };
+}
+export type ApplicationChurnWarning = { kind: "remediation-rounds" | "reopened-finding" | "non-progress"; message: string };
+export async function deriveApplicationChurn(root: string, goalId: string, applicationId: string): Promise<ApplicationChurnWarning[]> {
+  const review = await import("./application-review.ts");
+  const reviewReports = await Promise.all((await review.listApplicationReviewTicketIds(root, goalId, applicationId)).map(id => review.loadApplicationReviewReportIfPresent(root, goalId, applicationId, id)));
+  const remediate = reviewReports.filter((report): report is NonNullable<typeof report> => report?.metadata.outcome === "completed" && report.metadata.verdict === "remediate");
+  const warnings: ApplicationChurnWarning[] = [];
+  if (remediate.length >= 2) warnings.push({ kind: "remediation-rounds", message: "two or more remediate review verdicts are recorded" });
+  const seen = new Set<string>(); let reopened = false;
+  for (const report of remediate) { for (const finding of report.metadata.findings) { if (seen.has(finding.id)) reopened = true; seen.add(finding.id); } }
+  if (reopened) warnings.push({ kind: "reopened-finding", message: "a stable finding ID recurred in a later remediation review" });
+  const reports = await Promise.all((await listApplicationTicketIds(root, goalId, applicationId)).map(id => loadApplicationReportIfPresent(root, goalId, applicationId, id)));
+  for (let index = 1; index < reports.length; index++) if (["partial", "blocked"].includes(reports[index - 1]?.metadata.outcome ?? "") && ["partial", "blocked"].includes(reports[index]?.metadata.outcome ?? "")) { warnings.push({ kind: "non-progress", message: "two consecutive partial or blocked implementation Reports are recorded" }); break; }
+  return warnings;
+}
+export async function deriveApplicationStatus(cwd: string, goalId: string, applicationId: string) { const repository = await discoverRepository(cwd); const application = await loadApplication(repository.root, goalId, applicationId); const ticketIds = await listApplicationTicketIds(repository.root, goalId, applicationId); const reports = await Promise.all(ticketIds.map((ticketId) => loadApplicationReportIfPresent(repository.root, goalId, applicationId, ticketId))); const open = ticketIds.find((_id, i) => reports[i] === undefined) ?? null; const completed = reports.map((report, i) => ({ report, ticketId: ticketIds[i]! })).filter((value): value is { report: ApplicationReport; ticketId: string } => value.report?.metadata.outcome === "completed").at(-1); const pinned = ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.targetRevision : null; let current: string | null = null; try { current = await main(repository.root); } catch { /* status remains inspectable */ } const review = await (await import("./application-review.ts")).deriveApplicationReviewStatus(cwd, goalId, applicationId); const worker = open === null ? null : await (await import("./application-worker.ts")).observeApplicationWorker(repository.root, { goalId, applicationId, ticketId: open }); return { goalId, applicationId, queuePosition: application.metadata.queuePosition, openTicketId: open, latestReport: reports.filter(Boolean).at(-1)?.metadata ?? null, candidate: completed === undefined ? null : { ticketId: completed.ticketId, revision: completed.report.metadata.candidateRevision }, pinnedTargetRevision: pinned, integrationClassification: ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.integration.classification : null, targetMismatch: pinned !== null && current !== null && pinned !== current, cleanupWarnings: await applicationCleanupWarnings(repository.root, goalId, applicationId), churnWarnings: await deriveApplicationChurn(repository.root, goalId, applicationId), worker, review }; }
 /** Retryable operational cleanup does not publish or rewrite any Application evidence. */
 export async function cleanupApplicationTicketRuntime(cwd: string, goalId: string, applicationId: string, ticketId: string): Promise<{ root: string }> {
   const repository = await discoverRepository(cwd);
@@ -229,10 +314,25 @@ export async function cleanupApplicationTicketRuntime(cwd: string, goalId: strin
   for (const ref of quarantines.split("\n").filter(Boolean)) await git(repository.root, ["update-ref", "-d", ref]);
   return { root: repository.root };
 }
-export async function recoverApplicationTicket(cwd: string, goalId: string, applicationId: string, ticketId: string, reason = "Supervisor recovery interrupted the open Application Ticket.") { const repository = await discoverRepository(cwd); const ticket = await loadApplicationTicket(repository.root, goalId, applicationId, ticketId); // Target movement blocks production, never recovery: interruption evidence and
-  // operational projections are independent of the current main projection.
-  const path = applicationReportPath(repository.root, goalId, applicationId, ticketId); if (!(await documentExists(repository.root, path))) { const metadata = applicationReportSchema.parse({ kind: "application-report", goalId, applicationId, ticketId, role: "implement", outcome: "interrupted", publishedAt: new Date().toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, artifacts: [], execution: { adapter: "host", isolation: ticket.metadata.executionPolicy.isolation, worker: "not-launched", model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt: ticket.metadata.issuedAt, finishedAt: new Date().toISOString() } }); await installImmutable(repository.root, path, serializeDocument(metadata, `# Application Ticket interrupted\n\n${text(reason, "Interruption reason")}\n`)); }
-  await cleanupApplicationTicketRuntime(repository.root, goalId, applicationId, ticketId);
+export async function recoverApplicationTicket(cwd: string, goalId: string, applicationId: string, ticketId: string, reason = "Supervisor recovery interrupted the open Application Ticket.") {
+  const repository = await discoverRepository(cwd);
+  const ticket = await loadApplicationTicket(repository.root, goalId, applicationId, ticketId);
+  const identity = { goalId, applicationId, ticketId };
+  const path = applicationReportPath(repository.root, goalId, applicationId, ticketId);
+  // Runtime is owned by the configured implementation adapter.  Stop and wait
+  // before removing its workspace or recording an interruption; a late
+  // dispatcher completion must not resurrect the operational record.
+  const adapter = (await import("./application-worker.ts")).configuredApplicationAdapter;
+  await adapter.stop(repository.root, identity);
+  await adapter.finalize(repository.root, identity);
+  await adapter.forget(repository.root, identity);
+  // Target movement blocks production, never recovery: interruption evidence
+  // and operational projections are independent of current main.
+  if (!(await documentExists(repository.root, path))) {
+    const metadata = applicationReportSchema.parse({ kind: "application-report", goalId, applicationId, ticketId, role: "implement", outcome: "interrupted", publishedAt: new Date().toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, artifacts: [], execution: { adapter: "configured-application-adapter", isolation: ticket.metadata.executionPolicy.isolation, worker: "interrupted", model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt: ticket.metadata.issuedAt, finishedAt: new Date().toISOString() } });
+    await installImmutable(repository.root, path, serializeDocument(metadata, `# Application Ticket interrupted\n\n${text(reason, "Interruption reason")}\n`));
+  }
+  await rm(applicationExchangePath(repository.root, identity), { recursive: true, force: true });
   // Retention is derived from Reports: clear an unreported ref left between
   // normalization and Report publication, then rebuild only reported objects.
   const prefix = `refs/spike/goals/${goalId}/applications/${applicationId}/`;
@@ -242,4 +342,5 @@ export async function recoverApplicationTicket(cwd: string, goalId: string, appl
   for (const { id, report } of reports) if (report?.metadata.outcome === "completed") await git(repository.root, ["update-ref", applicationCandidateRef(goalId, applicationId, id), report.metadata.candidateRevision!]);
   const quarantines = await git(repository.root, ["for-each-ref", "--format=%(refname)", `refs/spike/quarantine/goals/${goalId}/applications/${applicationId}/`]);
   for (const ref of quarantines.split("\n").filter(Boolean)) await git(repository.root, ["update-ref", "-d", ref]);
-  return { root: repository.root }; }
+  return { root: repository.root };
+}
