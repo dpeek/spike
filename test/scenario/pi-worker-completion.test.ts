@@ -154,7 +154,7 @@ describe("Pi worker completion boundary", () => {
     const publication = Bun.spawn([
       spikePath,
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001", "--json",
-    ], { cwd: repository.root, stdout: "pipe", stderr: "pipe" });
+    ], { cwd: repository.root, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
     const [exitCode, stdout, stderr] = await Promise.all([
       publication.exited,
       new Response(publication.stdout).text(),

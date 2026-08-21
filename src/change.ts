@@ -12,6 +12,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
 import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
+import { projectRoot } from "./project.ts";
 import {
   deriveCurrentApproval,
   deriveCurrentCandidate,
@@ -105,7 +106,7 @@ export type ResolvedChange = {
 };
 
 function changesPath(root: string, goalId: string): string {
-  return join(root, ".spike", "goals", goalId, "changes");
+  return join(projectRoot(root), "goals", goalId, "changes");
 }
 
 export function changePath(root: string, goalId: string, changeId: string): string {

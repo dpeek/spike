@@ -1,6 +1,7 @@
 import { lstat, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { spikeDataRoot } from "./data-root.ts";
 import { documentExists, installImmutable, listDirectoryNames, readDocument, serializeDocument } from "./durable-state.ts";
 import { projectSlugPattern } from "./identity.ts";
 
@@ -29,21 +30,7 @@ export type RequestView = Request & { state: RequestState; closure: RequestClosu
 /** Lightweight Inbox projection; full documents remain available through loadRequest. */
 export type RequestSummary = { metadata: Request["metadata"]; title: string; state: RequestState };
 
-export function requestDataRoot(environment: NodeJS.ProcessEnv = process.env): string {
-  const configured = environment["SPIKE_DATA_DIR"];
-  if (configured !== undefined) {
-    if (!configured.trim()) throw new Error("SPIKE_DATA_DIR must not be blank");
-    return resolve(configured);
-  }
-  const xdg = environment["XDG_DATA_HOME"];
-  if (xdg !== undefined) {
-    if (!xdg.trim()) throw new Error("XDG_DATA_HOME must not be blank");
-    return join(resolve(xdg), "spike");
-  }
-  const home = environment["HOME"];
-  if (home === undefined || !home.trim()) throw new Error("HOME must be set to resolve the Spike data directory");
-  return join(resolve(home), ".local", "share", "spike");
-}
+export const requestDataRoot = spikeDataRoot;
 
 /** Ensure an absolute selected root is a real directory before it is used. */
 async function prepareRoot(root: string, create = false): Promise<boolean> {
@@ -136,7 +123,9 @@ export async function createRequest(input: { title: string; statement: string; p
 export async function loadRequest(rootInput: string, requestId: string): Promise<RequestView> {
   const root = resolve(rootInput);
   if (!(await prepareRoot(root))) throw new Error(`Request data root does not exist: ${root}`);
-  const requestDocument = await readDocument(root, requestPath(root, requestId));
+  const path = requestPath(root, requestId);
+  if (!(await documentExists(root, path))) throw new Error(`Source Request does not exist: ${requestId}`);
+  const requestDocument = await readDocument(root, path);
   const metadata = requestSchema.parse(requestDocument.metadata);
   if (metadata.requestId !== requestId) throw new Error(`Request document belongs to a different Request: ${metadata.requestId}`);
   titleFromBody(requestDocument.body);

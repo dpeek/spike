@@ -26,6 +26,26 @@ async function fixture(policy: ExecutionPolicy = { isolation: "container", netwo
 
 workerAdapterContract({ name: "docker", adapter: dockerWorkerAdapter, createTicket: fixture });
 
+function expectCodingWorkspaceIsExecutable(inspected: any): void {
+  const options = inspected[0].HostConfig.Tmpfs?.["/work"] as string | undefined;
+  expect(options).toBeDefined();
+  expect(options).toContain("exec");
+  expect(options).toContain("nosuid");
+  expect(options).toMatch(/(?:^|,)size=(?:256m|268435456)(?:,|$)/);
+  expect(options).not.toContain("noexec");
+  expect(inspected[0].HostConfig.Tmpfs?.["/tmp"]).toContain("noexec");
+}
+
+const executeGeneratedWorkFile = `
+const { chmod } = await import("node:fs/promises");
+await Bun.write("generated-work-proof.sh", "#!/bin/sh\\nprintf 'generated /work file executed\\n'\\n");
+await chmod("generated-work-proof.sh", 0o700);
+const proof = Bun.spawn(["./generated-work-proof.sh"], { stdout: "pipe", stderr: "pipe" });
+const [code, stdout, stderr] = await Promise.all([proof.exited, new Response(proof.stdout).text(), new Response(proof.stderr).text()]);
+if (code !== 0) throw new Error(stderr || "generated proof failed");
+process.stdout.write(stdout);
+`;
+
 describe("Docker worker isolation", () => {
   test("mounts only the declared exchange, records immutable image provenance, and enforces policy before launch", async () => {
     const active = await fixture();
@@ -62,6 +82,23 @@ describe("Docker worker isolation", () => {
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", unsupported.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await unsupported.remove();
+    }
+  }, 30_000);
+
+  test("executes a generated file under /work and keeps the direct workspace bounded", async () => {
+    const active = await fixture();
+    try {
+      const dispatched = await dockerWorkerAdapter.dispatch({
+        cwd: active.root, ...active.identity, worker: "work-execution-regression", command: ["bun", "-e", executeGeneratedWorkFile],
+      });
+      expect(dispatched.execution).toMatchObject({ exitCode: 0, stdout: "generated /work file executed\n", stderr: "" });
+      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const runtime = record!.metadata.runtime!.resource as { containerId: string };
+      expectCodingWorkspaceIsExecutable(await Bun.$`docker inspect ${runtime.containerId}`.json());
+      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+    } finally {
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
     }
   }, 30_000);
 
@@ -200,7 +237,7 @@ describe("Docker worker isolation", () => {
       async closeTab(tab) { closed.push(tab); },
     };
     try {
-      const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "attended-worker", command: ["bun", "-e", "await Bun.sleep(100)"], herdr: host });
+      const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "attended-worker", command: ["bun", "-e", `${executeGeneratedWorkFile}\nawait Bun.sleep(500);`], herdr: host });
       expect(dispatched.status).toBe("working");
       const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string; host: string; imageDigest: string; workspace: string }; 
@@ -210,6 +247,7 @@ describe("Docker worker isolation", () => {
       expect(inspected[0].HostConfig.ReadonlyRootfs).toBe(true);
       expect(inspected[0].HostConfig.NetworkMode).toBe("none");
       expect(inspected[0].Image).toBe(runtime.imageDigest);
+      expectCodingWorkspaceIsExecutable(inspected);
       const mounts = inspected[0].Mounts as Array<{ Destination: string; RW: boolean }>;
       expect(mounts.map((mount) => mount.Destination).sort()).toEqual(["/exchange/input", "/exchange/output"]);
       expect(mounts.find((mount) => mount.Destination === "/exchange/input")?.RW).toBe(false);
@@ -217,6 +255,7 @@ describe("Docker worker isolation", () => {
       expect((await observeWorker(active.root, active.identity, host)).status).toBe("working");
       await waitForWorkerDone(active.root, active.identity);
       expect((await observeWorker(active.root, active.identity, host)).status).toBe("done");
+      expect((await Bun.$`docker logs ${runtime.containerId}`.text()).replaceAll("\r\n", "\n")).toBe("generated /work file executed\n");
       expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), {
         async stop(runtime) { await Bun.$`docker stop --time 1 ${(runtime as { containerId: string }).containerId}`.quiet(); await host.closeTab("docker-tab"); },
         async cleanup(runtime) {

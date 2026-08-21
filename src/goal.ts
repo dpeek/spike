@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { z } from "zod";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
-import { assertGoalBelongsToProject, loadProjectConfig } from "./config.ts";
+import { assertGoalBelongsToProject, loadProjectIdentity } from "./config.ts";
 import {
   documentExists,
   installImmutable,
@@ -13,6 +13,7 @@ import { discoverRepository, git } from "./git.ts";
 import { formatGoalId, goalIdPattern, goalSequence } from "./identity.ts";
 import { createInitialPlan, type Plan } from "./plan.ts";
 import { loadRequest, requestDataRoot } from "./request.ts";
+import { projectRoot } from "./project.ts";
 
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -54,7 +55,7 @@ export type CreateGoalInput = {
 };
 
 export function goalPath(root: string, goalId: string): string {
-  return join(root, ".spike", "goals", goalId, "goal.md");
+  return join(projectRoot(root), "goals", goalId, "goal.md");
 }
 
 export function integratedRef(goalId: string): string {
@@ -63,7 +64,7 @@ export function integratedRef(goalId: string): string {
 }
 
 async function allocatedGoalIdsForProject(root: string, projectSlug: string): Promise<string[]> {
-  const names = await listDirectoryNames(root, join(root, ".spike", "goals"));
+  const names = await listDirectoryNames(root, join(projectRoot(root), "goals"));
   const foreignGoalId = names.find((name) => goalIdPattern.test(name) && goalSequence(name, projectSlug) === undefined);
   if (foreignGoalId !== undefined) {
     throw new Error(`Goal ${foreignGoalId} does not belong to Project ${projectSlug}`);
@@ -136,7 +137,7 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
   const approval = requireText(input.approval, "Operator approval");
   const constraints = (input.constraints ?? []).map((constraint) => requireText(constraint, "Constraint"));
   const repository = await discoverRepository(input.cwd);
-  const { slug } = (await loadProjectConfig(repository.root)).project;
+  const { slug } = await loadProjectIdentity(repository.root);
   // This is deliberately before allocation, Plan staging, Goal publication, and ref creation.
   const sourceRequests = await validateSourceRequests(input.sourceRequests ?? [], slug);
   const goalId = await nextGoalId(repository.root, slug);
@@ -170,7 +171,7 @@ export async function createGoal(input: CreateGoalInput): Promise<CreatedGoal> {
 }
 
 export async function listAllocatedGoalIds(root: string): Promise<string[]> {
-  const { slug } = (await loadProjectConfig(root)).project;
+  const { slug } = await loadProjectIdentity(root);
   return allocatedGoalIdsForProject(root, slug);
 }
 

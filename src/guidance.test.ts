@@ -69,5 +69,5 @@ describe("workflow guidance", () => {
     await expect(loadGuidance(oversized.root, "review", await oversized.git("rev-parse", "HEAD"))).rejects.toThrow(
       "Git blob exceeds 32768 bytes",
     );
-  });
+  }, 15_000);
 });

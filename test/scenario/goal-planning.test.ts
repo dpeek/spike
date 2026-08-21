@@ -63,7 +63,7 @@ describe("Goal planning", () => {
     });
     expect(first.goal.metadata.goalId).toBe("spike-001");
 
-    await mkdir(join(repository.root, ".spike", "goals", "spike-002"), { recursive: true });
+    await mkdir(join(repository.projectRoot, "goals", "spike-002"), { recursive: true });
     const third = await createGoal({
       cwd: repository.root,
       title: "Third Goal",
@@ -72,7 +72,7 @@ describe("Goal planning", () => {
     });
     expect(third.goal.metadata.goalId).toBe("spike-003");
 
-    await mkdir(join(repository.root, ".spike", "goals", "spike-999"), { recursive: true });
+    await mkdir(join(repository.projectRoot, "goals", "spike-999"), { recursive: true });
     await expect(
       createGoal({
         cwd: repository.root,
@@ -147,7 +147,7 @@ describe("Goal planning", () => {
     const spike = join(import.meta.dir, "..", "..", "bin", "spike");
     const child = Bun.spawn(
       [spike, "goal", "create", "--title", "Terminal Goal", "--outcome", "Create durable records.", "--approval", "Approved."],
-      { cwd: repository.root, stdout: "pipe", stderr: "pipe" },
+      { cwd: repository.root, env: { ...process.env }, stdout: "pipe", stderr: "pipe" },
     );
     const [exitCode, stdout, stderr] = await Promise.all([
       child.exited,
@@ -159,8 +159,9 @@ describe("Goal planning", () => {
     expect(stderr).toBe("");
     const goalId = stdout.match(/spike-[0-9]{3}/)?.[0];
     expect(goalId).toBeDefined();
-    expect(await Bun.file(join(repository.root, ".spike", "goals", goalId!, "goal.md")).exists()).toBe(true);
-    expect(await Bun.file(join(repository.root, ".spike", "goals", goalId!, "plan.md")).exists()).toBe(true);
+    expect(await Bun.file(join(repository.projectRoot, "goals", goalId!, "goal.md")).exists()).toBe(true);
+    expect(await Bun.file(join(repository.projectRoot, "goals", goalId!, "plan.md")).exists()).toBe(true);
+    expect(await Bun.file(join(repository.root, ".spike")).exists()).toBe(false);
 
     const change = Bun.spawn(
       [
@@ -178,7 +179,7 @@ describe("Goal planning", () => {
         "--acceptance",
         "The Ticket records its model selection.",
       ],
-      { cwd: repository.root, stdout: "ignore", stderr: "pipe" },
+      { cwd: repository.root, env: { ...process.env }, stdout: "ignore", stderr: "pipe" },
     );
     expect(await change.exited).toBe(0);
 
@@ -200,7 +201,7 @@ describe("Goal planning", () => {
         "--thinking",
         "low",
       ],
-      { cwd: repository.root, stdout: "ignore", stderr: "pipe" },
+      { cwd: repository.root, env: { ...process.env }, stdout: "ignore", stderr: "pipe" },
     );
     expect(await ticket.exited).toBe(0);
     expect((await loadTicket(repository.root, goalId!, "001", "001")).metadata).toMatchObject({

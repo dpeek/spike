@@ -47,13 +47,19 @@ export async function loadProjectConfig(root: string): Promise<ProjectConfig> {
   return projectConfigSchema.parse(await readProjectConfigValue(root));
 }
 
+/** Read only the tracked Project identity. Existing workflow and frozen-Ticket
+ * operations must not depend on mutable agent defaults remaining complete. */
+export async function loadProjectIdentity(root: string): Promise<{ slug: string }> {
+  return projectIdentitySchema.parse(await readProjectConfigValue(root)).project;
+}
+
 /**
  * Frozen Ticket paths require only immutable workflow provenance plus the
  * Project slug. Do not parse mutable agent defaults here: those are consulted
  * exclusively when assigning a new Ticket.
  */
 export async function assertGoalBelongsToProject(root: string, goalId: string): Promise<void> {
-  const { slug } = projectIdentitySchema.parse(await readProjectConfigValue(root)).project;
+  const { slug } = await loadProjectIdentity(root);
   if (goalSequence(goalId, slug) === undefined) throw new Error(`Goal ${goalId} does not belong to Project ${slug}`);
 }
 

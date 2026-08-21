@@ -696,7 +696,7 @@ export function registerSupervisorExtension(
       promptGuidelines: [
         "Use spike_status for workflow facts; never infer them from planner prose, worker terminal output, or a Pi process exit status.",
         "Treat spike_dispatch_pi output and spike-worker-recheck messages as operational only; on a wake call spike_status, then explicitly use spike_publish_report if the Ticket remains open.",
-        "Use Spike tools rather than editing files under .spike directly.",
+        "Use Spike tools rather than editing host control-plane files directly.",
       ],
       parameters: {
         type: "object",

@@ -174,7 +174,7 @@ Spike must not infer recoverability from PID liveness, process birth time, termi
 
 A Project is one Git repository configured for Spike by tracked `spike.json`. Its required lowercase kebab-case slug is operator-chosen rather than inferred from a checkout directory or Git remote. The slug is stable after the first Goal allocation and is the human-facing namespace for that Project's Goals. Project slugs are expected to be unique within a future shared control plane; discovery and central registration are deferred.
 
-The Project owns Goal sequence allocation. While workflow authority is repository-local, allocation scans all matching `.spike/goals/<goal-id>/` directories, including unpublished staging directories, and selects the next three-digit sequence. The existing single-planner-writer constraint applies. A future central Spike store may take over this allocation without changing Goal IDs.
+The Project owns Goal sequence allocation under its host control plane. Allocation scans `projects/<project-slug>/goals/`, including unpublished staging directories, and selects the next three-digit sequence. The existing single-planner-writer constraint applies.
 
 Project configuration is not another workflow evidence document. Today its complete identity definition is the tracked configuration entry:
 
@@ -666,10 +666,11 @@ Pin Bun, Node, and Pi versions in the Docker build. Record the immutable Docker 
 
 ## Durable layout
 
-Every durable workflow file is one Markdown document with unversioned JSON frontmatter:
+Every durable workflow file is one Markdown document with unversioned JSON frontmatter. The single host-root selector is `SPIKE_DATA_DIR`, then `${XDG_DATA_HOME}/spike`, then `${HOME}/.local/share/spike`:
 
 ```text
-.spike/
+$SPIKE_DATA_DIR/projects/<project-slug>/
+  project.md
   goals/
     spike-001/
       goal.md
@@ -695,6 +696,25 @@ Every durable workflow file is one Markdown document with unversioned JSON front
   runtime/
     workers/goals/spike-001/changes/001/tickets/001/worker.md
 ```
+
+The first Project-aware command atomically registers the configured slug and repository identity, and records one canonical active checkout in `project.md`. Related worktrees/checkouts must run `spike project activate` before ordinary commands; an unrelated identity can never claim or activate that slug. `remote.origin.url` is the identity when configured, otherwise Spike uses Git's canonical common directory so worktrees are related. `spike.json`, `spike/guidance/`, Git refs, and retained objects remain in the active repository; no `.spike/` ignore entry is needed.
+
+For a one-time cutover, **before installing this no-legacy-reader version**, stop Spike and capture the local evidence from the intended active checkout: save the output of the old `spike status` and record every Goal ID, its active Change/Ticket status, and its candidate and integrated revisions. Resolve the authoritative root with production's exact unset-versus-blank contract (a defined blank is an error):
+
+```sh
+if [ "${SPIKE_DATA_DIR+x}" ]; then
+  [ -n "${SPIKE_DATA_DIR//[[:space:]]/}" ] || { echo 'SPIKE_DATA_DIR must not be blank' >&2; exit 1; }
+  ROOT=$SPIKE_DATA_DIR
+elif [ "${XDG_DATA_HOME+x}" ]; then
+  [ -n "${XDG_DATA_HOME//[[:space:]]/}" ] || { echo 'XDG_DATA_HOME must not be blank' >&2; exit 1; }
+  ROOT=$XDG_DATA_HOME/spike
+else
+  [ -n "${HOME:-}" ] && [ -n "${HOME//[[:space:]]/}" ] || { echo 'HOME must be set and not blank' >&2; exit 1; }
+  ROOT=$HOME/.local/share/spike
+fi
+```
+
+After installing the new version, from that checkout copy the **contents** to the exact central Project root (not a nested `.spike` directory): `mkdir -p "$ROOT/projects/<project-slug>" && cp -a .spike/. "$ROOT/projects/<project-slug>/"`. Run `spike project activate` and save `spike status`. Before deletion, compare the saved legacy and central evidence explicitly: the Goal count, every Goal ID, each active Change/Ticket status, and every candidate/integrated revision must match; also inspect `"$ROOT/projects/<project-slug>/goals"` for the same Goal count and IDs. Only after all of those values are equivalent may the operator run `rm -rf .spike`. Spike does not read, migrate, or dual-write that old location.
 
 Git remains authoritative for Candidate trees and commit objects. Completed implementation Reports retain worker and candidate revisions plus their provenance; completed review Reports retain exact reviewed revisions and verdicts. The Goal directory illustrates a Project-qualified Goal ID; the other `001` directories illustrate parent-relative sequential IDs. Files under `exchange/` and `runtime/` are staging inputs and operational projections rather than authoritative workflow documents. Structured files use Markdown with JSON frontmatter; Git bundles and worker artifacts retain their native formats.
 
@@ -818,7 +838,7 @@ Implement one Docker adapter behind the existing Worker module seam before produ
 - consume the same read-only input exchange;
 - create the private repository inside the container;
 - write only the declared output exchange;
-- do not mount the host checkout, `.spike/` authority, Docker socket, unrelated credentials, or the operator's home directory;
+- do not mount the host checkout, host control-plane authority, Docker socket, unrelated credentials, or the operator's home directory;
 - make network access and credentials explicit Ticket execution policy;
 - retain the same Submission, bundle import, Report publication, stop, and cleanup behavior;
 - pass the same Worker module contract tests as the local-clone adapter.

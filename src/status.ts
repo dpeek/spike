@@ -5,7 +5,7 @@ import {
   loadChangeDecisionIfPresent,
   type ChangeDecision,
 } from "./change.ts";
-import { loadProjectConfig } from "./config.ts";
+import { loadProjectIdentity } from "./config.ts";
 import { git, discoverRepository } from "./git.ts";
 import { integratedRef, listGoalIds, loadGoal } from "./goal.ts";
 import { detectChangeChurn, loadPlan, type ChurnIndicator } from "./plan.ts";
@@ -217,7 +217,7 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
 
 export async function deriveRepositoryStatus(cwd: string): Promise<DerivedRepositoryStatus> {
   const repository = await discoverRepository(cwd);
-  const project = (await loadProjectConfig(repository.root)).project;
+  const project = await loadProjectIdentity(repository.root);
   const goals: DerivedGoalStatus[] = [];
   for (const goalId of await listGoalIds(repository.root)) {
     goals.push(await deriveGoalStatus(repository.root, goalId));

@@ -117,7 +117,7 @@ describe("ephemeral Herdr worker hosting", () => {
     const waited = Bun.spawn([
       join(import.meta.dir, "..", "..", "bin", "spike"), "worker", "wait",
       "--goal", identity.goalId, "--change", "001", "--ticket", "001", "--json",
-    ], { cwd: repository.root, stdout: "pipe", stderr: "pipe" });
+    ], { cwd: repository.root, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
     const [waitExit, waitOutput, waitError] = await Promise.all([
       waited.exited,
       new Response(waited.stdout).text(),

@@ -1,4 +1,5 @@
 import { realpath } from "node:fs/promises";
+import { resolveProject } from "./project.ts";
 
 export type Repository = {
   root: string;
@@ -73,10 +74,10 @@ export async function discoverRepository(cwd: string): Promise<Repository> {
     throw new Error("the repository must have at least one commit");
   }
 
-  const remote = await execute(root, ["config", "--get", "remote.origin.url"]);
+  const project = await resolveProject(root);
   return {
     root,
     head,
-    identity: remote.exitCode === 0 && remote.stdout ? remote.stdout : `file://${root}`,
+    identity: project.registration.identity,
   };
 }

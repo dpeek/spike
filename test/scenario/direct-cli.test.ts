@@ -80,6 +80,7 @@ async function spikeResult(cwd: string, args: string[]): Promise<{ exitCode: num
     : [...args.slice(0, separator), "--json", ...args.slice(separator)];
   const child = Bun.spawn([spikePath, ...jsonArgs], {
     cwd,
+    env: { ...process.env },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",

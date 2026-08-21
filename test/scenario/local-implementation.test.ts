@@ -67,7 +67,7 @@ async function fixture() {
   const goalId = "spike-001";
   const ticketId = "001";
   const baseRevision = repository.head;
-  const ticketDirectory = join(repository.root, ".spike", "goals", goalId, "changes", "001", "tickets", ticketId);
+  const ticketDirectory = join(repository.projectRoot, "goals", goalId, "changes", "001", "tickets", ticketId);
   await mkdir(ticketDirectory, { recursive: true });
   await writeFile(
     join(ticketDirectory, "..", "..", "change.md"),

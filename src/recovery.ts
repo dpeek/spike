@@ -6,6 +6,7 @@ import { candidateRef } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
 import { sequenceIdPattern } from "./identity.ts";
+import { projectRoot } from "./project.ts";
 import {
   deriveCurrentCandidate,
   loadReportIfPresent,
@@ -21,6 +22,7 @@ import {
   finalizeWorker,
   type WorkerRuntimeOperations,
   type TicketIdentity,
+  exchangePath,
 } from "./worker.ts";
 
 export type StopTicketInput = TicketIdentity & {
@@ -244,7 +246,7 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 async function publishedChangeIds(root: string, goalId: string): Promise<string[]> {
-  const directory = join(root, ".spike", "goals", goalId, "changes");
+  const directory = join(projectRoot(root), "goals", goalId, "changes");
   const ids = (await listDirectoryNames(root, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
   const published: string[] = [];
   for (const changeId of ids) {
@@ -328,7 +330,7 @@ export async function reconcileGoal(
       const report = await loadReportIfPresent(repository.root, input.goalId, changeId, ticketId);
       const worker = await loadRecordedWorkerIfPresent(repository.root, identity);
       if (report === undefined) {
-        const output = join(repository.root, ".spike", "exchange", "goals", input.goalId, "changes", changeId, "tickets", ticketId, "output");
+        const output = join(exchangePath(repository.root, { goalId: input.goalId, changeId, ticketId }), "output");
         if (await pathExists(output)) ignoredOutputPaths.push(output);
         const ticket = await loadTicket(repository.root, input.goalId, changeId, ticketId);
         const recovered = await recoverInterruptedTicket(

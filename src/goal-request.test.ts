@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGoal, goalPath, integratedRef } from "./goal.ts";
@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 async function dataRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "spike-goal-requests-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "spike-goal-requests-")));
   dataRoots.push(root);
   return root;
 }
@@ -44,23 +44,16 @@ describe("Goal source Request provenance", () => {
     } finally { previous === undefined ? delete process.env["SPIKE_DATA_DIR"] : process.env["SPIKE_DATA_DIR"] = previous; }
   });
 
-  test("does not resolve an unusable Request store for zero sources, but rejects non-empty sources before workflow effects", async () => {
+  test("rejects an unusable shared data root before Goal workflow effects", async () => {
     const repository = await temporaryRepository(); repositories.push(repository);
     const saved = Object.fromEntries(["SPIKE_DATA_DIR", "XDG_DATA_HOME", "HOME"].map((name) => [name, process.env[name]]));
     process.env["SPIKE_DATA_DIR"] = "";
     process.env["XDG_DATA_HOME"] = "/dev/null/spike-request-store";
     process.env["HOME"] = "/dev/null/spike-home";
     try {
-      const created = await createGoal({ cwd: repository.root, title: "No sources", outcome: "Preserve existing workflow.", approval: "Approved." });
-      expect(created.goal.metadata.goalId).toBe("spike-001");
-      expect(await Bun.file(goalPath(repository.root, "spike-001")).exists()).toBe(true);
-      expect(await Bun.file(planPath(repository.root, "spike-001")).exists()).toBe(true);
-      await expect(repository.git("rev-parse", "--verify", integratedRef("spike-001"))).resolves.toContain(created.goal.metadata.repository.initialRevision);
-
+      await expect(createGoal({ cwd: repository.root, title: "No sources", outcome: "Preserve existing workflow.", approval: "Approved." })).rejects.toThrow("SPIKE_DATA_DIR must not be blank");
       await expect(createGoal({ cwd: repository.root, title: "Has source", outcome: "Must validate root.", approval: "Approved.", sourceRequests: ["request-001"] })).rejects.toThrow("SPIKE_DATA_DIR must not be blank");
-      expect(await Bun.file(goalPath(repository.root, "spike-002")).exists()).toBe(false);
-      expect(await Bun.file(planPath(repository.root, "spike-002")).exists()).toBe(false);
-      await expect(repository.git("rev-parse", "--verify", integratedRef("spike-002"))).rejects.toThrow();
+      await expect(repository.git("rev-parse", "--verify", integratedRef("spike-001"))).rejects.toThrow();
     } finally {
       for (const [name, value] of Object.entries(saved)) value === undefined ? delete process.env[name] : process.env[name] = value;
     }

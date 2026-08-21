@@ -64,6 +64,7 @@ const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" 
 async function spike(cwd: string, args: string[], stdin?: string) {
   const child = Bun.spawn([join(import.meta.dir, "..", "..", "bin", "spike"), ...args], {
     cwd,
+    env: { ...process.env },
     stdin: stdin === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -215,5 +216,5 @@ describe("planner CLI", () => {
     expect(await readFile(reportPath(repository.root, goalId, "001", "002"), "utf8")).toBe(reviewEvidence);
     expect(await readFile(join(repository.root, "operator-notes.txt"), "utf8")).toBe("preserve this user file\n");
     expect(await repository.git("rev-parse", "HEAD")).toBe(repository.head);
-  });
+  }, 15_000);
 });

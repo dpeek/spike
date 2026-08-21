@@ -34,7 +34,6 @@ async function writeCompletedReport(root: string, goalId: string, changeId: stri
 async function completedGoal() {
   const repository = await temporaryRepository();
   repositories.push(repository);
-  await writeFile(join(repository.root, ".git", "info", "exclude"), ".spike/\n");
   const goal = await createGoal({
     cwd: repository.root, title: "Apply a reviewed integration", outcome: "Advance an explicit local target.", approval: "Approved.",
   });
@@ -69,10 +68,10 @@ async function completedGoal() {
 }
 
 async function cli(cwd: string, args: string[]) {
-  const process = Bun.spawn([join(import.meta.dir, "..", "bin", "spike"), ...args], {
-    cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  const child = Bun.spawn([join(import.meta.dir, "..", "bin", "spike"), ...args], {
+    cwd, env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
-  return { exitCode: await process.exited, stdout: await new Response(process.stdout).text(), stderr: await new Response(process.stderr).text() };
+  return { exitCode: await child.exited, stdout: await new Response(child.stdout).text(), stderr: await new Response(child.stderr).text() };
 }
 
 describe("Goal integration apply", () => {

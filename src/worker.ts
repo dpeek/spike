@@ -1,10 +1,11 @@
 import { watch } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import {
   documentExists,
+  ensureWorkflowDirectory,
   installImmutable,
   readDocument,
   replaceAtomic,
@@ -19,6 +20,7 @@ import {
   type ReadHerdrTerminalInput,
 } from "./herdr.ts";
 import { loadTicket, ticketStatus } from "./ticket.ts";
+import { projectRoot } from "./project.ts";
 
 export type TicketIdentity = {
   goalId: string;
@@ -289,8 +291,7 @@ export function selectWorkerAdapter(policy: { isolation: "workspace" | "containe
 
 export function exchangePath(root: string, identity: TicketIdentity): string {
   return join(
-    root,
-    ".spike",
+    projectRoot(root),
     "exchange",
     "goals",
     identity.goalId,
@@ -307,8 +308,7 @@ export function ticketOutputPath(root: string, identity: TicketIdentity): string
 
 export function workerRecordPath(root: string, identity: TicketIdentity): string {
   return join(
-    root,
-    ".spike",
+    projectRoot(root),
     "runtime",
     "workers",
     "goals",
@@ -938,7 +938,8 @@ export async function prepareTicketExchange(root: string, identity: TicketIdenti
   if (await pathExists(exchange)) throw new Error(`Ticket exchange already exists: ${exchange}`);
   const inputDirectory = join(exchange, "input");
   const outputDirectory = join(exchange, "output");
-  await mkdir(inputDirectory, { recursive: true, mode: 0o700 });
+  // Validate the complete central path before mkdir can follow an exchange symlink.
+  await ensureWorkflowDirectory(root, inputDirectory);
 
   await installImmutable(
     root,
@@ -965,7 +966,7 @@ export async function prepareTicketExchange(root: string, identity: TicketIdenti
     chmod(join(inputDirectory, "context.md"), 0o400),
     chmod(inputDirectory, 0o500),
   ]);
-  await mkdir(outputDirectory, { mode: 0o700 });
+  await ensureWorkflowDirectory(root, outputDirectory);
   return { ...identity, inputDirectory, outputDirectory };
 }
 
@@ -1223,7 +1224,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   const startedAt = (input.clock ?? (() => new Date()))().toISOString();
   try {
     containerId = await dockerRequired([
-      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,noexec,nosuid,size=256m", 
+      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
@@ -1289,7 +1290,7 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
   let recorded = false;
   try {
     containerId = await dockerRequired([
-      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,noexec,nosuid,size=256m",
+      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,

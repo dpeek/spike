@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { link, open, lstat, mkdir, readFile, readdir, rename, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { spikeDataRoot } from "./data-root.ts";
 
 const defaultMaximumBytes = 128 * 1024;
 
@@ -44,8 +45,12 @@ export function parseDocument(source: string): MarkdownDocument {
 }
 
 async function rejectSymlinkComponents(root: string, target: string): Promise<void> {
-  const absoluteRoot = resolve(root);
-  const relativePath = relative(absoluteRoot, resolve(target));
+  let absoluteRoot = resolve(root);
+  const centralRoot = resolve(spikeDataRoot());
+  const targetAbsolute = resolve(target);
+  // Durable control-plane paths are deliberately outside the active repository.
+  if (targetAbsolute === centralRoot || targetAbsolute.startsWith(`${centralRoot}${sep}`)) absoluteRoot = centralRoot;
+  const relativePath = relative(absoluteRoot, targetAbsolute);
   if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
     throw new Error(`workflow path is outside the repository: ${target}`);
   }
@@ -67,6 +72,13 @@ async function rejectSymlinkComponents(root: string, target: string): Promise<vo
 async function prepareParent(root: string, path: string): Promise<void> {
   await rejectSymlinkComponents(root, path);
   await mkdir(dirname(path), { recursive: true });
+  await rejectSymlinkComponents(root, path);
+}
+
+/** Safely create a workflow directory after checking its entire central path. */
+export async function ensureWorkflowDirectory(root: string, path: string): Promise<void> {
+  await rejectSymlinkComponents(root, path);
+  await mkdir(path, { recursive: true, mode: 0o700 });
   await rejectSymlinkComponents(root, path);
 }
 

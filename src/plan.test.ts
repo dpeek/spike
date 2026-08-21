@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { changePath } from "./change.ts";
@@ -12,6 +12,7 @@ import {
   revisePlan,
 } from "./plan.ts";
 import { reportPath, ticketPath } from "./ticket.ts";
+import { activateProject, projectRoot } from "./project.ts";
 
 const goalId = "spike-001";
 const baseRevision = "0".repeat(40);
@@ -39,6 +40,15 @@ async function installProjectConfig(root: string): Promise<void> {
       },
     }),
   );
+}
+
+async function activateFixture(root: string): Promise<void> {
+  for (const args of [["init", "--quiet"], ["config", "user.name", "Spike Test"], ["config", "user.email", "spike@example.test"], ["add", "."], ["commit", "--quiet", "-m", "fixture"]]) {
+    const process = Bun.spawn(["git", "-C", root, ...args], { stdout: "ignore", stderr: "ignore" });
+    if (await process.exited !== 0) throw new Error("could not initialize fixture repository");
+  }
+  process.env["SPIKE_DATA_DIR"] = join(await realpath(root), "central-data");
+  await activateProject(root);
 }
 
 async function installChurnHistory(root: string): Promise<string[]> {
@@ -176,9 +186,10 @@ describe("Plan", () => {
   });
 
   test("refreshes churn guidance from durable Ticket and Report history", async () => {
-    const root = await mkdtemp(join(tmpdir(), "spike-plan-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "spike-plan-")));
     try {
       await installProjectConfig(root);
+      await activateFixture(root);
       await createInitialPlan(root, goalId, "Detect churn", "Warn after repeated feedback.", "2026-03-25T09:00:00.000Z");
       const ticketIds = await installChurnHistory(root);
       const reportSources = await Promise.all(
@@ -204,10 +215,11 @@ describe("Plan", () => {
   });
 
   test("revises planner working memory without changing authoritative Goal evidence", async () => {
-    const root = await mkdtemp(join(tmpdir(), "spike-plan-"));
-    const goalPath = join(root, ".spike", "goals", goalId, "goal.md");
+    const root = await realpath(await mkdtemp(join(tmpdir(), "spike-plan-")));
     try {
       await installProjectConfig(root);
+      await activateFixture(root);
+      const goalPath = join(projectRoot(root), "goals", goalId, "goal.md");
       await createInitialPlan(
         root,
         goalId,

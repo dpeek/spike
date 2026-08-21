@@ -12,6 +12,7 @@ import {
 } from "./change.ts";
 import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
+import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyGoalIntegration } from "./goal-apply.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
@@ -53,6 +54,7 @@ export function usage(): string {
 
 Usage:
   spike planner
+  spike project activate
   spike status [--goal <goal-id>] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
@@ -757,6 +759,12 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     }
     if (args.length === 1 && ["--version", "-V"].includes(args[0]!)) {
       return success(json, "version", { version }, `${version}\n`);
+    }
+
+    if (args[0] === "project" && args[1] === "activate") {
+      if (args.length !== 2) throw new UsageError(`unknown project option: ${args[2]}`);
+      const project = await activateProject(cwd);
+      return success(json, "project activate", { slug: project.slug, root: project.root, activeCheckout: project.registration.activeCheckout }, `Activated Project ${project.slug}\n`);
     }
 
     if (args[0] === "request" && args[1] === "create") {

@@ -102,7 +102,7 @@ describe("sequential Change and Ticket allocation", () => {
     await repository.git("update-ref", integratedRef(goalId), laterRevision);
 
     // A directory left before immutable publication burns its sequence ID.
-    await mkdir(join(repository.root, ".spike", "goals", goalId, "changes", "002"), { recursive: true });
+    await mkdir(join(repository.projectRoot, "goals", goalId, "changes", "002"), { recursive: true });
     const third = await createChange({
       cwd: repository.root,
       goalId,
@@ -219,7 +219,7 @@ describe("sequential Change and Ticket allocation", () => {
     );
     expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
 
-    await mkdir(join(repository.root, ".spike", "goals", goalId, "changes", "001", "tickets", "002"), {
+    await mkdir(join(repository.projectRoot, "goals", goalId, "changes", "001", "tickets", "002"), {
       recursive: true,
     });
     const third = await issueTicket({

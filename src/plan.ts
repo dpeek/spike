@@ -4,6 +4,7 @@ import { assertGoalBelongsToProject } from "./config.ts";
 import { installImmutable, readDocument, replaceAtomic, serializeDocument } from "./durable-state.ts";
 import { goalIdPattern } from "./identity.ts";
 import { loadChangeReportHistory, type ChangeReportHistory } from "./report.ts";
+import { projectRoot } from "./project.ts";
 
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const planSchema = z
@@ -29,7 +30,7 @@ export type ChurnIndicator =
     };
 
 export function planPath(root: string, goalId: string): string {
-  return join(root, ".spike", "goals", goalId, "plan.md");
+  return join(projectRoot(root), "goals", goalId, "plan.md");
 }
 
 function initialBody(title: string, outcome: string): string {

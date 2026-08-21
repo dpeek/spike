@@ -1,5 +1,9 @@
 # Phase 2 dogfood
 
+## Project control-plane setup
+
+Set `SPIKE_DATA_DIR` to the host data root (or use `${XDG_DATA_HOME}/spike`, then `${HOME}/.local/share/spike`) and run `spike project activate` from the intended checkout before workflow work. Goals, exchange, and runtime state are stored at `projects/<slug>/` there. A related worktree must be explicitly activated before ordinary Project commands; tracked `spike.json`, `spike/guidance/`, and Spike Git refs stay in the repository.
+
 ## Execution safety and agent assignment
 
 Use only a disposable repository for a workspace Ticket. The local-clone workspace adapter provides workspace separation, not security isolation, and can run only Tickets with `networkAccess: "unrestricted"` and no credential grants. Do not grant valuable credentials to workspace Tickets.

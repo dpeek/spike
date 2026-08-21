@@ -28,7 +28,7 @@ describe("durable Markdown documents", () => {
 
   test("installs immutable documents and atomically replaces mutable documents", async () => {
     const root = await mkdtemp(join(tmpdir(), "spike-state-"));
-    const path = join(root, ".spike", "plan.md");
+    const path = join(root, "projects", "spike", "plan.md");
     try {
       await installImmutable(root, path, serializeDocument({ kind: "plan" }, "first"));
       await expect(installImmutable(root, path, "replacement")).rejects.toThrow("already exists");
@@ -41,7 +41,7 @@ describe("durable Markdown documents", () => {
 
   test("publishes one complete immutable document without replacement", async () => {
     const root = await mkdtemp(join(tmpdir(), "spike-state-"));
-    const path = join(root, ".spike", "report.md");
+    const path = join(root, "projects", "spike", "report.md");
     try {
       const publications = await Promise.allSettled([
         installImmutable(root, path, serializeDocument({ kind: "report", ticket: "first" }, "first")),
@@ -60,9 +60,9 @@ describe("durable Markdown documents", () => {
     const root = await mkdtemp(join(tmpdir(), "spike-state-"));
     const outside = await mkdtemp(join(tmpdir(), "spike-outside-"));
     try {
-      await mkdir(join(root, ".spike"));
-      await symlink(outside, join(root, ".spike", "goals"));
-      await expect(installImmutable(root, join(root, ".spike", "goals", "goal.md"), "nope")).rejects.toThrow(
+      await mkdir(join(root, "projects"));
+      await symlink(outside, join(root, "projects", "spike"));
+      await expect(installImmutable(root, join(root, "projects", "spike", "goal.md"), "nope")).rejects.toThrow(
         "must not contain symbolic links",
       );
     } finally {

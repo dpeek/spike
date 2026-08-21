@@ -112,7 +112,7 @@ describe("crash-point recovery", () => {
         crash: crashAt("goal-publication", "after"),
       }),
     ).rejects.toThrow("injected crash after goal-publication");
-    const goalDirectories = await readdir(join(repository.root, ".spike", "goals"));
+    const goalDirectories = await readdir(join(repository.projectRoot, "goals"));
     const goalId = goalDirectories.find((id) => id !== beforeGoalRecovery.ignoredUnpublishedGoalIds[0]);
     expect(goalId).toBeDefined();
     if (goalId === undefined) throw new Error("published Goal was not found");

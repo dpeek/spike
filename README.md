@@ -78,8 +78,9 @@ When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch 
 
 Requests are host-local, Git-independent unapproved intake. `spike request create`
 uses `SPIKE_DATA_DIR`, then `${XDG_DATA_HOME}/spike`, then
-`${HOME}/.local/share/spike`. It stores immutable Markdown under that root; no
-Project checkout is required. A Request may have no `--project` flags (unassigned)
+`${HOME}/.local/share/spike`. Projects use this exact same root: their control plane is
+`projects/<slug>/` alongside `requests/`; no second `SPIKE_DATA_ROOT` selector exists.
+It stores immutable Markdown under that root; no Project checkout is required. A Request may have no `--project` flags (unassigned)
 or several stable Project slugs.
 
 ```bash
