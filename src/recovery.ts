@@ -217,6 +217,8 @@ export type ReconcileRepositoryInput = {
   cwd: string;
   reason?: string;
   now?: Date;
+  /** Goal planners use local reconciliation only; Application/main recovery is supervisor-owned. */
+  recoverApplications?: boolean;
 };
 
 export type ReconciledGoal = {
@@ -319,9 +321,9 @@ export async function reconcileGoal(
   const changeIds = await publishedChangeIds(repository.root, input.goalId);
   const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
   const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId);
-  // Application decisions are durable before the Git target update. Reconcile
-  // that exact two-revision transition, never a different main history.
-  await recoverApplications(repository.root, input.goalId);
+  // Application decisions can advance checked-out main and are Project-wide.
+  // A Goal-scoped planner therefore never invokes this branch.
+  if (input.recoverApplications !== false) await recoverApplications(repository.root, input.goalId);
   const interruptedTickets: InterruptedTicketRecovery[] = [];
   const finalizedWorkers: TicketIdentity[] = [];
   const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];
@@ -415,6 +417,7 @@ export async function reconcileRepository(
           goalId,
           ...(input.reason === undefined ? {} : { reason: input.reason }),
           ...(input.now === undefined ? {} : { now: input.now }),
+          ...(input.recoverApplications === undefined ? {} : { recoverApplications: input.recoverApplications }),
         },
         runtimeOperations,
       ),

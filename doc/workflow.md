@@ -31,25 +31,32 @@ This model preserves durable evidence, resumability, exact Git provenance, and i
 ## Goal planner ownership
 
 A Project supervisor is the only Project-wide planner authority. It may start,
-discover, observe, attach to, or explicitly replace one Herdr-hosted Pi planner for
-one selected existing Goal. The planner identity is a deterministic readable name
+discover, observe, attach to, or explicitly replace up to two Herdr-hosted Pi planners
+for two distinct selected existing Goals by default. This fixed limit is not configurable. The planner identity is a deterministic readable name
 formed from the exact registered repository identity and Goal ID (with a stable
 identity digest); that exact name is the Herdr discovery label, tab label, Pi session
 `--name`, and operational projection key. A Project slug alone is never discovery
 authority.
 
-`spike planner start-or-reattach --goal <goal>` exact-discovers first. One live
-matching resource is reattached without a new Pi process or workflow-document
-mutation. Multiple live exact matches are surfaced and refused without closing any
-of them. `spike planner replace --goal <goal>` is the only explicit replacement: it
-idempotently closes every exact matching tab, including stale done/unavailable
-resources, then launches one fresh persistent interactive named Pi. `observe` and
+`spike planner start-or-reattach --goal <goal>` exact-discovers all durable,
+Project-qualified Goal labels first. One live matching resource is reattached without
+a new Pi process or workflow-document mutation. Two distinct live Goal planners are
+admitted; a third is refused before stale cleanup, tab creation, Pi launch, or any
+workflow mutation. Multiple live exact matches are surfaced and refused without
+closing any of them. `spike planner replace --goal <goal>` is the only explicit
+replacement: at capacity it closes only the selected Goal's exact matching tabs,
+including stale done/unavailable resources, then launches one fresh persistent
+interactive named Pi. `observe` and
 `attach` are read/terminal operations and never mutate durable workflow state.
 
 The Goal planner receives only its exact Goal ID and a thin Goal-scoped extension.
 It can use guidance, status, Plan, Change, Ticket, Report, worker observation,
-Change decision, and recovery operations only with that Goal ID. Cross-Goal IDs and
-Project-wide operations are rejected before the extension invokes the CLI. Its live
+Change decision, and Goal-local recovery operations only with that Goal ID. These
+mutations are safe to overlap only because every document, candidate/integration ref,
+exchange path, and runtime record is Goal-nested; one active Change per Goal and one
+active Ticket per Change remain enforced. Cross-Goal IDs and Project-wide operations
+(Goal allocation, planner admission, Application, target mutation, and
+repository-wide recovery) are rejected before the extension invokes the CLI. Its live
 conversation is useful solely for reattachment. A replacement reconstructs context
 from durable evidence; Pi JSONL, terminal text, Pi/session identity, process exit,
 and Herdr lifecycle are never workflow evidence and are not Spike recovery.
@@ -71,7 +78,7 @@ The model separates six concerns:
 - a Ticket assigns one bounded worker session;
 - a Report records that Ticket's canonical outcome.
 
-One planner, sequential Changes and Tickets, immutable evidence, and derived status make interruption recovery deterministic without requiring general concurrent transition coordination.
+One Project supervisor, at most two disjoint Goal planners, sequential Changes and Tickets within each Goal, immutable evidence, and derived status make interruption recovery deterministic without requiring general concurrent transition coordination.
 
 ## Design principles
 
@@ -92,6 +99,14 @@ Authoritative evidence is immutable and append-only:
 - worker retirement evidence.
 
 These records prove what was requested, produced, reviewed, and landed. A Request records intake, not approval: capturing or selecting one cannot start work or close it. An explicitly approved Goal may cite source Requests and may remain queued without an active Change.
+
+#### Operational planner observation
+
+Repository status derives every Goal phase from durable Goal, Change, Ticket, Report,
+decision, Application, and Git evidence, so it remains available when no planner is
+attached. Supervisor status may show one exact Herdr observation per Goal separately.
+Live, stale, unavailable, or duplicate planner observations are operational only and
+cannot alter durable phase, completion, cleanup health, or recovery decisions.
 
 #### Planner notebook
 
@@ -168,7 +183,7 @@ The local-clone adapter provides workspace separation only and may run controlle
 
 ### Sequential work and nested identity
 
-Initially, Spike supports one planner process mutating workflow state for a Project repository. A Goal has at most one active Change, and a Change has at most one active Ticket. Workers write only through their assigned output paths; the planner imports those outputs and performs workflow transitions serially.
+Initially, Spike supports one Project supervisor and at most two concurrent Goal planners mutating only disjoint Goal-local workflow state. A Goal has at most one active Change, and a Change has at most one active Ticket. Workers write only through their assigned Goal-nested output paths; each Goal planner imports and transitions its own workflow serially.
 
 Goal, Change, and Ticket IDs reflect this ordering:
 
@@ -179,7 +194,11 @@ Goal, Change, and Ticket IDs reflect this ordering:
 - IDs are never reused, including after rejection, abandonment, failure, or interruption.
 - A Change ID is unique only within its Goal; a Ticket ID is unique only within its Change. Durable references therefore include their parent IDs or use a parent-relative path.
 
-Spike does not initially guarantee safe concurrent planner CLI mutation. This explicit capability cut removes the need for lock ordering across activation, issuance, publication, acceptance, completion, and cleanup.
+Spike permits concurrent Goal-local mutation only for the two admitted disjoint Goals.
+Their nested documents, refs, exchanges, and runtime records do not overlap; Git ref
+updates are exact and Goal-qualified. Project-wide allocation, planner admission,
+Application, target mutation, and repository-wide recovery remain serially owned by
+the one supervisor. No general lock manager or mutable scheduler status exists.
 
 ### Recovery rewinds rather than resumes
 
@@ -619,11 +638,13 @@ Cleanup is idempotent and independent from workflow progress. A failed adapter c
 
 ## Locking
 
-The initial workflow assumes one planner writer and does not support concurrent planner mutation.
+The initial workflow assumes one Project supervisor. It supports at most two concurrent
+Goal planners only for disjoint Goal-local mutations; it does not support independent
+supervisors or concurrent Project-wide mutation.
 
 Retain narrow coordination only where runtime stop and runtime exit recording genuinely race.
 
-Do not add workflow locks for Goal, Change, Ticket, Report publication, candidate normalization, review, or Change decision operations. The single planner writer makes them unnecessary.
+Do not add workflow locks for Goal, Change, Ticket, Report publication, candidate normalization, review, or Change decision operations. One owner per Goal and disjoint Goal-local paths/refs make them unnecessary; Project-wide operations remain owned by the single supervisor.
 
 If concurrent planner mutation becomes a demonstrated requirement, design it later against this simpler model.
 

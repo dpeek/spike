@@ -18,6 +18,8 @@ import {
 import { listTicketIds, loadOpenTicket } from "./ticket.ts";
 import { loadRecordedWorkerIfPresent, type TicketIdentity } from "./worker.ts";
 import { applicationEvidence } from "./application.ts";
+import { goalPlannerIdentity, goalPlannerOperations, type GoalPlannerObservation } from "./goal-planner.ts";
+import { herdrOperations, type HerdrOperations } from "./herdr.ts";
 
 export type CleanupWarning = {
   identity: TicketIdentity;
@@ -87,6 +89,14 @@ export type DerivedRepositoryStatus = {
   project: { slug: string };
   goals: DerivedGoalStatus[];
   cleanup: CleanupHealth;
+};
+
+/** Operational attachment observations deliberately sit beside, never inside,
+ * durable Goal phase. A failed or ambiguous terminal query cannot influence
+ * Goal completion, cleanup health, or any recovery decision. */
+export type SupervisorPlannerStatus = {
+  durable: DerivedRepositoryStatus;
+  planners: GoalPlannerObservation[];
 };
 
 function decisionStatus(decision: ChangeDecision): DerivedDecision {
@@ -233,4 +243,21 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
   };
+}
+
+export async function deriveSupervisorPlannerStatus(
+  cwd: string,
+  herdr: HerdrOperations = herdrOperations,
+): Promise<SupervisorPlannerStatus> {
+  const [durable, repository] = await Promise.all([deriveRepositoryStatus(cwd), discoverRepository(cwd)]);
+  const planners = await Promise.all(durable.goals.map(async ({ goalId }) => {
+    try {
+      return await goalPlannerOperations.observe({ cwd: repository.root, goalId, herdr });
+    } catch {
+      // Keep the exact durable identity visible even when Herdr discovery is
+      // unavailable. This is an operational observation, not a health error.
+      return { ...goalPlannerIdentity(repository.identity, goalId), resources: [], state: "unavailable" as const };
+    }
+  }));
+  return { durable, planners };
 }

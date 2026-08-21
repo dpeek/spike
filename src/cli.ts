@@ -33,6 +33,7 @@ import { reconcileGoal, reconcileRepository, type ReconciledGoal } from "./recov
 import {
   deriveGoalStatus,
   deriveRepositoryStatus,
+  deriveSupervisorPlannerStatus,
   type DerivedGoalStatus,
   type DerivedRepositoryStatus,
 } from "./status.ts";
@@ -60,7 +61,7 @@ Usage:
   spike planner attach --goal <goal-id>
   spike planner replace --goal <goal-id> [--json]
   spike project activate
-  spike status [--goal <goal-id>] [--json]
+  spike status [--goal <goal-id>] [--operational] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike goal apply --goal <goal-id> --target main --approval <statement> [--json]
@@ -614,10 +615,19 @@ function parseGoalPlanner(args: string[]): { goalId: string } {
   return { goalId: valueAfter(args, 0, "--goal") };
 }
 
-function parseStatus(args: string[]): { goalId?: string } {
-  if (args.length === 0) return {};
-  if (args.length !== 2 || args[0] !== "--goal") throw new UsageError(`unknown status option: ${args[0]}`);
-  return { goalId: valueAfter(args, 0, "--goal") };
+function parseStatus(args: string[]): { goalId?: string; operational?: boolean } {
+  let goalId: string | undefined;
+  let operational = false;
+  for (let index = 0; index < args.length;) {
+    const option = args[index]!;
+    if (option === "--operational") { operational = true; index += 1; continue; }
+    const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else throw new UsageError(`unknown status option: ${option}`);
+    index += 2;
+  }
+  if (operational && goalId !== undefined) throw new UsageError("--operational is available only for repository status");
+  return { ...(goalId === undefined ? {} : { goalId }), ...(operational ? { operational: true } : {}) };
 }
 
 function parseGuidanceShow(args: string[]): { step: GuidanceStep; goalId?: string; changeId?: string } {
@@ -686,19 +696,24 @@ function parseChangeDecision(
   return { goalId, changeId, ...(statement === undefined ? {} : { statement }) };
 }
 
-function parseRecover(args: string[]): { goalId?: string; reason?: string } {
+function parseRecover(args: string[]): { goalId?: string; reason?: string; goalLocal?: boolean } {
   let goalId: string | undefined;
   let reason: string | undefined;
-  for (let index = 0; index < args.length; index += 2) {
+  let goalLocal = false;
+  for (let index = 0; index < args.length;) {
     const option = args[index]!;
+    if (option === "--goal-local") { goalLocal = true; index += 1; continue; }
     const value = valueAfter(args, index, option);
     if (option === "--goal") goalId = value;
     else if (option === "--reason") reason = value;
     else throw new UsageError(`unknown option: ${option}`);
+    index += 2;
   }
+  if (goalLocal && goalId === undefined) throw new UsageError("--goal-local requires --goal");
   return {
     ...(goalId === undefined ? {} : { goalId }),
     ...(reason === undefined ? {} : { reason }),
+    ...(goalLocal ? { goalLocal: true } : {}),
   };
 }
 
@@ -828,17 +843,17 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "status") {
       const input = parseStatus(args.slice(1));
-      const status = input.goalId === undefined
-        ? await deriveRepositoryStatus(cwd)
-        : await deriveGoalStatus(cwd, input.goalId);
-      return success(
-        json,
-        "status",
-        status,
-        input.goalId === undefined
-          ? humanRepositoryStatus(status as DerivedRepositoryStatus)
-          : humanGoalStatus(status as DerivedGoalStatus),
-      );
+      if (input.goalId !== undefined) {
+        const status = await deriveGoalStatus(cwd, input.goalId);
+        return success(json, "status", status, humanGoalStatus(status));
+      }
+      if (input.operational) {
+        const status = await deriveSupervisorPlannerStatus(cwd);
+        const plannerLines = `${status.planners.map((planner) => `  Planner ${planner.goalId} ${planner.state}`).join("\n")}${status.planners.length === 0 ? "" : "\n"}`;
+        return success(json, "status", status, `${humanRepositoryStatus(status.durable)}${plannerLines}`);
+      }
+      const status = await deriveRepositoryStatus(cwd);
+      return success(json, "status", status, humanRepositoryStatus(status));
     }
 
     if (args[0] === "guidance" && args[1] === "show") {
@@ -1116,7 +1131,12 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
           humanReconciliation(reconciled.goals, reconciled.ignoredUnpublishedGoalIds.length),
         );
       }
-      const reconciled = await reconcileGoal({ cwd, goalId: input.goalId, ...(input.reason === undefined ? {} : { reason: input.reason }) });
+      const reconciled = await reconcileGoal({
+        cwd,
+        goalId: input.goalId,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
+        ...(input.goalLocal ? { recoverApplications: false } : {}),
+      });
       return success(json, "recover", reconciled, humanReconciliation([reconciled]));
     }
 

@@ -204,8 +204,10 @@ A completed review or blocked Report needs no commit message options. To seal a
 worker failure instead, use `--failure "<reason>"`. Report publication returns
 worker cleanup status and retains a warning when finalization must be retried.
 
-A Project supervisor owns Project-wide workflow operations. For one existing Goal,
-it can own one replaceable Herdr-hosted planner. Its deterministic human-readable
+A Project supervisor owns Project-wide workflow operations. It can own at most two
+replaceable Herdr-hosted planners for two distinct existing Goals by default. Goal
+creation and allocation, planner admission, Application operations, target mutation,
+and repository-wide recovery remain supervisor-owned and serialized. Its deterministic human-readable
 name includes the exact repository identity digest and Goal ID, so matching labels
 cannot be confused merely because two repositories share a Project slug. The same
 name is used for Herdr tab discovery, the tab label, and Pi's persistent `--name`.
@@ -217,11 +219,14 @@ spike planner attach --goal spike-001
 spike planner replace --goal spike-001 --json
 ```
 
-Start-or-reattach returns one exact live planner without launching another Pi.
-Duplicate live labels are refused without closing either pane; `replace` is the
-explicit operation that idempotently closes every exact matching tab and starts a
-fresh named Pi session. Done or unavailable matching resources are stale operational
-projections and are cleaned before a replacement. Reattachment preserves the live Pi
+Start-or-reattach reconstructs admission from exact live Herdr discovery and returns
+one exact live planner without launching another Pi. At most two distinct Goal labels
+are admitted; a third is refused before stale cleanup, tab creation, Pi launch, or
+workflow mutation. Duplicate live labels are refused without closing either pane;
+`replace` is the explicit operation that idempotently closes only the selected Goal's
+exact matching tabs and starts a fresh named Pi session, including at two-Goal
+capacity. Done or unavailable matching resources are stale operational projections
+and are cleaned only after admission. Reattachment preserves the live Pi
 conversation; replacement begins only from durable Goal, Plan, Ticket, Report,
 decision, and Git evidence. Neither operation reads Pi JSONL, terminal text, process
 exit, or Herdr state as workflow evidence, and neither invokes Spike recovery.
@@ -229,12 +234,18 @@ exit, or Herdr state as workflow evidence, and neither invokes Spike recovery.
 The launched Pi disables extension discovery, loads only
 `src/pi-goal-planner-extension.ts`, allows only read/grep/find/ls plus Goal-scoped
 planner tools, and receives its exact Goal ID through the launch environment. Those
+Goal-local tools may overlap only across distinct Goals: their documents, candidate
+and integration refs, exchanges, and runtime records are nested by Goal ID. Each Goal
+still has one active Change and each Change one active Ticket. Those
 tools reject a different Goal before invoking `spike`; they omit Project-wide Goal
 creation, Request inbox, and Goal application operations. `spike planner` remains
 the direct Project-supervisor launcher for interactive local operation.
 
-The supervisor extension exposes sequential structured tools for committed
-guidance selection, explicitly approved Goal creation, status, Plan revision,
+Repository status is a durable projection of every Goal's documents, Reports,
+decisions, Applications, and Git evidence; it remains available without planners.
+Supervisor planner observations are a separate operational projection and never alter
+durable phase, cleanup health, or recovery. The supervisor extension exposes
+sequential structured tools for committed guidance selection, explicitly approved Goal creation, status, Plan revision,
 Change creation and decisions, focused Implement/Review/Remediate Ticket issuance,
 Pi dispatch, Report publication, and recovery. `spike_begin_step` must run
 immediately before each guided mutation. It loads the selected Markdown through
@@ -255,7 +266,7 @@ repository state:
 spike guidance show --step goal [--json]
 spike guidance show --step plan --goal <goal-id> [--json]
 spike guidance show --step implement --goal <goal-id> --change 001 [--json]
-spike status [--goal <goal-id>] [--json]
+spike status [--goal <goal-id>] [--operational] [--json]
 spike plan revise --goal <goal-id> [--file plan.md] [--json] # stdin when omitted
 spike change land --goal <goal-id> --change 001 [--json]
 spike change reject --goal <goal-id> --change 001 --statement "..." [--json]

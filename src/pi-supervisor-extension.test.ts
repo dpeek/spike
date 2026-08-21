@@ -470,6 +470,9 @@ describe("Pi supervisor extension", () => {
     expect(calls).toEqual([]);
     await scoped.get("spike_status")!.execute("call", {}, undefined, undefined, { cwd: "/project" });
     expect(calls[0]!.args).toEqual(["status", "--goal", "goal-1"]);
+    await scoped.get("spike_begin_step")!.execute("call", { step: "recover", goalId: "goal-1" }, undefined, undefined, { cwd: "/project" });
+    await scoped.get("spike_recover")!.execute("call", { goalId: "goal-1", reason: "Restarted." }, undefined, undefined, { cwd: "/project" });
+    expect(calls.at(-1)!.args).toEqual(["recover", "--goal-local", "--goal", "goal-1", "--reason", "Restarted."]);
   });
 
   test("Goal startup binds its Project for scoped status and waiter calls, and mismatches invoke nothing", async () => {

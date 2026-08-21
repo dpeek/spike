@@ -219,8 +219,9 @@ function goalStatusLines(value: unknown): string[] {
 }
 
 function statusText(data: unknown): string {
-  const status = object(data);
-  if (status === undefined) return "Invalid Spike status";
+  const envelope = object(data);
+  if (envelope === undefined) return "Invalid Spike status";
+  const status = object(envelope.durable) ?? envelope;
   if (typeof status.goalId === "string") return goalStatusLines(status).join("\n");
   const project = object(status.project);
   const goals = Array.isArray(status.goals) ? status.goals : [];
@@ -230,6 +231,11 @@ function statusText(data: unknown): string {
   const cleanup = object(status.cleanup);
   if (cleanup?.healthy === false) {
     lines.push(`${Array.isArray(cleanup.warnings) ? cleanup.warnings.length : "?"} repository cleanup warning(s)`);
+  }
+  const planners = Array.isArray(envelope.planners) ? envelope.planners : [];
+  for (const planner of planners) {
+    const observed = object(planner);
+    lines.push(`Planner ${string(observed?.goalId) ?? "unknown Goal"} · ${string(observed?.state) ?? "unavailable"} (operational)`);
   }
   return lines.join("\n");
 }
@@ -787,6 +793,7 @@ export function registerSupervisorExtension(
       command: "status",
       args(params) {
         const args = ["status"];
+        if (options.goalId === undefined) args.push("--operational");
         optional(args, "--goal", params.goalId);
         return args;
       },
@@ -1211,7 +1218,9 @@ export function registerSupervisorExtension(
       },
       command: "recover",
       args(params) {
+        // The Goal-scoped extension must not reach Application/main recovery.
         const args = ["recover"];
+        if (options.goalId !== undefined) args.push("--goal-local");
         optional(args, "--goal", params.goalId);
         optional(args, "--reason", params.reason);
         return args;

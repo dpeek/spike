@@ -9,8 +9,11 @@ import { goalPlannerToolNames } from "./pi-supervisor-extension.ts";
 export type GoalPlannerIdentity = { projectIdentity: string; goalId: string; name: string };
 export type GoalPlannerObservation = GoalPlannerIdentity & {
   resources: Array<HerdrHandles & { status: HerdrAgentStatus }>;
-  state: "live" | "stale" | "absent" | "duplicate";
+  state: "live" | "stale" | "absent" | "duplicate" | "unavailable";
 };
+
+/** The fixed Project-supervisor admission limit. It is deliberately not config. */
+export const maximumActiveGoalPlanners = 2;
 export type GoalPlannerOperations = {
   startOrReattach(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
   observe(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
@@ -63,25 +66,50 @@ async function observation(identity: GoalPlannerIdentity, herdr: HerdrOperations
   return {
     ...identity,
     resources,
-    state: live.length > 1 ? "duplicate" : live.length === 1 ? "live" : resources.length > 0 ? "stale" : "absent",
+    state: live.length > 1
+      ? "duplicate"
+      : live.length === 1
+        ? "live"
+        : resources.length === 0
+          ? "absent"
+          : resources.every((resource) => resource.status === "unavailable")
+            ? "unavailable"
+            : "stale",
   };
 }
 
-async function anotherLivePlanner(
+async function otherPlannerObservations(
   root: string,
   identity: GoalPlannerIdentity,
   herdr: HerdrOperations,
-): Promise<GoalPlannerIdentity | undefined> {
+): Promise<GoalPlannerObservation[]> {
   // Enumerate only durable, Project-qualified Goal IDs and derive each exact
   // label. Prefix matching a mutable terminal label would grant cross-Goal
   // authority, so it is never used for admission.
+  const observations: GoalPlannerObservation[] = [];
   for (const goalId of await listGoalIds(root)) {
     if (goalId === identity.goalId) continue;
-    const other = goalPlannerIdentity(identity.projectIdentity, goalId);
-    const current = await observation(other, herdr);
-    if (current.state === "live" || current.state === "duplicate") return other;
+    observations.push(await observation(goalPlannerIdentity(identity.projectIdentity, goalId), herdr));
   }
-  return undefined;
+  return observations;
+}
+
+function assertAdmissionCapacity(
+  current: GoalPlannerObservation,
+  others: GoalPlannerObservation[],
+): void {
+  const duplicate = others.find((other) => other.state === "duplicate");
+  if (duplicate !== undefined) {
+    throw new Error(`multiple live Goal planners found for ${duplicate.name}; refusing ambiguous Project planner admission`);
+  }
+  const liveOthers = others.filter((other) => other.state === "live");
+  const activeCount = liveOthers.length + (current.state === "live" ? 1 : 0);
+  if (activeCount >= maximumActiveGoalPlanners && current.state !== "live") {
+    throw new Error(`Goal planner admission limit of ${maximumActiveGoalPlanners} is reached; refusing another Project planner`);
+  }
+  if (activeCount > maximumActiveGoalPlanners) {
+    throw new Error(`more than ${maximumActiveGoalPlanners} live Goal planners found; refusing ambiguous Project planner admission`);
+  }
 }
 
 async function close(resources: GoalPlannerObservation["resources"], herdr: HerdrOperations): Promise<void> {
@@ -138,14 +166,12 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
     if (current.state === "duplicate") throw new Error(`multiple live Goal planners found for ${target.identity.name}; refusing to choose or close either`);
-    // A selected live resource does not make an already cross-Goal live
-    // projection valid. Check every other durable Goal before returning it.
-    const other = await anotherLivePlanner(target.root, target.identity, herdr);
-    if (other !== undefined) {
-      throw new Error(`Goal planner ${other.name} is already live; refusing a second Project planner`);
-    }
+    // Admission is fully derived from exact Herdr discovery. In particular it
+    // happens before selected stale tabs are closed, a tab is created, Pi is
+    // launched, or any workflow path/ref is touched.
+    assertAdmissionCapacity(current, await otherPlannerObservations(target.root, target.identity, herdr));
     if (current.state === "live") return current;
-    if (current.state === "stale") await close(current.resources, herdr);
+    if (current.state === "stale" || current.state === "unavailable") await close(current.resources, herdr);
     return launch(target, input, herdr);
   },
   async attach(input) {
@@ -160,12 +186,10 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     const target = await selected(input);
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
-    // Replacement is a launch admission path. Refuse an invalid cross-Goal
-    // live projection before closing selected resources or creating anything.
-    const other = await anotherLivePlanner(target.root, target.identity, herdr);
-    if (other !== undefined) {
-      throw new Error(`Goal planner ${other.name} is already live; refusing a second Project planner`);
-    }
+    // Replacement keeps the selected Goal's one owner. At capacity its old
+    // owner counts as the selected slot, so closing it then launching its
+    // replacement is permitted without touching the other Goal's resources.
+    assertAdmissionCapacity(current, await otherPlannerObservations(target.root, target.identity, herdr));
     await close(current.resources, herdr);
     return launch(target, input, herdr);
   },

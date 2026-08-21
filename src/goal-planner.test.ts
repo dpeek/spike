@@ -86,20 +86,9 @@ describe("Goal planner ownership", () => {
     expect(calls).toEqual(expect.arrayContaining(["close:tab-1", "close:tab-2"]));
   });
 
-  test("refuses a second live Goal planner in the same Project without closing it", async () => {
+  test("admits two distinct Goals and replaces one at capacity without disturbing the other", async () => {
     const { repository, goalId } = await fixture();
-    const other = await createGoal({ cwd: repository.root, title: "Other", outcome: "Remain exclusive.", approval: "Approved." });
-    const otherIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, other.goal.metadata.goalId);
-    const { herdr, calls } = fakeHerdr([{ tab: "other-tab", pane: "other-pane", label: otherIdentity.name, status: "working" }]);
-    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr }))
-      .rejects.toThrow("refusing a second Project planner");
-    expect(calls).toContain(`find:${otherIdentity.name}`);
-    expect(calls.some((call) => call.startsWith("create:") || call === "close:other-tab")).toBe(false);
-  });
-
-  test("refuses cross-Goal live projections before reattachment or repeated replacement side effects", async () => {
-    const { repository, goalId } = await fixture();
-    const other = await createGoal({ cwd: repository.root, title: "Other", outcome: "Remain exclusive.", approval: "Approved." });
+    const other = await createGoal({ cwd: repository.root, title: "Other", outcome: "Run independently.", approval: "Approved." });
     const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
     const otherIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, other.goal.metadata.goalId);
     const { herdr, calls } = fakeHerdr([
@@ -107,15 +96,47 @@ describe("Goal planner ownership", () => {
       { tab: "other-tab", pane: "other-pane", label: otherIdentity.name, status: "working" },
     ]);
 
-    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr }))
-      .rejects.toThrow("refusing a second Project planner");
-    await expect(goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr }))
-      .rejects.toThrow("refusing a second Project planner");
-    await expect(goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr }))
-      .rejects.toThrow("refusing a second Project planner");
+    expect((await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr })).state).toBe("live");
+    await goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr });
+    expect(calls).toContain("close:selected-tab");
+    expect(calls).not.toContain("close:other-tab");
+    expect(calls.some((call) => call.startsWith(`create:${identity.name}`))).toBe(true);
+  });
 
+  test("reconstructs zero, one, and two admissions after restart before refusing a third", async () => {
+    const { repository, goalId } = await fixture();
+    const second = await createGoal({ cwd: repository.root, title: "Second", outcome: "Run independently.", approval: "Approved." });
+    const third = await createGoal({ cwd: repository.root, title: "Third", outcome: "Be refused.", approval: "Approved." });
+    const { herdr, calls } = fakeHerdr([]);
+    await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr });
+    await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId: second.goal.metadata.goalId, herdr });
+    const createsAtCapacity = calls.filter((call) => call.startsWith("create:")).length;
+    // A fresh operation object has no remembered admission record; discovery
+    // finds the two exact labels and reattaches the selected one.
+    expect((await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr })).state).toBe("live");
+    expect(calls.filter((call) => call.startsWith("create:")).length).toBe(createsAtCapacity);
+    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId: third.goal.metadata.goalId, herdr }))
+      .rejects.toThrow("admission limit of 2");
+  });
+
+  test("refuses a third planner before stale cleanup, creation, launch, or workflow mutation", async () => {
+    const { repository, goalId } = await fixture();
+    const second = await createGoal({ cwd: repository.root, title: "Second", outcome: "Run independently.", approval: "Approved." });
+    const third = await createGoal({ cwd: repository.root, title: "Third", outcome: "Be refused.", approval: "Approved." });
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const secondIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, second.goal.metadata.goalId);
+    const thirdIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, third.goal.metadata.goalId);
+    const { herdr, calls } = fakeHerdr([
+      { tab: "stale-selected", pane: "stale-pane", label: identity.name, status: "done" },
+      { tab: "second-tab", pane: "second-pane", label: secondIdentity.name, status: "working" },
+      { tab: "third-tab", pane: "third-pane", label: thirdIdentity.name, status: "idle" },
+    ]);
+
+    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("admission limit of 2");
+    await expect(goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("admission limit of 2");
     expect(calls.filter((call) => call.startsWith("close:") || call.startsWith("create:") || call.startsWith("run:"))).toEqual([]);
-    expect(calls.filter((call) => call === `find:${otherIdentity.name}`)).toHaveLength(3);
   });
 
   test("repeated stale cleanup and replacement close only matching resources once", async () => {

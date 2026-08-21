@@ -98,7 +98,7 @@ describe("direct Pi supervisor", () => {
 
     const spikeInvocation = JSON.parse(await readFile(fake.spikeRecord, "utf8"));
     expect(await realpath(spikeInvocation.cwd)).toBe(await realpath(repository.root));
-    expect(spikeInvocation).toMatchObject({ args: ["status", "--json"], stdin: "" });
+    expect(spikeInvocation).toMatchObject({ args: ["status", "--operational", "--json"], stdin: "" });
     const result = JSON.parse(await readFile(fake.toolResult, "utf8"));
     expect(JSON.parse(result.content[0].text)).toEqual({
       ok: true,
