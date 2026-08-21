@@ -1,5 +1,5 @@
 import { watch } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
@@ -106,17 +106,16 @@ export type PiDispatchClassification =
 
 /**
  * Resolve Pi hosting from the Ticket's frozen isolation policy. Container
- * workers have no attended adapter, so reject that incompatible override
- * before any exchange, runtime, or host-worker side effects begin.
+ * hosting is an operational choice.  Explicit direct dispatch always wins;
+ * unattended planners never accidentally create a Herdr resource.
  */
 export function selectPiHost(
-  policy: { isolation: "workspace" | "container" },
+  _policy: { isolation: "workspace" | "container" },
   requested?: "herdr" | "direct",
+  herdrAvailable = process.env["HERDR_ENV"] === "1",
 ): "herdr" | "direct" {
-  if (requested === "herdr" && policy.isolation === "container") {
-    throw new Error("Herdr hosting is incompatible with container Ticket isolation");
-  }
-  return requested ?? (policy.isolation === "container" ? "direct" : "herdr");
+  if (requested !== undefined) return requested;
+  return herdrAvailable ? "herdr" : "direct";
 }
 
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -193,12 +192,16 @@ export type WorkerRuntimeEnvelope = NonNullable<RecordedWorker["metadata"]["runt
 /** Opaque adapter-owned data. Shared workflow code must only pass it back to the selected adapter. */
 export type WorkerRuntimeResource = unknown;
 type LocalCloneRuntime = { host: "direct"; workspace: string; pid?: number } | { host: "herdr"; workspace: string; tab: string; pane: string };
-type DockerRuntime = { containerId: string; imageDigest: string };
+type DockerRuntime = { containerId: string; imageDigest: string; host?: "herdr"; workspace?: string; tab?: string; pane?: string }; 
 
 /** Adapter-owned operations over its canonical runtime resource. */
 export type WorkerRuntimeOperations = {
   stop: (runtime: WorkerRuntimeResource, identity: TicketIdentity) => Promise<void>;
   cleanup: (runtime: WorkerRuntimeResource) => Promise<void>;
+  /** Injected only by Docker-free lifecycle tests; undefined means still live. */
+  terminalExitCode?: (runtime: WorkerRuntimeResource) => Promise<number | undefined>;
+  /** Wait for the exact Docker resource; aborting this operational wait is safe. */
+  waitForTerminalExit?: (runtime: WorkerRuntimeResource, signal?: AbortSignal) => Promise<number>;
 };
 
 export type WorkerObservation = {
@@ -254,13 +257,27 @@ export const dockerWorkerAdapter: WorkerAdapter = {
   isolation: "container",
   supports: (policy) => policy.isolation === "container",
   dispatch: (input) => dispatchDockerTicket(input),
+  dispatchAttended: (input) => dispatchHerdrDockerTicket(input),
   validateRuntime: validateDockerRuntime,
   runtimeOperations: {
-    stop: (runtime) => dockerStop((runtime as DockerRuntime).containerId),
-    cleanup: (runtime) => dockerRemove((runtime as DockerRuntime).containerId),
+    async stop(runtime) {
+      const dockerRuntime = runtime as DockerRuntime;
+      // Stop the actual container first; closing an attach tab is not a stop.
+      await dockerStop(dockerRuntime.containerId);
+      if (dockerRuntime.host === "herdr" && dockerRuntime.tab !== undefined) await herdrOperations.closeTab(dockerRuntime.tab);
+    },
+    async cleanup(runtime) {
+      const dockerRuntime = runtime as DockerRuntime;
+      await dockerRemove(dockerRuntime.containerId);
+      if (dockerRuntime.workspace !== undefined) await rm(dockerRuntime.workspace, { recursive: true, force: true });
+    },
+    terminalExitCode: (runtime) => dockerTerminalExitCode((runtime as DockerRuntime).containerId),
+    waitForTerminalExit: (runtime, signal) => dockerWaitForTerminalExit((runtime as DockerRuntime).containerId, signal),
   },
   observe: (root, identity) => observeDockerWorker(root, identity),
   loadFinished: (root, identity) => loadFinishedDockerWorker(root, identity),
+  readTerminal: (root, identity, input, options) => readDockerWorkerTerminal(root, identity, input as ReadHerdrTerminalInput, options as HerdrOperations | undefined),
+  attachTerminal: (root, identity, options) => attachDockerWorkerTerminal(root, identity, options as HerdrOperations | undefined),
   finalize: (root, identity, finishedAt, operations) => stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations),
 };
 
@@ -423,6 +440,19 @@ export async function recordWorker(
   return { metadata, body };
 }
 
+/** Docker lifecycle tests may record opaque attended resources without a daemon. */
+export function recordDockerWorker(
+  root: string,
+  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; containerId: string; imageDigest: string; workspace?: string; herdr?: HerdrHandles; environmentDigest?: string },
+): Promise<RecordedWorker> {
+  return recordWorker(root, {
+    ...input,
+    runtime: input.herdr === undefined
+      ? { containerId: input.containerId, imageDigest: input.imageDigest }
+      : { containerId: input.containerId, imageDigest: input.imageDigest, host: "herdr", workspace: input.workspace!, tab: input.herdr.tab, pane: input.herdr.pane },
+  });
+}
+
 /** Local adapter's resource constructor; generic recording retains it opaquely. */
 export function recordLocalCloneWorker(
   root: string,
@@ -451,12 +481,21 @@ const herdrExecutionSchema = z.object({
 
 type HerdrExecutionMarker = z.infer<typeof herdrExecutionSchema>;
 
-function herdrExecutionPath(resource: Extract<LocalCloneRuntime, { host: "herdr" }>): string {
+type AttendedRuntime = { host: "herdr"; workspace: string; tab: string; pane: string };
+
+function attendedRuntime(resource: unknown): AttendedRuntime | undefined {
+  if (typeof resource !== "object" || resource === null) return undefined;
+  const value = resource as Record<string, unknown>;
+  return value["host"] === "herdr" && typeof value["workspace"] === "string" && typeof value["tab"] === "string" && typeof value["pane"] === "string"
+    ? value as AttendedRuntime : undefined;
+}
+
+function herdrExecutionPath(resource: AttendedRuntime): string {
   return join(resource.workspace, "herdr-execution.json");
 }
 
 async function loadHerdrExecutionMarker(
-  resource: Extract<LocalCloneRuntime, { host: "herdr" }>,
+  resource: AttendedRuntime,
 ): Promise<HerdrExecutionMarker | undefined> {
   const path = herdrExecutionPath(resource);
   try {
@@ -472,8 +511,8 @@ async function loadHerdrExecutionMarker(
 }
 
 async function refreshHerdrExecution(root: string, record: RecordedWorker): Promise<RecordedWorker> {
-  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
-  if (record.metadata.finishedAt !== undefined || resource?.host !== "herdr") return record;
+  const resource = attendedRuntime(record.metadata.runtime?.resource);
+  if (record.metadata.finishedAt !== undefined || resource === undefined) return record;
   const execution = await loadHerdrExecutionMarker(resource);
   if (execution === undefined) return record;
   const started = Date.parse(record.metadata.startedAt);
@@ -487,6 +526,47 @@ async function refreshHerdrExecution(root: string, record: RecordedWorker): Prom
     exitCode: execution.exitCode,
   });
   const refreshed = { metadata, body: record.body };
+  await replaceWorkerRecord(root, refreshed);
+  return refreshed;
+}
+
+/** Materialize bounded operational completion only after Docker reports this exact ID terminal. */
+async function installDockerExecutionMarker(resource: DockerRuntime, exitCode: number): Promise<void> {
+  const attended = attendedRuntime(resource);
+  if (attended === undefined) return;
+  const marker = herdrExecutionPath(attended);
+  const temporary = `${marker}.tmp.${process.pid}.${crypto.randomUUID()}`;
+  const body = JSON.stringify({ exitCode, finishedAt: new Date().toISOString() }) + "\n";
+  await writeFile(temporary, body, { mode: 0o600 });
+  try {
+    await rename(temporary, marker);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    // Concurrent restart observers may have won the atomic installation.
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+async function refreshDockerExecution(root: string, record: RecordedWorker, operations: WorkerRuntimeOperations = dockerWorkerAdapter.runtimeOperations!): Promise<RecordedWorker> {
+  if (record.metadata.finishedAt !== undefined) return record;
+  const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
+  if (runtime === undefined) return record;
+  let exitCode: number | undefined;
+  try {
+    exitCode = await (operations.terminalExitCode?.(runtime) ?? dockerTerminalExitCode(runtime.containerId));
+  } catch (error) {
+    // An absent resource is not terminal evidence (it may have been retired
+    // by a racing finalizer); leave the Worker projected unfinished.
+    if ((error as Error).message.includes("no such object")) return record;
+    throw error;
+  }
+  if (exitCode === undefined) return record;
+  await installDockerExecutionMarker(runtime, exitCode);
+  const finishedAt = new Date().toISOString();
+  const refreshed = {
+    metadata: workerRecordSchema.parse({ ...record.metadata, finishedAt, exitCode }),
+    body: record.body,
+  };
   await replaceWorkerRecord(root, refreshed);
   return refreshed;
 }
@@ -547,9 +627,9 @@ export async function stopAndFinalizeRecordedWorker(
   // the same exit while stop was in progress.
   let durable = await loadRecordedWorkerIfPresent(root, identity) ?? record;
   let stoppedExitCode: number | undefined;
-  if (adapter.adapter === "docker") {
+  if (adapter.adapter === "docker" && (durable.metadata.finishedAt === undefined || durable.metadata.exitCode === undefined)) {
     try {
-      stoppedExitCode = await dockerExitCode((resource as DockerRuntime).containerId);
+      stoppedExitCode = await (runtimeOperations.terminalExitCode?.(resource) ?? dockerExitCode((resource as DockerRuntime).containerId));
     } catch (error) {
       return { status: "failed", phase: "stop", execution, message: error instanceof Error ? error.message : String(error) };
     }
@@ -681,16 +761,35 @@ async function markerBackedHerdrDone(
   }
   const record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker record`);
-  const resource = record.metadata.runtime?.resource as LocalCloneRuntime | undefined;
-  if (resource?.host !== "herdr") throw new Error("Ticket has no attended Herdr worker");
+  const resource = attendedRuntime(record.metadata.runtime?.resource);
+  if (resource === undefined) throw new Error("Ticket has no attended Herdr worker");
   if ((await loadHerdrExecutionMarker(resource)) === undefined) return undefined;
   return { ticket: identity, key: workerDoneKey(identity), hosting: "herdr", status: "done" };
 }
 
+/** Docker completion is owned by the adapter, never by the Herdr attach pane. */
+async function waitForDockerWorkerDone(root: string, identity: TicketIdentity, signal?: AbortSignal): Promise<WorkerDoneNotification> {
+  let record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record === undefined) throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker record`);
+  const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
+  if (runtime === undefined || attendedRuntime(runtime) === undefined) throw new Error("Ticket has no attended Herdr worker");
+  const operations = dockerWorkerAdapter.runtimeOperations!;
+  // Retain compatibility with an already materialized operational marker,
+  // while all new markers are installed only by the Docker observer below.
+  record = await refreshHerdrExecution(root, record);
+  record = await refreshDockerExecution(root, record, operations);
+  if (record.metadata.finishedAt === undefined) {
+    const exitCode = await (operations.waitForTerminalExit?.(runtime, signal) ?? dockerWaitForTerminalExit(runtime.containerId, signal));
+    await installDockerExecutionMarker(runtime, exitCode);
+    record = await refreshHerdrExecution(root, record);
+  }
+  if (record.metadata.finishedAt === undefined) throw new Error("Docker completion marker was not installed");
+  return { ticket: identity, key: workerDoneKey(identity), hosting: "herdr", status: "done" };
+}
+
 /**
- * Wait for the local attended wrapper's execution marker. This is an
- * operational notification only: it does not publish a Report or close the
- * Ticket. Docker should add its own concrete completion pressure later.
+ * Wait for an attended operational completion notification. This never
+ * publishes a Report or closes a Ticket.
  */
 export async function waitForWorkerDone(
   root: string,
@@ -698,12 +797,16 @@ export async function waitForWorkerDone(
   signal?: AbortSignal,
 ): Promise<WorkerDoneNotification> {
   signal?.throwIfAborted();
+  const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
+  if (selectWorkerAdapter(ticket.metadata.executionPolicy).adapter === "docker") {
+    return waitForDockerWorkerDone(root, identity, signal);
+  }
   const initial = await markerBackedHerdrDone(root, identity);
   if (initial !== undefined) return initial;
 
   const record = await loadRecordedWorkerIfPresent(root, identity);
-  const resource = record?.metadata.runtime?.resource as LocalCloneRuntime | undefined;
-  if (resource?.host !== "herdr") throw new Error("Ticket has no attended Herdr worker");
+  const resource = attendedRuntime(record?.metadata.runtime?.resource);
+  if (resource === undefined) throw new Error("Ticket has no attended Herdr worker");
 
   return new Promise<WorkerDoneNotification>((resolve, reject) => {
     let settled = false;
@@ -898,10 +1001,15 @@ function validateLocalPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): vo
 }
 
 function validateDockerRuntime(resource: unknown): asserts resource is DockerRuntime {
-  z.object({
+  const runtime = z.object({
     containerId: z.string().regex(/^[0-9a-f]{64}$/),
     imageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    host: z.literal("herdr").optional(), workspace: nonBlankString.optional(), tab: nonBlankString.optional(), pane: nonBlankString.optional(),
   }).strict().parse(resource);
+  if (runtime.host !== undefined) {
+    if (runtime.workspace === undefined || runtime.tab === undefined || runtime.pane === undefined) throw new Error("attended Docker runtime is incomplete");
+    validateWorkspace(runtime.workspace);
+  } else if (runtime.workspace !== undefined || runtime.tab !== undefined || runtime.pane !== undefined) throw new Error("Docker runtime hosting fields are inconsistent");
 }
 
 type DockerCredential = { encodedAuth: string };
@@ -931,16 +1039,31 @@ export async function resolveDockerCredential(ticket: Awaited<ReturnType<typeof 
   if (provider !== dockerPiProvider || grant !== dockerPiProvider) {
     throw new Error("docker adapter supports only the openai-codex credential grant and model provider");
   }
-  const source = process.env["SPIKE_PI_AUTH_FILE"];
-  if (!source?.trim()) throw new Error("SPIKE_PI_AUTH_FILE is required for a declared Docker credential grant");
-  let raw: string;
-  try {
-    const stat = await lstat(source);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error("invalid");
-    raw = await readFile(source, "utf8");
-  } catch {
-    throw new Error("declared Docker credential source is unavailable or invalid");
+  // An explicit source is an override, not a hint: a bad override must fail
+  // before Docker/exchange side effects rather than silently using another login.
+  const override = process.env["SPIKE_PI_AUTH_FILE"]?.trim() || undefined;
+  const configuredDirectory = process.env["PI_CODING_AGENT_DIR"]?.trim();
+  const candidates = override !== undefined
+    ? [override]
+    : [
+      ...(configuredDirectory === undefined || configuredDirectory === "" ? [] : [join(configuredDirectory, "auth.json")]),
+      ...(process.env["HOME"]?.trim() ? [join(process.env["HOME"]!, ".pi", "agent", "auth.json")] : []),
+    ];
+  let raw: string | undefined;
+  for (const source of candidates) {
+    try {
+      const stat = await lstat(source);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error("invalid");
+      raw = await readFile(source, "utf8");
+      break;
+    } catch (error) {
+      // Normal Pi fallback only skips a missing configured location. Any file
+      // that is unsafe or unreadable is a refusal, as is an explicit override.
+      if (override === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error("declared Docker credential source is unavailable or invalid");
+    }
   }
+  if (raw === undefined) throw new Error("declared Docker credential source is unavailable or invalid");
   let document: unknown;
   try { document = JSON.parse(raw); } catch { throw new Error("declared Docker credential source is malformed"); }
   if (typeof document !== "object" || document === null || Array.isArray(document)) {
@@ -979,11 +1102,38 @@ async function dockerStop(containerId: string): Promise<void> {
   await dockerRequired(["stop", "--time", "1", containerId]);
 }
 
-async function dockerExitCode(containerId: string): Promise<number> {
-  const value = await dockerRequired(["inspect", "--format", "{{.State.ExitCode}}", containerId]);
-  const exitCode = Number(value);
+async function dockerTerminalExitCode(containerId: string): Promise<number | undefined> {
+  const value = await dockerRequired(["inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", containerId]);
+  const [running, rawExitCode] = value.split(/\s+/, 2);
+  if (running === "true") return undefined;
+  const exitCode = Number(rawExitCode);
   if (!Number.isInteger(exitCode)) throw new Error(`Docker container has no terminal exit code: ${containerId}`);
   return exitCode;
+}
+
+async function dockerExitCode(containerId: string): Promise<number> {
+  const exitCode = await dockerTerminalExitCode(containerId);
+  if (exitCode === undefined) throw new Error(`Docker container has not finished: ${containerId}`);
+  return exitCode;
+}
+
+async function dockerWaitForTerminalExit(containerId: string, signal?: AbortSignal): Promise<number> {
+  const already = await dockerTerminalExitCode(containerId);
+  if (already !== undefined) return already;
+  signal?.throwIfAborted();
+  const process = Bun.spawn(["docker", "wait", containerId], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const abort = () => process.kill();
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const [code, stdout, stderr] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()]);
+    signal?.throwIfAborted();
+    if (code !== 0) throw new Error(`docker wait failed: ${(stderr || stdout).trim()}`);
+    const exitCode = Number(stdout.trim());
+    if (!Number.isInteger(exitCode)) throw new Error(`Docker container has no terminal exit code: ${containerId}`);
+    return exitCode;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 async function dockerRemove(containerId: string): Promise<void> {
@@ -1012,17 +1162,39 @@ function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: A
 }
 
 async function observeDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerObservation> {
-  const record = await loadRecordedWorkerIfPresent(root, identity);
+  let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) return { hosting: null, status: "unavailable" };
-  if (record.metadata.finishedAt !== undefined) return { hosting: "direct", status: "done" };
+  record = await refreshHerdrExecution(root, record);
+  record = await refreshDockerExecution(root, record);
   const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
-  if (runtime === undefined || !(await dockerExists(runtime.containerId))) return { hosting: "direct", status: "unavailable" };
-  const running = await dockerRequired(["inspect", "--format", "{{.State.Running}}", runtime.containerId]);
-  return { hosting: "direct", status: running === "true" || running === "false" ? "working" : "unavailable" };
+  const hosting = runtime?.host === "herdr" ? "herdr" : "direct";
+  if (record.metadata.finishedAt !== undefined) return { hosting, status: "done" };
+  if (runtime === undefined || !(await dockerExists(runtime.containerId))) return { hosting, status: "unavailable" };
+  // A stopped-but-not-yet-reaped container remains working until the adapter-owned
+  // exact-container observer has observed its actual exit and atomically written the marker.
+  return { hosting, status: "working" };
+}
+
+async function readDockerWorkerTerminal(root: string, identity: TicketIdentity, input: ReadHerdrTerminalInput = {}, herdr: HerdrOperations = herdrOperations): Promise<string> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  const runtime = attendedRuntime(record?.metadata.runtime?.resource);
+  if (runtime === undefined) throw new Error("Ticket has no Herdr-hosted terminal");
+  return herdr.read(runtime.pane, input);
+}
+
+async function attachDockerWorkerTerminal(root: string, identity: TicketIdentity, herdr: HerdrOperations = herdrOperations): Promise<number> {
+  const record = await loadRecordedWorkerIfPresent(root, identity);
+  const runtime = attendedRuntime(record?.metadata.runtime?.resource);
+  if (runtime === undefined) throw new Error("Ticket has no Herdr-hosted terminal");
+  return herdr.attach(runtime.pane);
 }
 
 async function loadFinishedDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerExecution> {
-  const record = await loadRecordedWorkerIfPresent(root, identity);
+  let record = await loadRecordedWorkerIfPresent(root, identity);
+  if (record !== undefined) {
+    record = await refreshHerdrExecution(root, record);
+    record = await refreshDockerExecution(root, record);
+  }
   if (record === undefined || record.metadata.finishedAt === undefined || record.metadata.exitCode === undefined) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker has not finished`);
   }
@@ -1091,6 +1263,54 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   } finally {
     completeDispatch?.();
     liveDockerWorkers.delete(workerKey(identity));
+  }
+}
+
+/** Launch an interactive Docker container through one fresh Herdr tab. The
+ * adapter-owned restartable exact-container observer waits after attachment;
+ * attachment loss is never completion evidence. */
+export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
+  if (input.command.length === 0) throw new Error("Worker command must not be empty");
+  const worker = requireText(input.worker, "Worker identity");
+  const repository = await discoverRepository(input.cwd);
+  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
+  validateDockerPolicy(ticket);
+  const credential = await resolveDockerCredential(ticket);
+  const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
+  const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", dockerImage()]);
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${dockerImage()}`);
+  const exchange = await prepareTicketExchange(repository.root, identity);
+  const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
+  const host = input.herdr ?? herdrOperations;
+  const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
+  let containerId: string | undefined;
+  let handles: HerdrHandles | undefined;
+  let recorded = false;
+  try {
+    containerId = await dockerRequired([
+      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "--tmpfs", "/work:rw,noexec,nosuid,size=256m",
+      "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
+      "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
+      "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
+    ]);
+    const createdImageDigest = await dockerRequired(["inspect", "--format", "{{.Image}}", containerId]);
+    if (createdImageDigest !== imageDigest) throw new Error("Docker container image does not match inspected provenance");
+    handles = await host.createTab({ cwd: workspace, label: `${input.goalId}-${input.changeId}-${input.ticketId}`, environment: {} });
+    await recordWorker(repository.root, { ...identity, role: ticket.metadata.role, worker, startedAt: (input.clock ?? (() => new Date()))().toISOString(), environmentDigest: imageDigest, runtime: { containerId, imageDigest, host: "herdr", workspace, tab: handles.tab, pane: handles.pane } });
+    recorded = true;
+    // Start is adapter-owned. Herdr owns only this interactive attachment;
+    // losing its shell cannot prevent a later supervisor from observing exit.
+    await dockerRequired(["start", containerId]);
+    await host.run(handles.pane, `docker attach ${shellQuote(containerId)}`);
+    return { root: repository.root, exchange, hosting: "herdr", status: "working" };
+  } catch (error) {
+    if (!recorded) {
+      if (handles !== undefined) await host.closeTab(handles.tab).catch(() => undefined);
+      if (containerId !== undefined) await dockerRemove(containerId).catch(() => undefined);
+      await rm(workspace, { recursive: true, force: true });
+    }
+    throw error;
   }
 }
 
@@ -1328,7 +1548,9 @@ export async function dispatchPiTicket(
     container ? "/usr/local/bin/pi" : input.piExecutable ?? "pi",
     ...(host === "direct" ? ["--print"] : []),
     "--no-session",
-    ...(container ? [] : ["--no-approve"]),
+    // Never prompt for project trust: the immutable checkout is established
+    // by the pinned container entrypoint (or local-clone dispatcher).
+    "--no-approve",
     "--model",
     ticket.metadata.model,
     "--thinking",

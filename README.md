@@ -16,6 +16,8 @@ Requires [Bun](https://bun.sh/).
 ```bash
 bun run test
 bun run check
+# Explicit Docker coverage (requires a safe local daemon)
+bun test test/docker/
 bin/spike --help
 ```
 
@@ -68,6 +70,10 @@ spike ticket issue \
   --thinking medium
 ```
 
+## Attended container workers
+
+When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in one ephemeral Herdr tab. The tab can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary.
+
 ## Request inbox
 
 Requests are host-local, Git-independent unapproved intake. `spike request create`
@@ -102,8 +108,9 @@ an active Change.
 role's `implement` or `review` agent defaults from `spike.json`. Use
 `--clear-credentials` to explicitly replace configured grants with an empty list,
 for example when overriding a Ticket to workspace isolation. Omitted worker
-isolation in configuration resolves to `container`; workspace dispatch is attended
-by default, while container dispatch is direct by default.
+isolation in configuration resolves to `container`. When the planner has
+`HERDR_ENV=1`, both workspace and container dispatch are attended; otherwise both
+use direct execution. Use `--host direct` as the explicit container fallback.
 Pi dispatch accepts no model, thinking, role, prompt, or extension overrides.
 Attended dispatch defaults to one headed interactive Pi TUI in a named ephemeral
 Herdr tab. It uses the immutable selection from `ticket.md`, automatically
@@ -136,8 +143,11 @@ spike worker attach --goal <goal-id> --change 001 --ticket 001
 
 Herdr `working`, `blocked`, `done`, or unavailable status and terminal output
 cannot complete the Ticket or publish a Report. `worker wait` emits one operational
-notification only after the attended wrapper's execution marker exists. The
-supervisor extension waits in the background and queues a full-identity recheck
+notification only after the attended execution marker exists: for workspace
+hosting, the wrapper records local Pi exit; for Docker, the adapter-owned,
+restartable exact-container observer records actual exit after `docker wait` and
+installs the operational marker; the Herdr pane hosts attachment only. The supervisor extension waits in the
+background and queues a full-identity recheck
 message that wakes an idle planner. If an attended waiter fails unexpectedly, it
 queues a distinct operational failure recheck instead of silently disabling wake-up.
 The planner must call `spike_status` and then explicitly publish the Report; either
@@ -183,7 +193,10 @@ role-specific completion and blocked tools. The extension sends tool arguments
 to `spike worker complete --json` or `spike worker block --json`; it does not
 import Spike internals or format durable files. A rejected payload remains
 retryable. An accepted outcome terminates the agent turn and requests Pi's
-supported graceful shutdown; the Herdr wrapper then records the process exit.
+supported graceful shutdown. For workspace hosting, the Herdr wrapper then
+records local Pi exit; for Docker, the Herdr pane hosts attachment only and the
+adapter-owned, restartable exact-container observer records actual container exit
+and installs the operational marker.
 
 A completed review or blocked Report needs no commit message options. To seal a
 worker failure instead, use `--failure "<reason>"`. Report publication returns

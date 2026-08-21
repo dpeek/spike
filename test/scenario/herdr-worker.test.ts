@@ -8,11 +8,13 @@ import { publishImplementationReport } from "../../src/report.ts";
 import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
 import {
   dispatchHerdrTicket,
+  dockerWorkerAdapter,
   loadFinishedWorkerExecution,
   loadRecordedWorkerIfPresent,
   observeWorker,
   prepareTicketExchange,
   readWorkerTerminal,
+  recordDockerWorker,
   recordLocalCloneWorker,
   stopAndFinalizeRecordedWorker,
   waitForWorkerDone,
@@ -33,7 +35,7 @@ afterEach(async () => {
   }
 });
 
-async function issuedTicket() {
+async function issuedTicket(policy: import("../../src/ticket.ts").ExecutionPolicy = { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] }) {
   const repository = await temporaryRepository();
   repositories.push(repository);
   const goal = await createGoal({
@@ -56,7 +58,7 @@ async function issuedTicket() {
     goalId,
     changeId: "001",
     instruction: "Implement attended hosting.",
-    executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+    executionPolicy: policy,
     model: "controlled-model",
     thinking: "medium",
   });
@@ -129,6 +131,119 @@ describe("ephemeral Herdr worker hosting", () => {
     });
     expect(await ticketStatus(repository.root, identity.goalId, identity.changeId, identity.ticketId)).toBe("open");
     expect(await Bun.file(reportPath(repository.root, identity.goalId, identity.changeId, identity.ticketId)).exists()).toBe(false);
+  });
+
+  test("loads an attended Docker marker directly after wait, without status observation", async () => {
+    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-attended-"));
+    workspaces.push(workspace);
+    await recordDockerWorker(repository.root, {
+      ...identity, role: "implement", worker: "docker-worker", startedAt: "2026-04-01T10:00:00.000Z",
+      containerId: "a".repeat(64), imageDigest: `sha256:${"b".repeat(64)}`, workspace,
+      herdr: { tab: "docker-tab", pane: "docker-pane" },
+    });
+    await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":0,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
+    await expect(waitForWorkerDone(repository.root, identity)).resolves.toMatchObject({ status: "done" });
+    // This is the supervisor's wait-to-load/publish path: no observeWorker.
+    await expect(loadFinishedWorkerExecution(repository.root, identity)).resolves.toMatchObject({ adapter: "docker", exitCode: 0 });
+  });
+
+  test("Docker-free attended attachment loss, stop/report race, and repeated retirement retain actual-exit evidence", async () => {
+    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-race-"));
+    workspaces.push(workspace);
+    await recordDockerWorker(repository.root, {
+      ...identity, role: "implement", worker: "race-worker", startedAt: "2026-04-01T10:00:00.000Z",
+      containerId: "c".repeat(64), imageDigest: `sha256:${"d".repeat(64)}`, workspace,
+      herdr: { tab: "race-tab", pane: "race-pane" },
+    });
+    const host = observationalHerdr("done", "attachment ended");
+    // Losing an attachment is operational and cannot substitute for docker wait.
+    await expect(readWorkerTerminal(repository.root, identity, {}, host)).resolves.toBe("attachment ended");
+    await expect(loadFinishedWorkerExecution(repository.root, identity)).rejects.toThrow("has not finished");
+    await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":17,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
+    await expect(loadFinishedWorkerExecution(repository.root, identity)).resolves.toMatchObject({ exitCode: 17 });
+    const operations: import("../../src/worker.ts").WorkerRuntimeOperations = {
+      async stop() { operationsSeen.push("stop/tab-close"); },
+      async cleanup(runtime) {
+        if (!dockerRemoved) { operationsSeen.push("docker-remove"); dockerRemoved = true; }
+        operationsSeen.push("workspace-remove");
+        if (operationsSeen.filter((operation) => operation === "workspace-remove").length === 1) {
+          throw new Error("injected wrapper workspace removal failure");
+        }
+        await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
+      },
+      // Retry must use the durable marker/Worker fields rather than inspect
+      // the Docker ID that the successful first cleanup already removed.
+      async terminalExitCode() { operationsSeen.push("unexpected-terminal-inspect"); throw new Error("no such object"); },
+    };
+    const operationsSeen: string[] = [];
+    let dockerRemoved = false;
+    await expect(stopAndFinalizeRecordedWorker(repository.root, identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
+    expect((await loadRecordedWorkerIfPresent(repository.root, identity))?.metadata).toMatchObject({ finishedAt: "2026-04-01T10:01:00.000Z", exitCode: 17 });
+    await expect(stopAndFinalizeRecordedWorker(repository.root, identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
+    expect(operationsSeen).toEqual(["stop/tab-close", "docker-remove", "workspace-remove", "stop/tab-close", "workspace-remove"]);
+    expect(await Bun.file(workspace).exists()).toBe(false);
+    expect((await loadRecordedWorkerIfPresent(repository.root, identity))?.metadata.runtime).toBeUndefined();
+  });
+
+  test("refuses a removed Docker runtime without durable terminal evidence before cleanup", async () => {
+    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    await recordDockerWorker(repository.root, {
+      ...identity, role: "implement", worker: "unknown-container", startedAt: "2026-04-01T10:00:00.000Z",
+      containerId: "1".repeat(64), imageDigest: `sha256:${"2".repeat(64)}`,
+    });
+    const events: string[] = [];
+    const result = await stopAndFinalizeRecordedWorker(repository.root, identity, new Date(), {
+      async stop() { events.push("stop"); },
+      async terminalExitCode() { events.push("terminal-inspect"); throw new Error("no such object"); },
+      async cleanup() { events.push("cleanup"); },
+    });
+    expect(result).toMatchObject({ status: "failed", phase: "stop", message: "no such object" });
+    expect(events).toEqual(["stop", "terminal-inspect"]);
+    expect((await loadRecordedWorkerIfPresent(repository.root, identity))?.metadata.runtime).toBeDefined();
+  });
+
+  test("Docker-free observer loss cancels and restarts the exact-container waiter", async () => {
+    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-observer-loss-"));
+    workspaces.push(workspace);
+    await recordDockerWorker(repository.root, {
+      ...identity, role: "implement", worker: "observer-loss", startedAt: "2026-04-01T10:00:00.000Z",
+      containerId: "e".repeat(64), imageDigest: `sha256:${"f".repeat(64)}`, workspace,
+      herdr: { tab: "lost-tab", pane: "lost-pane" },
+    });
+    const original = dockerWorkerAdapter.runtimeOperations!;
+    let exitCode: number | undefined;
+    let waits = 0;
+    dockerWorkerAdapter.runtimeOperations = {
+      ...original,
+      async terminalExitCode() { return exitCode; },
+      async waitForTerminalExit(_runtime, signal) {
+        waits++;
+        if (signal?.aborted) throw new Error("cancelled");
+        return new Promise<number>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+        });
+      },
+    };
+    try {
+      // A dead attachment says nothing about the still-live container.
+      await expect(loadFinishedWorkerExecution(repository.root, identity)).rejects.toThrow("has not finished");
+      const abort = new AbortController();
+      const waiting = waitForWorkerDone(repository.root, identity, abort.signal);
+      abort.abort();
+      await expect(waiting).rejects.toThrow("cancelled");
+      expect(waits).toBe(1);
+      // No Herdr observer is restarted. A fresh supervisor inspects the same
+      // recorded identity, reconstructs terminal state, and writes the marker.
+      exitCode = 23;
+      await expect(waitForWorkerDone(repository.root, identity)).resolves.toMatchObject({ status: "done" });
+      await expect(loadFinishedWorkerExecution(repository.root, identity)).resolves.toMatchObject({ exitCode: 23 });
+      expect(await Bun.file(join(workspace, "herdr-execution.json")).exists()).toBe(true);
+    } finally {
+      dockerWorkerAdapter.runtimeOperations = original;
+    }
   });
 
   test("retries Herdr stop and cleanup idempotently", async () => {

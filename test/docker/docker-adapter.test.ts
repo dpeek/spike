@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, test } from "bun:test";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { issueTicket, type ExecutionPolicy } from "../../src/ticket.ts";
-import { dispatchPiTicket, dockerWorkerAdapter, exchangePath, loadRecordedWorkerIfPresent } from "../../src/worker.ts";
+import { dispatchHerdrDockerTicket, dispatchPiTicket, dockerWorkerAdapter, exchangePath, loadRecordedWorkerIfPresent, observeWorker, waitForWorkerDone } from "../../src/worker.ts";
+import type { HerdrOperations } from "../../src/herdr.ts";
 import { publishImplementationReport } from "../../src/report.ts";
 import { temporaryRepository } from "../support/repository.ts";
 import { workerAdapterContract } from "../contract/worker-adapter.ts";
@@ -87,19 +89,27 @@ describe("Docker worker isolation", () => {
 
     const absent = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
     const sourceForLater = process.env["SPIKE_PI_AUTH_FILE"];
+    const configuredForLater = process.env["PI_CODING_AGENT_DIR"];
+    const homeForLater = process.env["HOME"];
     delete process.env["SPIKE_PI_AUTH_FILE"];
+    process.env["PI_CODING_AGENT_DIR"] = `/tmp/spike-missing-auth-${crypto.randomUUID()}`;
+    process.env["HOME"] = `/tmp/spike-missing-home-${crypto.randomUUID()}`;
     try {
       let inspected = false;
       await expect(dockerWorkerAdapter.dispatch({
         cwd: absent.root, ...absent.identity, worker: "missing-credential", command: ["true"],
         afterDockerImageInspection: async () => { inspected = true; },
-      })).rejects.toThrow("SPIKE_PI_AUTH_FILE");
+      })).rejects.toThrow("unavailable or invalid");
       expect(inspected).toBe(false);
       expect(await loadRecordedWorkerIfPresent(absent.root, absent.identity)).toBeUndefined();
       expect(await Bun.file(`${exchangePath(absent.root, absent.identity)}/input/ticket.md`).exists()).toBe(false);
     } finally {
       if (sourceForLater === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
       else process.env["SPIKE_PI_AUTH_FILE"] = sourceForLater;
+      if (configuredForLater === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+      else process.env["PI_CODING_AGENT_DIR"] = configuredForLater;
+      if (homeForLater === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = homeForLater;
       await Bun.spawn(["chmod", "-R", "u+w", absent.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await absent.remove();
     }
@@ -175,6 +185,105 @@ describe("Docker worker isolation", () => {
       await Bun.$`docker rm --force ${source}`.quiet();
       if (previousImage === undefined) delete process.env["SPIKE_DOCKER_IMAGE"];
       else process.env["SPIKE_DOCKER_IMAGE"] = previousImage;
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
+    }
+  }, 30_000);
+
+  test("attends a TTY container, wakes only after docker exit, and retires tab resources", async () => {
+    const active = await fixture();
+    const closed: string[] = [];
+    const host: HerdrOperations = {
+      async createTab() { return { tab: "docker-tab", pane: "docker-pane" }; },
+      async run(_pane, command) { Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" }); },
+      async status() { return "done"; }, async read() { return "operational terminal"; }, async attach() { return 0; },
+      async closeTab(tab) { closed.push(tab); },
+    };
+    try {
+      const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "attended-worker", command: ["bun", "-e", "await Bun.sleep(100)"], herdr: host });
+      expect(dispatched.status).toBe("working");
+      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const runtime = record!.metadata.runtime!.resource as { containerId: string; host: string; imageDigest: string; workspace: string }; 
+      const inspected = await Bun.$`docker inspect ${runtime.containerId}`.json();
+      expect(inspected[0].Config.Tty).toBe(true);
+      expect(inspected[0].Config.OpenStdin).toBe(true);
+      expect(inspected[0].HostConfig.ReadonlyRootfs).toBe(true);
+      expect(inspected[0].HostConfig.NetworkMode).toBe("none");
+      expect(inspected[0].Image).toBe(runtime.imageDigest);
+      const mounts = inspected[0].Mounts as Array<{ Destination: string; RW: boolean }>;
+      expect(mounts.map((mount) => mount.Destination).sort()).toEqual(["/exchange/input", "/exchange/output"]);
+      expect(mounts.find((mount) => mount.Destination === "/exchange/input")?.RW).toBe(false);
+      expect(mounts.find((mount) => mount.Destination === "/exchange/output")?.RW).toBe(true);
+      expect((await observeWorker(active.root, active.identity, host)).status).toBe("working");
+      await waitForWorkerDone(active.root, active.identity);
+      expect((await observeWorker(active.root, active.identity, host)).status).toBe("done");
+      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), {
+        async stop(runtime) { await Bun.$`docker stop --time 1 ${(runtime as { containerId: string }).containerId}`.quiet(); await host.closeTab("docker-tab"); },
+        async cleanup(runtime) {
+          await Bun.$`docker rm --force ${(runtime as { containerId: string }).containerId}`.quiet();
+          await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
+        },
+      })).status).toBe("finalized");
+      expect(closed).toEqual(["docker-tab"]);
+      expect(await Bun.file(runtime.workspace).exists()).toBe(false);
+      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect(closed).toEqual(["docker-tab"]);
+    } finally {
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
+    }
+  }, 30_000);
+
+  test("retries attended Docker cleanup after removal succeeds but wrapper workspace removal fails", async () => {
+    const active = await fixture();
+    const closed: string[] = [];
+    const host: HerdrOperations = {
+      async createTab() { return { tab: "cleanup-race-tab", pane: "cleanup-race-pane" }; },
+      async run(_pane, command) { Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" }); },
+      async status() { return "done"; }, async read() { return "attachment is operational"; }, async attach() { return 0; },
+      async closeTab(tab) { closed.push(tab); },
+    };
+    try {
+      await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "cleanup-race", command: ["true"], herdr: host });
+      await waitForWorkerDone(active.root, active.identity);
+      const durable = (await loadRecordedWorkerIfPresent(active.root, active.identity))!;
+      expect(durable.metadata).toMatchObject({ finishedAt: expect.any(String), exitCode: 0 });
+      const runtime = durable.metadata.runtime!.resource as { containerId: string; workspace: string };
+      await mkdir(runtime.workspace, { recursive: true });
+      await writeFile(`${runtime.workspace}/cleanup-race-proof`, "wrapper workspace remains until successful retry\n");
+      const events: string[] = [];
+      let removed = false;
+      const operations = {
+        async stop(resource: unknown) {
+          events.push("stop/tab-close");
+          const id = (resource as { containerId: string }).containerId;
+          if ((await Bun.spawn(["docker", "container", "inspect", id], { stdout: "ignore", stderr: "ignore" }).exited) === 0) {
+            await Bun.$`docker stop --time 1 ${id}`.quiet();
+          }
+          await host.closeTab("cleanup-race-tab");
+        },
+        async terminalExitCode(resource: unknown) {
+          events.push("terminal-inspect");
+          const id = (resource as { containerId: string }).containerId;
+          return Number((await Bun.$`docker inspect --format {{.State.ExitCode}} ${id}`.text()).trim());
+        },
+        async cleanup(resource: unknown) {
+          const value = resource as { containerId: string; workspace: string };
+          if (!removed) { events.push("docker-remove"); await Bun.$`docker rm --force ${value.containerId}`.quiet(); removed = true; }
+          events.push("workspace-remove");
+          if (events.filter((event) => event === "workspace-remove").length === 1) throw new Error("injected wrapper removal failure");
+          await rm(value.workspace, { recursive: true, force: true });
+        },
+      };
+      await expect(dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
+      expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(true);
+      await expect(dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
+      expect(events).toEqual(["stop/tab-close", "docker-remove", "workspace-remove", "stop/tab-close", "workspace-remove"]);
+      expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(false);
+      expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
+      expect(closed).toEqual(["cleanup-race-tab", "cleanup-race-tab"]);
+      expect((await loadRecordedWorkerIfPresent(active.root, active.identity))?.metadata.runtime).toBeUndefined();
+    } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
     }
