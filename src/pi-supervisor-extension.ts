@@ -104,7 +104,7 @@ export const goalPlannerToolNames = [
 ] as const;
 
 export const applicationSupervisorToolNames = [
-  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_recover_application",
+  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
 ] as const;
 
 export const supervisorToolNames = [
@@ -837,6 +837,34 @@ export function registerSupervisorExtension(
       },
       command: "application apply-head",
       args: (params) => ["application", "apply-head", "--goal", params.goalId, "--application", params.applicationId],
+    }, invoke, options),
+    tool({
+      name: "spike_issue_application_review", label: "Issue Application Review Ticket", description: "Supervisor-only issue of a review Ticket for the exact current Application Candidate.", promptSnippet: "Issue exact Application Candidate review",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "instruction"], properties: { goalId: nonBlankString, applicationId: nonBlankString, instruction: nonBlankString } }, command: "application review issue",
+      args: (params) => ["application", "review", "issue", "--goal", params.goalId, "--application", params.applicationId, "--instruction", params.instruction],
+    }, invoke, options),
+    tool({
+      name: "spike_prepare_application_review", label: "Prepare Application Review", description: "Prepare bounded context for the exact Application review Candidate.", promptSnippet: "Prepare exact Application review context",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString } }, command: "application review prepare",
+      args: (params) => ["application", "review", "prepare", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId],
+    }, invoke, options),
+    tool({
+      name: "spike_dispatch_application_review", label: "Dispatch Application Review", description: "Dispatch the exact Application review Candidate through the configured Application adapter.", promptSnippet: "Dispatch exact Application review worker",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString } }, command: "application review dispatch-pi",
+      args: (params) => ["application", "review", "dispatch-pi", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker],
+    }, invoke, options),
+    tool({
+      name: "spike_publish_application_review", label: "Publish Application Review", description: "Validate recorded review-worker output and publish immutable Application review evidence.", promptSnippet: "Publish exact Application review Report",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString } }, command: "application review publish",
+      args: (params) => ["application", "review", "publish", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker],
+    }, invoke, options),
+    tool({
+      name: "spike_application_review_status", label: "Application review status", description: "Show durable Application Candidate review and approval usability.", promptSnippet: "Inspect Application review approval", parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId"], properties: { goalId: nonBlankString, applicationId: nonBlankString } }, command: "application review status",
+      args: (params) => ["application", "review", "status", "--goal", params.goalId, "--application", params.applicationId],
+    }, invoke, options),
+    tool({
+      name: "spike_recover_application_review", label: "Recover Application review", description: "Record interruption evidence and perform best-effort operational cleanup for an Application review.", promptSnippet: "Recover exact Application review", parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, reason: nonBlankString } }, command: "application review recover",
+      args: (params) => { const args = ["application", "review", "recover", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId]; optional(args, "--reason", params.reason); return args; },
     }, invoke, options),
     tool({
       name: "spike_issue_application_implement",

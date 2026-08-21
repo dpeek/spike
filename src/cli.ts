@@ -16,6 +16,8 @@ import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
 import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, recoverApplicationTicket } from "./application-ticket.ts";
+import { deriveApplicationReviewStatus, issueApplicationReviewTicket, prepareApplicationReviewExchange, publishApplicationReviewReport, recoverApplicationReviewTicket } from "./application-review.ts";
+import { dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker, loadFinishedApplicationReviewWorker, observeApplicationReviewWorker, readApplicationReviewWorker } from "./application-review-worker.ts";
 import { dispatchApplicationPiTicket, dispatchApplicationWorker, loadFinishedApplicationWorker, observeApplicationWorker, readApplicationWorker } from "./application-worker.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
@@ -70,6 +72,10 @@ Usage:
   spike application apply-head --goal <goal-id> --application <application-id> [--json]
   spike application ticket issue --goal <goal-id> --application <application-id> --instruction <instruction> [options]
   spike application ticket prepare --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
+  spike application review issue --goal <goal-id> --application <application-id> --instruction <instruction> [--json]
+  spike application review prepare --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
+  spike application review status --goal <goal-id> --application <application-id> [--json]
+  spike application review recover --goal <goal-id> --application <application-id> --ticket <ticket-id> [--reason <reason>] [--json]
   spike application ticket dispatch-test --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
   spike application ticket dispatch-pi --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> [--json]
   spike application worker status --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
@@ -940,6 +946,47 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         `  Planner cleanup ${queued.plannerCleanup.status}\n`);
     }
 
+    if (args[0] === "application" && args[1] === "review" && args[2] === "issue") {
+      const input = parseApplicationIdentity(args.slice(3), { instruction: true });
+      const issued = await issueApplicationReviewTicket({ cwd, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
+      return success(json, "application review issue", { ticket: issued.ticket.metadata }, `Issued Application review Ticket ${input.goalId}/${input.applicationId}/${issued.ticket.metadata.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "prepare") {
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd);
+      const exchange = await prepareApplicationReviewExchange(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application review prepare", exchange, `Prepared Application review Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-pi") {
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewPiTicket({ cwd, ...input });
+      return success(json, "application review dispatch-pi", { ticket: input, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-test") {
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewWorker({ cwd, ...input });
+      return success(json, "application review dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "worker" && args[3] === "status") {
+      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd), observed = await observeApplicationReviewWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application review worker status", { ticket: input, ...observed }, `Application review Worker ${input.ticketId} ${observed.status}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "worker" && args[3] === "read") {
+      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd), terminal = await readApplicationReviewWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application review worker read", { ticket: input, terminal }, terminal);
+    }
+    if (args[0] === "application" && args[1] === "review" && (args[2] === "publish" || (args[2] === "report" && args[3] === "publish"))) {
+      const input = parseApplicationPiDispatch(args.slice(args[2] === "report" ? 4 : 3)); const repository = await discoverRepository(cwd), execution = await loadFinishedApplicationReviewWorker(repository.root, input);
+      if (execution.worker !== input.worker) throw new UsageError("application review publish worker does not match recorded Application review Worker");
+      const published = await publishApplicationReviewReport({ cwd: repository.root, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      return success(json, "application review publish", { report: published.report.metadata }, `Published Application review Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "status") {
+      const input = parseApplicationIdentity(args.slice(3)); const status = await deriveApplicationReviewStatus(cwd, input.goalId, input.applicationId);
+      return success(json, "application review status", status, `Application review approval ${status.approvalUsable ? "usable" : "unusable"}\n`);
+    }
+    if (args[0] === "application" && args[1] === "review" && args[2] === "recover") {
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true, reason: true }); const result = await recoverApplicationReviewTicket(cwd, input.goalId, input.applicationId, input.ticketId!, input.reason);
+      return success(json, "application review recover", result, `Recovered Application review Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "issue") {
       const input = parseApplicationIdentity(args.slice(3), { instruction: true });
       const issued = await issueApplicationTicket({ cwd, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
@@ -978,7 +1025,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "application" && args[1] === "status") {
       const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, input.goalId, input.applicationId);
-      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n`);
+      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n`);
     }
 
     if (args[0] === "application" && args[1] === "recover") {

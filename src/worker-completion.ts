@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 import { acceptanceCriteria } from "./acceptance.ts";
 import { loadApplicationTicketDocument, type ApplicationTicket } from "./application-ticket.ts";
+import { applicationReviewTicketSchema, type ApplicationReviewTicket } from "./application-review.ts";
 import { installImmutable, readDocument, serializeDocument } from "./durable-state.ts";
 import { loadTicketDocument, type Ticket } from "./ticket.ts";
 
@@ -407,6 +408,26 @@ async function createApplicationOutputBundle(repository: string, outputDirectory
   } finally { await git(repository, ["update-ref", "-d", ref]).catch(() => undefined); await rm(temporary, { force: true }); }
 }
 
+async function completeApplicationReviewWorker(cwd: string, inputDirectory: string, outputDirectory: string, payloadSource: string): Promise<WorkerCompletion> {
+  const raw = await readDocument(inputDirectory, join(inputDirectory, "ticket.md"));
+  const metadata = applicationReviewTicketSchema.parse(raw.metadata);
+  const ticket: ApplicationReviewTicket = { metadata, body: raw.body };
+  const expected: Array<[string, string]> = [["SPIKE_GOAL_ID", metadata.goalId], ["SPIKE_APPLICATION_ID", metadata.applicationId], ["SPIKE_TICKET_ID", metadata.ticketId], ["SPIKE_TICKET_ROLE", "review"], ["SPIKE_INPUT_REVISION", metadata.candidateRevision]];
+  for (const [name, value] of expected) if (process.env[name] !== undefined && process.env[name] !== value) throw new Error(`${name} does not match SPIKE_INPUT_DIR/ticket.md`);
+  const model = process.env["SPIKE_ACTUAL_MODEL"] ?? process.env["SPIKE_MODEL"], thinking = process.env["SPIKE_ACTUAL_THINKING"] ?? process.env["SPIKE_THINKING"];
+  if (!model || !thinking || model !== metadata.model || thinking !== metadata.thinking) throw new Error("actual worker selection does not match Application review Ticket assignment");
+  const payload = reviewPayloadSchema.parse(parsePayload(payloadSource));
+  const ids = payload.findings.map(item => item.id); if (new Set(ids).size !== ids.length) throw new Error("review finding IDs must be unique");
+  if (payload.verdict === "remediate" && payload.findings.length === 0) throw new Error("remediate review completion must contain at least one finding");
+  const artifacts = await validateOutputAndDigestArtifacts(outputDirectory, payload.artifacts);
+  const repository = await repositoryRoot(cwd), head = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (head !== ticket.metadata.candidateRevision) throw new Error(`review checkout is at ${head}, expected Candidate ${ticket.metadata.candidateRevision}`);
+  if (await git(repository, ["status", "--porcelain=v1", "--untracked-files=all"])) throw new Error("Application review checkout must remain at the exact clean Candidate");
+  const submission = { kind: "application-review-submission", goalId: metadata.goalId, applicationId: metadata.applicationId, ticketId: metadata.ticketId, outcome: "completed", reviewedRevision: metadata.candidateRevision, producingImplementationTicketId: metadata.producingImplementationTicketId, verdict: payload.verdict, findings: payload.findings, acceptanceAssessment: payload.acceptanceAssessment, artifacts } as const;
+  await installImmutable(outputDirectory, join(outputDirectory, "submission.md"), serializeDocument(submission, reviewBody(payload)));
+  return { goalId: metadata.goalId, applicationId: metadata.applicationId, ticketId: metadata.ticketId, role: "review", outcome: "completed", reviewedRevision: metadata.candidateRevision, artifacts };
+}
+
 async function completeApplicationWorker(cwd: string, inputDirectory: string, outputDirectory: string, payloadSource: string): Promise<WorkerCompletion> {
   const ticket = await loadApplicationTicketDocument(inputDirectory, join(inputDirectory, "ticket.md")); await assertApplicationEnvironment(ticket);
   const payload = implementationPayloadSchema.parse(parsePayload(payloadSource)); const artifacts = await validateOutputAndDigestArtifacts(outputDirectory, payload.artifacts);
@@ -428,6 +449,7 @@ export async function completeWorker(cwd: string, payloadSource: string): Promis
   ]);
   const rawTicket = await readDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-ticket") return completeApplicationWorker(cwd, inputDirectory, outputDirectory, payloadSource);
+  if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-review-ticket") return completeApplicationReviewWorker(cwd, inputDirectory, outputDirectory, payloadSource);
   const ticket = await loadTicketDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   assertEnvironmentMatchesTicket(ticket);
   const payloadValue = parsePayload(payloadSource);
@@ -482,6 +504,8 @@ async function blockApplicationWorker(cwd: string, inputDirectory: string, outpu
   return { goalId: ticket.metadata.goalId, applicationId: ticket.metadata.applicationId, ticketId: ticket.metadata.ticketId, role: "implement", outcome: "blocked", artifacts };
 }
 
+async function blockApplicationReviewWorker(_cwd:string,inputDirectory:string,outputDirectory:string,payloadSource:string):Promise<WorkerBlocked> { const raw=await readDocument(inputDirectory,join(inputDirectory,"ticket.md"));const ticket=applicationReviewTicketSchema.parse(raw.metadata);const expected:[[string,string],[string,string],[string,string],[string,string]]=[["SPIKE_GOAL_ID",ticket.goalId],["SPIKE_APPLICATION_ID",ticket.applicationId],["SPIKE_TICKET_ID",ticket.ticketId],["SPIKE_TICKET_ROLE","review"]];for(const [name,value] of expected)if(process.env[name]!==undefined&&process.env[name]!==value)throw new Error(`${name} does not match SPIKE_INPUT_DIR/ticket.md`);const model=process.env["SPIKE_ACTUAL_MODEL"]??process.env["SPIKE_MODEL"],thinking=process.env["SPIKE_ACTUAL_THINKING"]??process.env["SPIKE_THINKING"];if(model!==ticket.model||thinking!==ticket.thinking)throw new Error("actual worker selection does not match Application review Ticket assignment");const payload=blockedPayloadSchema.parse(parsePayload(payloadSource));const artifacts=await validateOutputAndDigestArtifacts(outputDirectory,payload.artifacts);await installImmutable(outputDirectory,join(outputDirectory,"submission.md"),serializeDocument({kind:"application-review-submission",goalId:ticket.goalId,applicationId:ticket.applicationId,ticketId:ticket.ticketId,outcome:"blocked",artifacts},blockedBody(payload)));return {goalId:ticket.goalId,applicationId:ticket.applicationId,ticketId:ticket.ticketId,role:"review",outcome:"blocked",artifacts}; }
+
 export async function blockWorker(cwd: string, payloadSource: string): Promise<WorkerBlocked> {
   const inputPath = requireEnvironmentDirectory("SPIKE_INPUT_DIR");
   const outputPath = requireEnvironmentDirectory("SPIKE_OUTPUT_DIR");
@@ -491,6 +515,7 @@ export async function blockWorker(cwd: string, payloadSource: string): Promise<W
   ]);
   const rawTicket = await readDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-ticket") return blockApplicationWorker(cwd, inputDirectory, outputDirectory, payloadSource);
+  if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-review-ticket") return blockApplicationReviewWorker(cwd, inputDirectory, outputDirectory, payloadSource);
   const ticket = await loadTicketDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   assertEnvironmentMatchesTicket(ticket);
   const payload = blockedPayloadSchema.parse(parsePayload(payloadSource));

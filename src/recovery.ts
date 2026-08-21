@@ -9,6 +9,7 @@ import { sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
 import { assertGoalNotFrozen, listProjectApplications, listPublishedApplicationIds, recoverApplications } from "./application.ts";
 import { listApplicationTicketIds, recoverApplicationTicket } from "./application-ticket.ts";
+import { listApplicationReviewTicketIds, recoverApplicationReviewTicket } from "./application-review.ts";
 import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
 import {
   deriveCurrentCandidate,
@@ -359,6 +360,9 @@ export async function reconcileGoal(
         // completed ones whose rebuildable retention/runtime projections were
         // lost after publication.
         await recoverApplicationTicket(repository.root, input.goalId, application.metadata.applicationId, ticketId, input.reason);
+      }
+      for (const reviewId of await listApplicationReviewTicketIds(repository.root, input.goalId, application.metadata.applicationId)) {
+        await recoverApplicationReviewTicket(repository.root, input.goalId, application.metadata.applicationId, reviewId, input.reason);
       }
     }
     if (input.recoverApplications !== false) await recoverApplications(repository.root);

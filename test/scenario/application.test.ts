@@ -1,13 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, landChange } from "../../src/change.ts";
+import { run as runCli } from "../../src/cli.ts";
 import { serializeDocument } from "../../src/durable-state.ts";
 import { applyQueueHead, queueGoalIntegration } from "../../src/goal-apply.ts";
 import { createGoal, integratedRef } from "../../src/goal.ts";
 import { reconcileGoal } from "../../src/recovery.ts";
 import { applicationCandidateRef, applicationExchangePath, applicationReportPath, deriveApplicationStatus, issueApplicationTicket, loadApplicationReportIfPresent, prepareApplicationTicketExchange, publishApplicationImplementationReport, recoverApplicationTicket } from "../../src/application-ticket.ts";
 import { applicationWorkerRecordPath, dispatchApplicationWorker } from "../../src/application-worker.ts";
+import { applicationReviewWorkerRecordPath, dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker } from "../../src/application-review-worker.ts";
+import { applicationReviewExchangePath, applicationReviewReportPath, deriveApplicationReviewStatus, issueApplicationReviewTicket, loadApplicationReviewReportIfPresent, publishApplicationReviewReport, recoverApplicationReviewTicket } from "../../src/application-review.ts";
 import { issueTicket, reportPath } from "../../src/ticket.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
@@ -15,6 +18,11 @@ const repositories: Array<{ remove: () => Promise<void> }> = [];
 afterEach(async () => { await Promise.all(repositories.splice(0).map((repository) => repository.remove())); });
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 const timestamp = new Date(0).toISOString();
+const workerCompletionModule = join(import.meta.dir, "../../src/worker-completion.ts");
+/** Exercise the worker's production completion boundary inside its dispatched checkout. */
+function reviewCompletionCommand(payload: Record<string, unknown>): string[] {
+  return ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))});`];
+}
 
 async function report(root: string, goalId: string, changeId: string, ticketId: string, metadata: { role: "implement" | "review" } & Record<string, unknown>) {
   const path = reportPath(root, goalId, changeId, ticketId);
@@ -119,6 +127,117 @@ test("scenario: diverged Application uses supported content merges, verified cus
   expect(await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, ticket.ticketId))).toBe(published.report.metadata.candidateRevision!);
   expect((await deriveApplicationStatus(repository.root, goalId, queued.applicationId)).cleanupWarnings).toEqual([]);
   expect(await repository.git("rev-parse", "main")).toBe(target);
+});
+
+test("scenario: Application review approves only the exact current Candidate and a later review invalidates it", async () => {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Review candidate." });
+  const issued = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const identity = { goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
+  const dispatched = await dispatchApplicationWorker({ cwd: repository.root, ...identity, worker: "review-source", command: ["bun", "-e", workerCommand] });
+  const execution = dispatched.execution;
+  const implementation = await publishApplicationImplementationReport({ cwd: repository.root, ...identity, message: { summary: "Review source" }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, identity.ticketId);
+  const review = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Review exact candidate.", executionPolicy: policy });
+  const assessment = "Recover a squash Application.";
+  const dispatchedReview = await dispatchApplicationReviewWorker({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId, worker: "reviewer", command: reviewCompletionCommand({ reviewStatement: "Approved exact Candidate.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: assessment, assessment: "met", evidence: "Real Git candidate reviewed." }], artifacts: [] }) });
+  const reviewExecution = dispatchedReview.execution;
+  expect(await runCli(["--json", "application", "review", "publish", "--goal", goalId, "--application", queued.applicationId, "--ticket", review.ticket.metadata.ticketId, "--worker", reviewExecution.worker], repository.root)).toBe(0);
+  expect(await Bun.file(applicationReviewWorkerRecordPath(repository.root, { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId })).exists()).toBe(false);
+  expect((await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId)).approvalUsable).toBe(true);
+  // Retained operational cleanup immediately gates otherwise-valid approval.
+  await mkdir(applicationReviewExchangePath(repository.root, { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId }), { recursive: true });
+  expect((await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId)).approvalUsable).toBe(false);
+  await Bun.$`rm -rf ${applicationReviewExchangePath(repository.root, { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId })}`;
+  const later = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Reconsider exact candidate.", executionPolicy: policy });
+  const piArguments = join(repository.root, ".review-pi-arguments.json"), fakePi = join(repository.root, ".review-pi");
+  await writeFile(fakePi, `#!/usr/bin/env bun\nawait Bun.write(${JSON.stringify(piArguments)}, JSON.stringify(process.argv.slice(2)));\nawait (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reviewStatement: "Pause.", verdict: "ask-operator", findings: [], acceptanceAssessment: [{ criterion: assessment, assessment: "unclear", evidence: "Operator decision needed." }], artifacts: [] }))});\n`);
+  await chmod(fakePi, 0o755);
+  const laterDispatched = await dispatchApplicationReviewPiTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: later.ticket.metadata.ticketId, worker: "reviewer", piExecutable: fakePi });
+  const productionPiArguments = JSON.parse(await Bun.file(piArguments).text()) as string[];
+  expect(productionPiArguments.join(" ")).toContain("spike_complete_review,spike_block_review");
+  expect(productionPiArguments.join(" ")).not.toContain("spike_complete_implementation");
+  await rm(fakePi); await rm(piArguments);
+  await publishApplicationReviewReport({ cwd: repository.root, goalId, applicationId: queued.applicationId, ticketId: later.ticket.metadata.ticketId, execution: { adapter: laterDispatched.execution.adapter, isolation: laterDispatched.execution.isolation, worker: laterDispatched.execution.worker, model: laterDispatched.execution.model, thinking: laterDispatched.execution.thinking, startedAt: laterDispatched.execution.startedAt, finishedAt: laterDispatched.execution.finishedAt } });
+  expect((await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId)).approvalUsable).toBe(false);
+  expect(await Bun.file(applicationReviewReportPath(repository.root, goalId, queued.applicationId, later.ticket.metadata.ticketId)).exists()).toBe(true);
+  // Recovery is identity-preserving and does not repair a moved target by changing refs or the host worktree.
+  const interrupted = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Interrupted review.", executionPolicy: policy });
+  const interruptedIdentity = { goalId, applicationId: queued.applicationId, ticketId: interrupted.ticket.metadata.ticketId };
+  await dispatchApplicationReviewWorker({ cwd: repository.root, ...interruptedIdentity, worker: "interrupted-reviewer", command: ["bun", "-e", "process.exit(0)"] });
+  const candidateRef = await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId));
+  const goalRef = await repository.git("rev-parse", integratedRef(goalId));
+  await writeFile(join(repository.root, "review-moved.txt"), "later M\n"); await repository.git("add", "review-moved.txt"); await repository.git("commit", "--quiet", "-m", "Main moved during review");
+  const moved = await repository.git("rev-parse", "main");
+  await recoverApplicationReviewTicket(repository.root, goalId, queued.applicationId, interrupted.ticket.metadata.ticketId);
+  const recovered = (await loadApplicationReviewReportIfPresent(repository.root, goalId, queued.applicationId, interrupted.ticket.metadata.ticketId))!;
+  expect(recovered.metadata.outcome).toBe("interrupted"); expect(recovered.metadata.candidateRevision).toBe(implementation.report.metadata.candidateRevision); expect(recovered.metadata.producingImplementationTicketId).toBe(identity.ticketId);
+  expect(await repository.git("rev-parse", "main")).toBe(moved); expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(goalRef); expect(await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId))).toBe(candidateRef);
+  expect(await Bun.file(applicationReviewWorkerRecordPath(repository.root, interruptedIdentity)).exists()).toBe(false);
+});
+
+test("scenario: Application review retains remediate and reject as durable non-approvals through the adapter seam", async () => {
+  const { repository, goalId } = await readyGoal();
+  await writeFile(join(repository.root, "target-only.txt"), "M\n"); await repository.git("add", "target-only.txt"); await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Review verdicts." });
+  const issued = await issueApplicationTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const identity = { goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
+  const implementationRun = await dispatchApplicationWorker({ cwd: repository.root, ...identity, worker: "review-verdict-source", command: ["bun", "-e", workerCommand] });
+  const implementation = await publishApplicationImplementationReport({ cwd: repository.root, ...identity, message: { summary: "Review verdict source" }, execution: { adapter: implementationRun.execution.adapter, isolation: implementationRun.execution.isolation, worker: implementationRun.execution.worker, model: implementationRun.execution.model, thinking: implementationRun.execution.thinking, startedAt: implementationRun.execution.startedAt, finishedAt: implementationRun.execution.finishedAt } });
+  await recoverApplicationTicket(repository.root, goalId, queued.applicationId, identity.ticketId);
+  for (const verdict of ["remediate", "reject"] as const) {
+    const review = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: `Review ${verdict}.`, executionPolicy: policy });
+    const reviewIdentity = { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId };
+    const findings = verdict === "remediate" ? [{ id: "needs-remediation", severity: "high" as const, statement: "Remediate this Candidate." }] : [{ id: "rejected", severity: "high" as const, statement: "Reject this Candidate." }];
+    const run = await dispatchApplicationReviewWorker({ cwd: repository.root, ...reviewIdentity, worker: "review-verdict-worker", command: reviewCompletionCommand({ reviewStatement: `${verdict} exact Candidate.`, verdict, findings, acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "not-met", evidence: `${verdict} exact Candidate.` }], artifacts: [] }) });
+    await publishApplicationReviewReport({ cwd: repository.root, ...reviewIdentity, execution: { adapter: run.execution.adapter, isolation: run.execution.isolation, worker: run.execution.worker, model: run.execution.model, thinking: run.execution.thinking, startedAt: run.execution.startedAt, finishedAt: run.execution.finishedAt } });
+    const status = await deriveApplicationReviewStatus(repository.root, goalId, queued.applicationId);
+    expect(status.verdict).toBe(verdict); expect(status.approvalUsable).toBe(false); expect(status.findings).toEqual(findings);
+  }
+  // Worker-authored identity and artifact failures are refused before a Report
+  // or any Candidate/Goal/main/worktree side effect.  These start from real
+  // dispatched production completions rather than hand-staged happy paths.
+  const before = { main: await repository.git("rev-parse", "main"), goal: await repository.git("rev-parse", integratedRef(goalId)), goalRefs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), candidate: await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId)), status: await repository.git("status", "--porcelain") };
+  const mismatched = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Reject mismatched identity.", executionPolicy: policy });
+  const mismatchIdentity = { goalId, applicationId: queued.applicationId, ticketId: mismatched.ticket.metadata.ticketId };
+  const mismatchRun = await dispatchApplicationReviewWorker({ cwd: repository.root, ...mismatchIdentity, worker: "identity-worker", command: reviewCompletionCommand({ reviewStatement: "Exact candidate.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Exact." }], artifacts: [] }) });
+  await writeFile(join(mismatchRun.exchange.outputDirectory, "submission.md"), serializeDocument({ kind: "application-review-submission", ...mismatchIdentity, ticketId: "999", outcome: "completed", reviewedRevision: implementation.report.metadata.candidateRevision, producingImplementationTicketId: identity.ticketId, verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Wrong identity." }], artifacts: [] }, "# Review evidence\n\n## Review statement\n\nWrong identity.\n"));
+  await expect(publishApplicationReviewReport({ cwd: repository.root, ...mismatchIdentity, execution: { adapter: mismatchRun.execution.adapter, isolation: mismatchRun.execution.isolation, worker: mismatchRun.execution.worker, model: mismatchRun.execution.model, thinking: mismatchRun.execution.thinking, startedAt: mismatchRun.execution.startedAt, finishedAt: mismatchRun.execution.finishedAt } })).rejects.toThrow("identity");
+  expect(await Bun.file(applicationReviewReportPath(repository.root, goalId, queued.applicationId, mismatchIdentity.ticketId)).exists()).toBe(false);
+  expect({ main: await repository.git("rev-parse", "main"), goal: await repository.git("rev-parse", integratedRef(goalId)), goalRefs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), candidate: await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId)), status: await repository.git("status", "--porcelain") }).toEqual(before);
+  await recoverApplicationReviewTicket(repository.root, goalId, queued.applicationId, mismatchIdentity.ticketId);
+
+  const digest = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Reject changed artifact.", executionPolicy: policy });
+  const digestIdentity = { goalId, applicationId: queued.applicationId, ticketId: digest.ticket.metadata.ticketId };
+  const digestPayload = { reviewStatement: "Artifact declared.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Exact." }], artifacts: ["artifacts/evidence.txt"] };
+  const digestRun = await dispatchApplicationReviewWorker({ cwd: repository.root, ...digestIdentity, worker: "digest-worker", command: ["bun", "-e", `const { mkdir } = await import("node:fs/promises"); await mkdir(process.env.SPIKE_OUTPUT_DIR + "/artifacts", { recursive: true }); await Bun.write(process.env.SPIKE_OUTPUT_DIR + "/artifacts/evidence.txt", "before"); await (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(digestPayload))});`] });
+  await writeFile(join(digestRun.exchange.outputDirectory, "artifacts", "evidence.txt"), "after");
+  await expect(publishApplicationReviewReport({ cwd: repository.root, ...digestIdentity, execution: { adapter: digestRun.execution.adapter, isolation: digestRun.execution.isolation, worker: digestRun.execution.worker, model: digestRun.execution.model, thinking: digestRun.execution.thinking, startedAt: digestRun.execution.startedAt, finishedAt: digestRun.execution.finishedAt } })).rejects.toThrow("digest");
+  expect(await Bun.file(applicationReviewReportPath(repository.root, goalId, queued.applicationId, digestIdentity.ticketId)).exists()).toBe(false);
+  expect({ main: await repository.git("rev-parse", "main"), goal: await repository.git("rev-parse", integratedRef(goalId)), goalRefs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), candidate: await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId)), status: await repository.git("status", "--porcelain") }).toEqual(before);
+  await recoverApplicationReviewTicket(repository.root, goalId, queued.applicationId, digestIdentity.ticketId);
+
+  const escaped = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Reject escaped artifact.", executionPolicy: policy });
+  const escapedIdentity = { goalId, applicationId: queued.applicationId, ticketId: escaped.ticket.metadata.ticketId };
+  const escapedRun = await dispatchApplicationReviewWorker({ cwd: repository.root, ...escapedIdentity, worker: "escape-worker", command: reviewCompletionCommand({ reviewStatement: "This must not stage.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Exact." }], artifacts: ["artifacts/../escape.txt"] }) });
+  expect(escapedRun.execution.exitCode).not.toBe(0);
+  await expect(publishApplicationReviewReport({ cwd: repository.root, ...escapedIdentity, execution: { adapter: escapedRun.execution.adapter, isolation: escapedRun.execution.isolation, worker: escapedRun.execution.worker, model: escapedRun.execution.model, thinking: escapedRun.execution.thinking, startedAt: escapedRun.execution.startedAt, finishedAt: escapedRun.execution.finishedAt } })).rejects.toThrow("did not complete successfully");
+  expect(await Bun.file(applicationReviewReportPath(repository.root, goalId, queued.applicationId, escapedIdentity.ticketId)).exists()).toBe(false);
+  await recoverApplicationReviewTicket(repository.root, goalId, queued.applicationId, escapedIdentity.ticketId);
+
+  // Blocking uses the same production worker boundary, but cannot publish a
+  // completed review Report; recovery records the identity-preserving result.
+  const blocked = await issueApplicationReviewTicket({ cwd: repository.root, goalId, applicationId: queued.applicationId, instruction: "Block exact review.", executionPolicy: policy });
+  const blockedIdentity = { goalId, applicationId: queued.applicationId, ticketId: blocked.ticket.metadata.ticketId };
+  const blockedRun = await dispatchApplicationReviewWorker({ cwd: repository.root, ...blockedIdentity, worker: "blocked-worker", command: ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).blockWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reason: "External review service unavailable.", evidence: "Scenario block.", artifacts: [] }))});`] });
+  expect(blockedRun.execution.exitCode).toBe(0);
+  await expect(publishApplicationReviewReport({ cwd: repository.root, ...blockedIdentity, execution: { adapter: blockedRun.execution.adapter, isolation: blockedRun.execution.isolation, worker: blockedRun.execution.worker, model: blockedRun.execution.model, thinking: blockedRun.execution.thinking, startedAt: blockedRun.execution.startedAt, finishedAt: blockedRun.execution.finishedAt } })).rejects.toThrow();
+  expect(await Bun.file(applicationReviewReportPath(repository.root, goalId, queued.applicationId, blockedIdentity.ticketId)).exists()).toBe(false);
+  await recoverApplicationReviewTicket(repository.root, goalId, queued.applicationId, blockedIdentity.ticketId);
+
+  expect(await repository.git("rev-parse", "main")).toBe(issued.ticket.metadata.targetRevision);
+  expect(await repository.git("rev-parse", applicationCandidateRef(goalId, queued.applicationId, identity.ticketId))).toBe(implementation.report.metadata.candidateRevision!);
 });
 
 test("scenario: interruption before Application Report recovers moved target without changing host or Goal evidence", async () => {
