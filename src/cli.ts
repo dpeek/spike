@@ -15,6 +15,8 @@ import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
+import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, recoverApplicationTicket } from "./application-ticket.ts";
+import { dispatchApplicationPiTicket, dispatchApplicationWorker, loadFinishedApplicationWorker, observeApplicationWorker, readApplicationWorker } from "./application-worker.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
@@ -66,6 +68,15 @@ Usage:
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike goal queue --goal <goal-id> --target main --approval <statement> [--json]
   spike application apply-head --goal <goal-id> --application <application-id> [--json]
+  spike application ticket issue --goal <goal-id> --application <application-id> --instruction <instruction> [options]
+  spike application ticket prepare --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
+  spike application ticket dispatch-test --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> -- <command> [args...]
+  spike application ticket dispatch-pi --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> [--json]
+  spike application worker status --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
+  spike application worker read --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
+  spike application status --goal <goal-id> --application <application-id> [--json]
+  spike application report publish --goal <goal-id> --application <application-id> --ticket <ticket-id> --worker <identity> --commit-summary <summary> [--json]
+  spike application recover --goal <goal-id> --application <application-id> --ticket <ticket-id> [--reason <reason>] [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike request create --title <title> --statement <statement> [--project <slug>] [--json]
   spike request list [--project <slug> | --unassigned] [--closed] [--json]
@@ -322,6 +333,18 @@ function parseGoalQueue(args: string[]): { goalId: string; targetBranch: string;
   return { goalId, targetBranch, approval };
 }
 
+function parseApplicationIdentity(args: string[], options: { ticket?: boolean; instruction?: boolean; reason?: boolean } = {}): { goalId: string; applicationId: string; ticketId?: string; instruction?: string; reason?: string } {
+  let goalId: string | undefined; let applicationId: string | undefined; let ticketId: string | undefined; let instruction: string | undefined; let reason: string | undefined;
+  for (let index = 0; index < args.length; index += 2) { const option = args[index]!; const value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket" && options.ticket) ticketId = value; else if (option === "--instruction" && options.instruction) instruction = value; else if (option === "--reason" && options.reason) reason = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (goalId === undefined) throw new UsageError("--goal is required"); if (applicationId === undefined) throw new UsageError("--application is required"); if (options.ticket && ticketId === undefined) throw new UsageError("--ticket is required"); if (options.instruction && instruction === undefined) throw new UsageError("--instruction is required"); return { goalId, applicationId, ...(ticketId === undefined ? {} : { ticketId }), ...(instruction === undefined ? {} : { instruction }), ...(reason === undefined ? {} : { reason }) };
+}
+
+function parseApplicationReportPublish(args: string[]): { goalId: string; applicationId: string; ticketId: string; worker: string; summary: string } {
+  let goalId: string | undefined; let applicationId: string | undefined; let ticketId: string | undefined; let worker: string | undefined; let summary: string | undefined;
+  for (let index = 0; index < args.length; index += 2) { const option = args[index]!; const value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else if (option === "--commit-summary") summary = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (goalId === undefined) throw new UsageError("--goal is required"); if (applicationId === undefined) throw new UsageError("--application is required"); if (ticketId === undefined) throw new UsageError("--ticket is required"); if (worker === undefined) throw new UsageError("--worker is required"); if (summary === undefined) throw new UsageError("--commit-summary is required"); return { goalId, applicationId, ticketId, worker, summary };
+}
+
 function parseApplicationApplyHead(args: string[]): { goalId: string; applicationId: string } {
   let goalId: string | undefined;
   let applicationId: string | undefined;
@@ -496,6 +519,20 @@ function parsePiDispatch(args: string[]): {
   if (ticketId === undefined) throw new UsageError("--ticket is required");
   if (worker === undefined) throw new UsageError("--worker is required");
   return { goalId, changeId, ticketId, worker, ...(host === undefined ? {} : { host }) };
+}
+
+function parseApplicationPiDispatch(args: string[]): { goalId: string; applicationId: string; ticketId: string; worker: string } {
+  let goalId: string | undefined, applicationId: string | undefined, ticketId: string | undefined, worker: string | undefined;
+  for (let index = 0; index < args.length; index += 2) { const option = args[index]!, value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (!goalId) throw new UsageError("--goal is required"); if (!applicationId) throw new UsageError("--application is required"); if (!ticketId) throw new UsageError("--ticket is required"); if (!worker) throw new UsageError("--worker is required"); return { goalId, applicationId, ticketId, worker };
+}
+
+function parseApplicationTestDispatch(args: string[]): { goalId: string; applicationId: string; ticketId: string; worker: string; command: string[] } {
+  const separator = args.indexOf("--"); if (separator === -1) throw new UsageError("application ticket dispatch-test requires -- before the worker command");
+  const options = args.slice(0, separator), command = args.slice(separator + 1); if (!command.length) throw new UsageError("application ticket dispatch-test requires a worker command after --");
+  let goalId: string | undefined, applicationId: string | undefined, ticketId: string | undefined, worker: string | undefined;
+  for (let index = 0; index < options.length; index += 2) { const option = options[index]!, value = valueAfter(options, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (!goalId) throw new UsageError("--goal is required"); if (!applicationId) throw new UsageError("--application is required"); if (!ticketId) throw new UsageError("--ticket is required"); if (!worker) throw new UsageError("--worker is required"); return { goalId, applicationId, ticketId, worker, command };
 }
 
 function parseTestDispatch(args: string[]): {
@@ -901,6 +938,52 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         `Queued Goal ${queued.goalId} for main at FIFO position ${queued.queuePosition}\n` +
         `  Application ${queued.applicationId}\n` +
         `  Planner cleanup ${queued.plannerCleanup.status}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "ticket" && args[2] === "issue") {
+      const input = parseApplicationIdentity(args.slice(3), { instruction: true });
+      const issued = await issueApplicationTicket({ cwd, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
+      return success(json, "application ticket issue", { ticket: issued.ticket.metadata, path: relative(issued.root, `goals/${input.goalId}/applications/${input.applicationId}/tickets/${issued.ticket.metadata.ticketId}/ticket.md`) }, `Issued Application Ticket ${input.goalId}/${input.applicationId}/${issued.ticket.metadata.ticketId}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-pi") {
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationPiTicket({ cwd, ...input });
+      return success(json, "application ticket dispatch-pi", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application Pi Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-test") {
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationWorker({ cwd, ...input });
+      return success(json, "application ticket dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution, paths: { input: relative(dispatched.root, dispatched.exchange.inputDirectory), output: relative(dispatched.root, dispatched.exchange.outputDirectory) } }, `Dispatched Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "worker" && args[2] === "status") {
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd); const observed = await observeApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application worker status", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, ...observed }, `Application Worker ${input.goalId}/${input.applicationId}/${input.ticketId} ${observed.status}\n`);
+    }
+    if (args[0] === "application" && args[1] === "worker" && args[2] === "read") {
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd); const terminal = await readApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application worker read", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, terminal }, terminal);
+    }
+    if (args[0] === "application" && args[1] === "ticket" && args[2] === "prepare") {
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd);
+      const exchange = await prepareApplicationTicketExchange(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      return success(json, "application ticket prepare", exchange, `Prepared Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "report" && args[2] === "publish") {
+      const input = parseApplicationReportPublish(args.slice(3)); const repository = await discoverRepository(cwd);
+      const execution = await loadFinishedApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId });
+      if (execution.worker !== input.worker) throw new UsageError("application report publish worker does not match the recorded Application Worker");
+      const published = await publishApplicationImplementationReport({ cwd: repository.root, goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, message: { summary: input.summary }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      return success(json, "application report publish", { report: published.report.metadata }, `Published Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "status") {
+      const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, input.goalId, input.applicationId);
+      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "recover") {
+      const input = parseApplicationIdentity(args.slice(2), { ticket: true, reason: true }); const recovered = await recoverApplicationTicket(cwd, input.goalId, input.applicationId, input.ticketId!, input.reason);
+      return success(json, "application recover", recovered, `Recovered Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "apply-head") {

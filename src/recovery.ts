@@ -8,6 +8,7 @@ import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.
 import { sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
 import { assertGoalNotFrozen, listProjectApplications, listPublishedApplicationIds, recoverApplications } from "./application.ts";
+import { listApplicationTicketIds, recoverApplicationTicket } from "./application-ticket.ts";
 import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
 import {
   deriveCurrentCandidate,
@@ -349,6 +350,17 @@ export async function reconcileGoal(
   // may still recover its already-published target decision, without replaying
   // any Goal ref or workflow mutation.
   if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0) {
+    // Application Tickets are a separate Goal/Application/Ticket namespace.
+    // They are recoverable without reissuing work or rebuilding their target pin.
+    for (const application of await listProjectApplications(repository.root)) {
+      if (application.metadata.goalId !== input.goalId) continue;
+      for (const ticketId of await listApplicationTicketIds(repository.root, input.goalId, application.metadata.applicationId)) {
+        // Recovery reconciles every durable Application Report, including
+        // completed ones whose rebuildable retention/runtime projections were
+        // lost after publication.
+        await recoverApplicationTicket(repository.root, input.goalId, application.metadata.applicationId, ticketId, input.reason);
+      }
+    }
     if (input.recoverApplications !== false) await recoverApplications(repository.root);
     return {
       goalId: input.goalId,

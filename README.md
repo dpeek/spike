@@ -8,6 +8,7 @@ Version 2 is starting from a deliberately small foundation.
 
 - [Workflow design](doc/workflow.md)
 - [Phase 2 dogfood procedure and evidence](doc/dogfood.md)
+- [Diverged Application Candidates](doc/application-candidates.md)
 
 ## Development
 
@@ -291,6 +292,10 @@ spike application apply-head --goal spike-001 --application 001 --json
 ```
 
 It refuses missing, resolved, non-head, mismatched, stale, or non-`main` work before a Candidate, decision, ref, or worktree mutation. If checked-out `main` exactly equals the head Goal base, Spike creates the single-parent deterministic squash Candidate, publishes its exact decision, then uses `merge --ff-only` so Git preserves user changes. No model review is needed on this clean-base path. If `main` has advanced, the head remains unresolved and frozen with no Candidate or target mutation; later Applications remain blocked in FIFO order for future diverged-target Candidate work. Restart recovery reconstructs queue and head only from immutable Application/decision evidence and completes only an exact interrupted target advancement. There is no `goal apply` compatibility command.
+
+## Diverged Application Candidates
+
+A diverged FIFO head (`main` no longer equals the queued Goal base) remains frozen but can receive one supervisor-issued implementation Ticket in the separate Goal/Application/Ticket namespace. The first Ticket pins exact target `M`, Goal revision `G`, merge base `B`, and Implement guidance loaded from the Git blob at `M`; retries cannot repin them. Prepare it with `spike application ticket prepare`, which supplies a bounded bundle containing only `M`, `G`, `B`, and its declared input. Clean three-way integration starts from the computed tree; conflicts start from `M` with exact bounded conflict evidence. The accepted worker tree is normalized to a single-parent Candidate on `M`, retained under the producing Application Ticket ref, and made authoritative only by an immutable Application Report. Candidate production never changes `main`, Goal integration refs, or an Application decision. `spike application status` surfaces a later target mismatch without hiding the pinned evidence; `spike application recover` interrupts open work and rebuilds retention without issuing a replacement or mutating `main`. See [Diverged Application Candidates](doc/application-candidates.md).
 
 JSON mode emits exactly one `{ ok, command, data }` success object or one
 `{ ok, command, error }` failure object.

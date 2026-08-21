@@ -4,7 +4,8 @@ export type WorkerRole = "implement" | "review";
 
 type CompletionData = {
   goalId: string;
-  changeId: string;
+  changeId?: string;
+  applicationId?: string;
   ticketId: string;
   role: WorkerRole;
   outcome: "completed" | "blocked";
@@ -163,8 +164,7 @@ function parseCompletion(stdout: string): CompletionData {
     data === null ||
     !("goalId" in data) ||
     typeof data.goalId !== "string" ||
-    !("changeId" in data) ||
-    typeof data.changeId !== "string" ||
+    (typeof (data as { changeId?: unknown }).changeId !== "string" && typeof (data as { applicationId?: unknown }).applicationId !== "string") ||
     !("ticketId" in data) ||
     typeof data.ticketId !== "string" ||
     !("role" in data) ||
@@ -316,7 +316,7 @@ function completionToolForRole(
       return {
         content: [{
           type: "text",
-          text: `Spike accepted ${role} Ticket ${completion.goalId}/${completion.changeId}/${completion.ticketId}.`,
+          text: `Spike accepted ${role} Ticket ${completion.goalId}/${completion.applicationId ?? completion.changeId}/${completion.ticketId}.`,
         }],
         details: completion,
         terminate: true,
@@ -360,7 +360,7 @@ function blockedToolForRole(
       return {
         content: [{
           type: "text",
-          text: `Spike accepted blocked ${role} Ticket ${blocked.goalId}/${blocked.changeId}/${blocked.ticketId}.`,
+          text: `Spike accepted blocked ${role} Ticket ${blocked.goalId}/${blocked.applicationId ?? blocked.changeId}/${blocked.ticketId}.`,
         }],
         details: blocked,
         terminate: true,

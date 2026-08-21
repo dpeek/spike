@@ -3,7 +3,8 @@ import { link, lstat, open, readFile, readdir, realpath, rm } from "node:fs/prom
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import { acceptanceCriteria } from "./acceptance.ts";
-import { installImmutable, serializeDocument } from "./durable-state.ts";
+import { loadApplicationTicketDocument, type ApplicationTicket } from "./application-ticket.ts";
+import { installImmutable, readDocument, serializeDocument } from "./durable-state.ts";
 import { loadTicketDocument, type Ticket } from "./ticket.ts";
 
 const artifactPathSchema = z.string().refine(
@@ -68,7 +69,9 @@ type GitResult = { exitCode: number; stdout: string; stderr: string };
 
 export type WorkerCompletion = {
   goalId: string;
-  changeId: string;
+  /** Change Tickets use changeId; Application Tickets use applicationId. */
+  changeId?: string;
+  applicationId?: string;
   ticketId: string;
   role: "implement" | "review";
   outcome: "completed";
@@ -79,7 +82,8 @@ export type WorkerCompletion = {
 
 export type WorkerBlocked = {
   goalId: string;
-  changeId: string;
+  changeId?: string;
+  applicationId?: string;
   ticketId: string;
   role: "implement" | "review";
   outcome: "blocked";
@@ -385,6 +389,36 @@ function requireEnvironmentDirectory(name: "SPIKE_INPUT_DIR" | "SPIKE_OUTPUT_DIR
   return resolve(value);
 }
 
+async function assertApplicationEnvironment(ticket: ApplicationTicket): Promise<void> {
+  const expected: Array<[string, string]> = [["SPIKE_GOAL_ID", ticket.metadata.goalId], ["SPIKE_APPLICATION_ID", ticket.metadata.applicationId], ["SPIKE_TICKET_ID", ticket.metadata.ticketId], ["SPIKE_TICKET_ROLE", "implement"], ["SPIKE_INPUT_REVISION", ticket.metadata.inputRevision]];
+  for (const [name, value] of expected) if (process.env[name] !== undefined && process.env[name] !== value) throw new Error(`${name} does not match SPIKE_INPUT_DIR/ticket.md`);
+  const model = process.env["SPIKE_ACTUAL_MODEL"] ?? process.env["SPIKE_MODEL"], thinking = process.env["SPIKE_ACTUAL_THINKING"] ?? process.env["SPIKE_THINKING"];
+  if (!model || !thinking) throw new Error("worker completion requires observed model and thinking provenance");
+  if (model !== ticket.metadata.model || thinking !== ticket.metadata.thinking) throw new Error("actual worker selection does not match Application Ticket assignment");
+}
+
+async function createApplicationOutputBundle(repository: string, outputDirectory: string, workerRevision: string, ticket: ApplicationTicket): Promise<void> {
+  const suffix = randomUUID().replaceAll("-", ""); const ref = `refs/spike/application-completion/${ticket.metadata.goalId}/${ticket.metadata.applicationId}/${ticket.metadata.ticketId}/${suffix}`;
+  const temporary = join(outputDirectory, `.repository.${suffix}.bundle.tmp`), bundle = join(outputDirectory, "repository.bundle");
+  try {
+    await git(repository, ["update-ref", ref, workerRevision, "0".repeat(workerRevision.length)]); await git(repository, ["bundle", "create", temporary, ref]);
+    await regularFile(temporary, "Application output repository bundle", maximumBundleBytes); await syncFile(temporary);
+    await link(temporary, bundle); await rm(temporary);
+  } finally { await git(repository, ["update-ref", "-d", ref]).catch(() => undefined); await rm(temporary, { force: true }); }
+}
+
+async function completeApplicationWorker(cwd: string, inputDirectory: string, outputDirectory: string, payloadSource: string): Promise<WorkerCompletion> {
+  const ticket = await loadApplicationTicketDocument(inputDirectory, join(inputDirectory, "ticket.md")); await assertApplicationEnvironment(ticket);
+  const payload = implementationPayloadSchema.parse(parsePayload(payloadSource)); const artifacts = await validateOutputAndDigestArtifacts(outputDirectory, payload.artifacts);
+  const repository = await repositoryRoot(cwd); const inputRevision = await git(repository, ["rev-parse", "--verify", `${ticket.metadata.inputRevision}^{commit}`]);
+  if (inputRevision !== ticket.metadata.inputRevision) throw new Error("Application Ticket input revision does not identify a commit exactly");
+  const workerRevision = await snapshotImplementation(repository, await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]));
+  await createApplicationOutputBundle(repository, outputDirectory, workerRevision, ticket);
+  const metadata = { kind: "application-submission", goalId: ticket.metadata.goalId, applicationId: ticket.metadata.applicationId, ticketId: ticket.metadata.ticketId, outcome: "completed", workerRevision, artifacts } as const;
+  await installImmutable(outputDirectory, join(outputDirectory, "submission.md"), serializeDocument(metadata, implementationBody(payload)));
+  return { goalId: ticket.metadata.goalId, applicationId: ticket.metadata.applicationId, ticketId: ticket.metadata.ticketId, role: "implement", outcome: "completed", workerRevision, artifacts };
+}
+
 export async function completeWorker(cwd: string, payloadSource: string): Promise<WorkerCompletion> {
   const inputPath = requireEnvironmentDirectory("SPIKE_INPUT_DIR");
   const outputPath = requireEnvironmentDirectory("SPIKE_OUTPUT_DIR");
@@ -392,6 +426,8 @@ export async function completeWorker(cwd: string, payloadSource: string): Promis
     regularDirectory(inputPath, "SPIKE_INPUT_DIR"),
     regularDirectory(outputPath, "SPIKE_OUTPUT_DIR"),
   ]);
+  const rawTicket = await readDocument(inputDirectory, join(inputDirectory, "ticket.md"));
+  if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-ticket") return completeApplicationWorker(cwd, inputDirectory, outputDirectory, payloadSource);
   const ticket = await loadTicketDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   assertEnvironmentMatchesTicket(ticket);
   const payloadValue = parsePayload(payloadSource);
@@ -437,6 +473,15 @@ export async function completeWorker(cwd: string, payloadSource: string): Promis
   return { ...identity, role: "review", outcome: "completed", reviewedRevision: ticket.metadata.inputRevision, artifacts };
 }
 
+async function blockApplicationWorker(cwd: string, inputDirectory: string, outputDirectory: string, payloadSource: string): Promise<WorkerBlocked> {
+  const ticket = await loadApplicationTicketDocument(inputDirectory, join(inputDirectory, "ticket.md")); await assertApplicationEnvironment(ticket);
+  const payload = blockedPayloadSchema.parse(parsePayload(payloadSource)); const artifacts = await validateOutputAndDigestArtifacts(outputDirectory, payload.artifacts);
+  const repository = await repositoryRoot(cwd); if ((await git(repository, ["rev-parse", "--verify", `${ticket.metadata.inputRevision}^{commit}`])) !== ticket.metadata.inputRevision) throw new Error("Application Ticket input revision does not identify a commit exactly");
+  const metadata = { kind: "application-submission", goalId: ticket.metadata.goalId, applicationId: ticket.metadata.applicationId, ticketId: ticket.metadata.ticketId, outcome: "blocked", artifacts } as const;
+  await installImmutable(outputDirectory, join(outputDirectory, "submission.md"), serializeDocument(metadata, blockedBody(payload)));
+  return { goalId: ticket.metadata.goalId, applicationId: ticket.metadata.applicationId, ticketId: ticket.metadata.ticketId, role: "implement", outcome: "blocked", artifacts };
+}
+
 export async function blockWorker(cwd: string, payloadSource: string): Promise<WorkerBlocked> {
   const inputPath = requireEnvironmentDirectory("SPIKE_INPUT_DIR");
   const outputPath = requireEnvironmentDirectory("SPIKE_OUTPUT_DIR");
@@ -444,6 +489,8 @@ export async function blockWorker(cwd: string, payloadSource: string): Promise<W
     regularDirectory(inputPath, "SPIKE_INPUT_DIR"),
     regularDirectory(outputPath, "SPIKE_OUTPUT_DIR"),
   ]);
+  const rawTicket = await readDocument(inputDirectory, join(inputDirectory, "ticket.md"));
+  if (typeof rawTicket.metadata === "object" && rawTicket.metadata !== null && (rawTicket.metadata as { kind?: unknown }).kind === "application-ticket") return blockApplicationWorker(cwd, inputDirectory, outputDirectory, payloadSource);
   const ticket = await loadTicketDocument(inputDirectory, join(inputDirectory, "ticket.md"));
   assertEnvironmentMatchesTicket(ticket);
   const payload = blockedPayloadSchema.parse(parsePayload(payloadSource));

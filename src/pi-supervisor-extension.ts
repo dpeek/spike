@@ -81,6 +81,8 @@ export type RegisterSupervisorExtensionOptions = {
   goalId?: string;
   /** Exact repository identity supplied by the Goal planner's immutable environment. */
   projectIdentity?: string;
+  /** Application tools are enabled only for a supervisor launched with queued Application work. */
+  applications?: boolean;
   /** Injection seam for the Node-compatible repository binding. */
   validateProject?: (cwd: string, projectIdentity: string) => Promise<void>;
 };
@@ -99,6 +101,10 @@ export const goalPlannerToolNames = [
   "spike_worker_read",
   "spike_publish_report",
   "spike_recover",
+] as const;
+
+export const applicationSupervisorToolNames = [
+  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_recover_application",
 ] as const;
 
 export const supervisorToolNames = [
@@ -833,6 +839,44 @@ export function registerSupervisorExtension(
       args: (params) => ["application", "apply-head", "--goal", params.goalId, "--application", params.applicationId],
     }, invoke, options),
     tool({
+      name: "spike_issue_application_implement",
+      label: "Issue Application Implement Ticket",
+      description: "Supervisor-only issue of an implementation Ticket for the exact diverged FIFO Application head.",
+      promptSnippet: "Issue the exact FIFO Application implementation Ticket",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "instruction"], properties: { goalId: nonBlankString, applicationId: nonBlankString, instruction: nonBlankString } },
+      command: "application ticket issue", args: (params) => ["application", "ticket", "issue", "--goal", params.goalId, "--application", params.applicationId, "--instruction", params.instruction],
+    }, invoke, options),
+    tool({
+      name: "spike_prepare_application_ticket", label: "Prepare Application Ticket", description: "Prepare the bounded immutable Application worker exchange.", promptSnippet: "Prepare one exact Application Ticket exchange",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString } }, command: "application ticket prepare",
+      args: (params) => ["application", "ticket", "prepare", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId],
+    }, invoke, options),
+    tool({
+      name: "spike_dispatch_application_pi", label: "Dispatch Application Pi Ticket", description: "Dispatch one exact Application Ticket to a fresh worker; dispatch output remains operational only.", promptSnippet: "Dispatch the exact Application Ticket worker",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString } }, command: "application ticket dispatch-pi",
+      args: (params) => ["application", "ticket", "dispatch-pi", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker],
+    }, invoke, options),
+    tool({
+      name: "spike_application_worker_status", label: "Application worker status", description: "Observe only the exact Application worker runtime.", promptSnippet: "Observe Application worker operational state",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString } }, command: "application worker status",
+      args: (params) => ["application", "worker", "status", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId],
+    }, invoke, options),
+    tool({
+      name: "spike_application_worker_read", label: "Read Application worker", description: "Read bounded Application worker operational output; it is not workflow evidence.", promptSnippet: "Read Application worker output without treating it as evidence",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString } }, command: "application worker read",
+      args: (params) => ["application", "worker", "read", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId],
+    }, invoke, options),
+    tool({
+      name: "spike_publish_application_report", label: "Publish Application Report", description: "Validate exact Application output and publish its Report before rebuildable Candidate retention.", promptSnippet: "Publish one exact Application Report",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId", "worker", "commitSummary"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, worker: nonBlankString, commitSummary: nonBlankString } }, command: "application report publish",
+      args: (params) => ["application", "report", "publish", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId, "--worker", params.worker, "--commit-summary", params.commitSummary],
+    }, invoke, options),
+    tool({
+      name: "spike_recover_application", label: "Recover Application", description: "Goal-scoped supervisor recovery for one Application Ticket.", promptSnippet: "Recover one exact Application Ticket",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "ticketId"], properties: { goalId: nonBlankString, applicationId: nonBlankString, ticketId: nonBlankString, reason: nonBlankString } }, command: "application recover",
+      args: (params) => { const args = ["application", "recover", "--goal", params.goalId, "--application", params.applicationId, "--ticket", params.ticketId]; optional(args, "--reason", params.reason); return args; },
+    }, invoke, options),
+    tool({
       name: "spike_create_goal",
       label: "Create approved Goal",
       description: "Create a Goal only after the operator explicitly approves its outcome and constraints. Pass the operator's exact approval statement; never infer or invent approval.",
@@ -1244,7 +1288,7 @@ export function registerSupervisorExtension(
   ];
 
   const visible = options.goalId === undefined
-    ? tools
+    ? tools.filter((definition) => options.applications === true || !(applicationSupervisorToolNames as readonly string[]).includes(definition.name))
     : tools.filter((definition) => (goalPlannerToolNames as readonly string[]).includes(definition.name));
   for (const definition of visible) pi.registerTool(definition);
 }
@@ -1262,5 +1306,5 @@ export function registerGoalPlannerExtension(
 }
 
 export default function spikeSupervisorExtension(pi: SupervisorExtensionApi): void {
-  registerSupervisorExtension(pi);
+  registerSupervisorExtension(pi, { applications: process.env["SPIKE_APPLICATION_TOOLS"] === "1" });
 }
