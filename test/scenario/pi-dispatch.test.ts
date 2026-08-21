@@ -11,7 +11,7 @@ import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
+const repositories: Array<{ root: string; dataRoot: string; remove: () => Promise<void> }> = [];
 const directories: string[] = [];
 
 afterEach(async () => {
@@ -76,9 +76,11 @@ console.log('{"kind":"report","outcome":"completed"}');
 }
 
 async function spike(cwd: string, args: string[], environment: Record<string, string> = {}) {
+  const dataRoot = repositories.find((repository) => repository.root === cwd)?.dataRoot;
+  if (dataRoot === undefined) throw new Error(`No controlled Project data root for ${cwd}`);
   const child = Bun.spawn([spikePath, ...args, "--json"], {
     cwd,
-    env: { ...process.env, ...environment },
+    env: { ...process.env, SPIKE_DATA_DIR: dataRoot, ...environment },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -166,6 +168,7 @@ describe("controlled Pi dispatch", () => {
       cwd: repository.root,
       ...identity,
       worker: "headed-pi-implementer",
+      host: "herdr",
       piExecutable: pi,
       herdr,
     });

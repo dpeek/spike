@@ -5,6 +5,7 @@ import { z } from "zod";
 import { acceptanceCriteria } from "./acceptance.ts";
 import { changePath, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
+import { assertGoalBelongsToProject } from "./config.ts";
 import {
   documentExists,
   installImmutable,
@@ -959,6 +960,7 @@ export async function publishImplementationReport(
   input: PublishImplementationReportInput,
 ): Promise<{ root: string; report: ImplementationReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalBelongsToProject(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
   if (await documentExists(repository.root, path)) {

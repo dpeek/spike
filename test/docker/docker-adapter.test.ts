@@ -395,10 +395,9 @@ describe("Docker worker isolation", () => {
         "[ \"$before\" = \"$after\" ]",
         "git diff --exit-code -- bun.lock",
         "printf 'locked install left bun.lock unchanged\\n'",
-        "mkdir -p /tmp/spike-check-bin",
-        "printf '#!/bin/sh\\nif [ \"$1\" = inspect ] && [ \"${2:-}\" = --format ]; then printf \"true 0\\\\n\"; exit 0; fi\\nexit 125\\n' > /tmp/spike-check-bin/docker",
-        "chmod 0700 /tmp/spike-check-bin/docker",
-        "export PATH=/tmp/spike-check-bin:$PATH HERDR_ENV=1 HERDR_WORKSPACE_ID=container-check HERDR_PANE_ID=container-check:pane",
+        "unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG SPIKE_DOCKER_IMAGE HERDR_ENV HERDR_WORKSPACE_ID HERDR_PANE_ID SPIKE_WORKER_IMAGE_DIGEST IMAGE_DIGEST CONTAINER_ID",
+        "! command -v docker >/dev/null 2>&1",
+        "[ ! -e /var/run/docker.sock ]",
         "bun run check",
         "printf 'literal bun run check completed\\n'",
       ].join("\n")];

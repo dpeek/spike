@@ -49,7 +49,7 @@ export type WorkerAdapter = {
   validateRuntime: (resource: unknown) => void;
   runtimeOperations?: WorkerRuntimeOperations;
   observe: (root: string, identity: TicketIdentity, options?: unknown) => Promise<WorkerObservation>;
-  loadFinished: (root: string, identity: TicketIdentity) => Promise<WorkerExecution>;
+  loadFinished: (root: string, identity: TicketIdentity, operations?: WorkerRuntimeOperations) => Promise<WorkerExecution>;
   readTerminal?: (root: string, identity: TicketIdentity, input?: unknown, options?: unknown) => Promise<string>;
   attachTerminal?: (root: string, identity: TicketIdentity, options?: unknown) => Promise<number>;
   finalize: (root: string, identity: TicketIdentity, finishedAt: Date, operations?: WorkerRuntimeOperations) => Promise<WorkerCleanup>;
@@ -277,7 +277,7 @@ export const dockerWorkerAdapter: WorkerAdapter = {
     waitForTerminalExit: (runtime, signal) => dockerWaitForTerminalExit((runtime as DockerRuntime).containerId, signal),
   },
   observe: (root, identity) => observeDockerWorker(root, identity),
-  loadFinished: (root, identity) => loadFinishedDockerWorker(root, identity),
+  loadFinished: (root, identity, operations) => loadFinishedDockerWorker(root, identity, operations),
   readTerminal: (root, identity, input, options) => readDockerWorkerTerminal(root, identity, input as ReadHerdrTerminalInput, options as HerdrOperations | undefined),
   attachTerminal: (root, identity, options) => attachDockerWorkerTerminal(root, identity, options as HerdrOperations | undefined),
   finalize: (root, identity, finishedAt, operations) => stopAndFinalizeRecordedWorker(root, identity, finishedAt, operations),
@@ -711,9 +711,10 @@ async function loadFinishedLocalCloneWorker(
 export async function loadFinishedWorkerExecution(
   root: string,
   identity: TicketIdentity,
+  operations?: WorkerRuntimeOperations,
 ): Promise<WorkerExecution> {
   const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
-  return selectWorkerAdapter(ticket.metadata.executionPolicy).loadFinished(root, identity);
+  return selectWorkerAdapter(ticket.metadata.executionPolicy).loadFinished(root, identity, operations);
 }
 
 export async function observeLocalCloneWorker(
@@ -1190,11 +1191,11 @@ async function attachDockerWorkerTerminal(root: string, identity: TicketIdentity
   return herdr.attach(runtime.pane);
 }
 
-async function loadFinishedDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerExecution> {
+async function loadFinishedDockerWorker(root: string, identity: TicketIdentity, operations?: WorkerRuntimeOperations): Promise<WorkerExecution> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record !== undefined) {
     record = await refreshHerdrExecution(root, record);
-    record = await refreshDockerExecution(root, record);
+    record = await refreshDockerExecution(root, record, operations ?? dockerWorkerAdapter.runtimeOperations!);
   }
   if (record === undefined || record.metadata.finishedAt === undefined || record.metadata.exitCode === undefined) {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} Worker has not finished`);

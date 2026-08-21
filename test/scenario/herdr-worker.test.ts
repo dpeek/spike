@@ -24,7 +24,7 @@ import {
 import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
+const repositories: Array<{ root: string; dataRoot: string; remove: () => Promise<void> }> = [];
 const workspaces: string[] = [];
 
 afterEach(async () => {
@@ -117,7 +117,7 @@ describe("ephemeral Herdr worker hosting", () => {
     const waited = Bun.spawn([
       join(import.meta.dir, "..", "..", "bin", "spike"), "worker", "wait",
       "--goal", identity.goalId, "--change", "001", "--ticket", "001", "--json",
-    ], { cwd: repository.root, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+    ], { cwd: repository.root, env: { ...process.env, SPIKE_DATA_DIR: repository.dataRoot }, stdout: "pipe", stderr: "pipe" });
     const [waitExit, waitOutput, waitError] = await Promise.all([
       waited.exited,
       new Response(waited.stdout).text(),
@@ -160,7 +160,12 @@ describe("ephemeral Herdr worker hosting", () => {
     const host = observationalHerdr("done", "attachment ended");
     // Losing an attachment is operational and cannot substitute for docker wait.
     await expect(readWorkerTerminal(repository.root, identity, {}, host)).resolves.toBe("attachment ended");
-    await expect(loadFinishedWorkerExecution(repository.root, identity)).rejects.toThrow("has not finished");
+    const liveContainer: import("../../src/worker.ts").WorkerRuntimeOperations = {
+      async stop() {},
+      async cleanup() {},
+      async terminalExitCode() { return undefined; },
+    };
+    await expect(loadFinishedWorkerExecution(repository.root, identity, liveContainer)).rejects.toThrow("has not finished");
     await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":17,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
     await expect(loadFinishedWorkerExecution(repository.root, identity)).resolves.toMatchObject({ exitCode: 17 });
     const operations: import("../../src/worker.ts").WorkerRuntimeOperations = {
