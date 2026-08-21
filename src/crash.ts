@@ -3,7 +3,10 @@ export type ImmutableCommitPoint =
   | "ticket-issuance"
   | "implementation-report-publication"
   | "review-report-publication"
-  | "change-decision-publication";
+  | "change-decision-publication"
+  | "application-publication"
+  | "application-decision-publication"
+  | "application-target-advance";
 
 export type CrashMoment = "before" | "after";
 

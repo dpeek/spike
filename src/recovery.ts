@@ -7,6 +7,7 @@ import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
 import { sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
+import { recoverApplications } from "./application.ts";
 import {
   deriveCurrentCandidate,
   loadReportIfPresent,
@@ -318,6 +319,9 @@ export async function reconcileGoal(
   const changeIds = await publishedChangeIds(repository.root, input.goalId);
   const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
   const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId);
+  // Application decisions are durable before the Git target update. Reconcile
+  // that exact two-revision transition, never a different main history.
+  await recoverApplications(repository.root, input.goalId);
   const interruptedTickets: InterruptedTicketRecovery[] = [];
   const finalizedWorkers: TicketIdentity[] = [];
   const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];

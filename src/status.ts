@@ -17,6 +17,7 @@ import {
 } from "./report.ts";
 import { listTicketIds, loadOpenTicket } from "./ticket.ts";
 import { loadRecordedWorkerIfPresent, type TicketIdentity } from "./worker.ts";
+import { applicationEvidence } from "./application.ts";
 
 export type CleanupWarning = {
   identity: TicketIdentity;
@@ -78,6 +79,7 @@ export type DerivedGoalStatus = {
   currentChange: DerivedChangeStatus | null;
   decisions: DerivedDecision[];
   cleanup: CleanupHealth;
+  application: Array<{ applicationId: string; state: "incomplete" | "inconsistent" | "applied" }>;
 };
 
 export type DerivedRepositoryStatus = {
@@ -180,11 +182,12 @@ async function deriveActiveChangeStatus(
 
 export async function deriveGoalStatus(cwd: string, goalId: string): Promise<DerivedGoalStatus> {
   const repository = await discoverRepository(cwd);
-  const [goal, plan, changeIds, integratedRevision] = await Promise.all([
+  const [goal, plan, changeIds, integratedRevision, application] = await Promise.all([
     loadGoal(repository.root, goalId),
     loadPlan(repository.root, goalId),
     listChangeIds(repository.root, goalId),
     git(repository.root, ["rev-parse", "--verify", `${integratedRef(goalId)}^{commit}`]),
+    applicationEvidence(repository.root, goalId),
   ]);
   if (goal.metadata.goalId !== plan.metadata.goalId) throw new Error(`Plan does not belong to Goal ${goalId}`);
 
@@ -212,6 +215,7 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
     currentChange,
     decisions,
     cleanup: { healthy: cleanupWarnings.length === 0, warnings: cleanupWarnings },
+    application,
   };
 }
 

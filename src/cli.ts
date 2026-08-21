@@ -58,7 +58,7 @@ Usage:
   spike status [--goal <goal-id>] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
-  spike goal apply --goal <goal-id> --target <local-branch> --approval <statement> [--json]
+  spike goal apply --goal <goal-id> --target main --approval <statement> [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike request create --title <title> --statement <statement> [--project <slug>] [--json]
   spike request list [--project <slug> | --unassigned] [--closed] [--json]
@@ -100,8 +100,8 @@ Goal creation options:
 
 Goal apply options:
   --goal <goal-id>               Completed Goal to apply
-  --target <local-branch>        Currently checked-out local branch to fast-forward
-  --approval <statement>         Explicit operator approval for this mutation
+  --target main                  Checked-out main; the only supported target
+  --approval <statement>         Separate explicit operator approval for this Application
 
 Request options:
   --project <slug>              Repeat for each Project affinity
@@ -715,6 +715,8 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
     if (change.churnWarnings.length > 0) lines.push(`  Churn warnings ${change.churnWarnings.length}`);
   }
   for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
+  if (status.application.length === 0) lines.push("  Applications none");
+  else for (const application of status.application) lines.push(`  Application ${application.applicationId} ${application.state}`);
   lines.push(status.cleanup.healthy ? "  Cleanup healthy" : `  Cleanup warnings ${status.cleanup.warnings.length}`);
   return `${lines.join("\n")}\n`;
 }

@@ -244,27 +244,35 @@ spike recover [--goal <goal-id>] [--json]
 ## Apply a completed Goal locally
 
 After every Change is resolved and workflow cleanup is healthy, an operator may
-fast-forward the currently checked-out local branch to the Goal's exact
-integration revision. This is a separate, explicit local action:
+create the Goal's only application form: an immutable, single-parent squash
+Application onto the currently checked-out local `main`. This is a separate,
+explicit local action:
 
 ```bash
 spike goal apply --goal spike-001 --target main \
   --approval "I approve applying this completed Goal" --json
 ```
 
-The command requires all three arguments. It first refuses if the Goal has an
-active Change or Ticket, cleanup warnings, a detached or different checked-out
-branch, a dirty index/worktree, a missing local target, or a target that cannot
-fast-forward. A refusal changes no target ref or worktree state through Spike's
-apply logic and JSON reports a machine-readable `workflow` error with the
-refusal reason.
+The command requires all three arguments and a clean-base condition: `main`
+must exactly equal the Goal initial revision. It refuses an active Change or
+Ticket, unhealthy cleanup, a detached or different checked-out branch, an
+already terminal Application, or a different current `main`, before publishing
+Application intent. It deliberately has no Spike cleanliness preflight: Git
+itself refuses a worktree update that would overwrite local work.
 
-On success, Spike's only mutation command is Git's local, verified
-`merge --ff-only`. The JSON data contains `goalId`, `targetBranch`,
-`previousTargetRevision`, `appliedRevision`, and `resultingTargetRevision`; the
-latter two are the exact Goal integration commit. Goal apply does not invoke
-`git push`, check out branches, create merge commits, rebase, cherry-pick,
-force-update, or resolve conflicts.
+Spike first publishes immutable Application intent (including separate operator
+approval), creates a normalized squash Candidate whose parent is the previous
+`main` and whose tree is the Goal integration tree, then publishes its immutable
+apply decision before asking Git to advance checked-out `main` with
+`merge --ff-only`. The resulting target revision is that distinct squash
+Candidate, while `appliedRevision` remains the Goal integration revision.
+Recovery completes only the recorded exact target transition.
+
+A clean-base deterministic squash Application needs no model review. If `main`
+has advanced from the Goal base, this clean-base command refuses; the later
+diverged-target workflow requires review of the exact Application Candidate.
+Goal apply does not invoke `git push`, check out branches, create merge commits,
+rebase, cherry-pick, force-update, or resolve conflicts.
 
 JSON mode emits exactly one `{ ok, command, data }` success object or one
 `{ ok, command, error }` failure object.

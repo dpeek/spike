@@ -13,6 +13,7 @@ import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
 import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
+import { hasTerminalApplication } from "./application.ts";
 import {
   deriveCurrentApproval,
   deriveCurrentCandidate,
@@ -430,6 +431,9 @@ export function abandonChange(input: ResolveChangeInput): Promise<ResolvedChange
 export async function createChange(input: CreateChangeInput): Promise<CreatedChange> {
   const repository = await discoverRepository(input.cwd);
   await loadGoal(repository.root, input.goalId);
+  if (await hasTerminalApplication(repository.root, input.goalId)) {
+    throw new Error(`Goal ${input.goalId} is terminal after application`);
+  }
 
   const activeChangeId = await unresolvedChangeId(repository.root, input.goalId);
   if (activeChangeId !== undefined) {

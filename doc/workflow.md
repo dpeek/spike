@@ -506,7 +506,15 @@ It begins at the Goal's initial revision and is a rebuildable projection of land
 5. Goal integrated revision and its dedicated integration ref advance to that commit.
 6. Planner updates the Plan and selects the next Change.
 
-If the integrated revision moved, Spike must explicitly recreate the Candidate and require review of the new hash. It must not silently land an unreviewed rewrite. Applying the integrated history to `main` is a separate explicit operator action.
+If the integrated revision moved, Spike must explicitly recreate the Candidate and require review of the new hash. It must not silently land an unreviewed rewrite.
+
+## Goal Application
+
+Application is the only form by which a completed Goal reaches `main`; Spike never fast-forwards Goal integration history directly. Every Application has a Goal-relative, never-reused three-digit ID and immutable `application.md` containing separate nonblank operator approval, the exact integrated revision, target `main`, and request time. A clean-base Application is allowed only when `main` exactly equals the Goal initial revision. Spike creates one squash Candidate with that old `main` commit as its sole parent and the integrated Goal tree, then writes immutable apply-decision evidence (Candidate, expected old main, resulting main, and time) **before** using `git merge --ff-only` on checked-out `main`.
+
+Spike deliberately does not preflight cleanliness. Git updates the checked-out worktree or refuses conflicting local changes without Spike overwriting them. On recovery, a decision advances only an exactly unchanged expected `main`, accepts exactly its recorded result, and refuses every other history. A Goal is applied only when valid decision evidence and the exact `main` projection agree; intent-only and mismatched evidence are surfaced as incomplete or inconsistent. An applied Goal is terminal: no later Change or Application may be created.
+
+Clean-base deterministic squash Application needs no model review. If `main` has advanced from the Goal base, this Change refuses it; a later workflow requires an exact Candidate review before a diverged-target Application.
 
 ## Rejection and abandonment
 
