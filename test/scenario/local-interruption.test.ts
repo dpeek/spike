@@ -57,7 +57,9 @@ describe("interrupted Ticket recovery", () => {
     });
     await writeFile(
       join(repository.root, "spike.json"),
-      '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+      // Replacement reproduces the interrupted Ticket; it must not resolve
+      // this malformed post-issuance agent configuration.
+      '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
     const identity = { goalId, changeId: "001", ticketId: "001" };

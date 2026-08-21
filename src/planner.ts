@@ -12,7 +12,7 @@ export type LaunchPlannerInput = {
 
 export async function launchPlanner(input: LaunchPlannerInput): Promise<number> {
   const repository = await discoverRepository(input.cwd);
-  const selection = (await loadProjectConfig(repository.root)).models.planner;
+  const selection = (await loadProjectConfig(repository.root)).agents.planner;
   const extension = resolve(import.meta.dir, "pi-supervisor-extension.ts");
   const spikeExecutable = input.spikeExecutable ?? input.environment?.["SPIKE_BIN"] ?? process.env["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike");
   const environment = { ...process.env, ...input.environment, SPIKE_BIN: spikeExecutable };

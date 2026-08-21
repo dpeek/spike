@@ -2,18 +2,24 @@
   "project": {
     "slug": "spike"
   },
-  "models": {
+  "agents": {
     "planner": {
       "model": "openai-codex/gpt-5.6-sol",
       "thinking": "high"
     },
     "implement": {
       "model": "openai-codex/gpt-5.6-terra",
-      "thinking": "medium"
+      "thinking": "medium",
+      "isolation": "container",
+      "networkAccess": "unrestricted",
+      "credentialGrants": ["openai-codex"]
     },
     "review": {
       "model": "openai-codex/gpt-5.6-sol",
-      "thinking": "high"
+      "thinking": "high",
+      "isolation": "container",
+      "networkAccess": "unrestricted",
+      "credentialGrants": ["openai-codex"]
     }
   }
 }

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadProjectConfig, resolveTicketModelSelection } from "./config.ts";
+import { loadProjectConfig, resolveTicketAssignment } from "./config.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -16,30 +16,40 @@ async function fixture(): Promise<string> {
     join(root, "spike.json"),
     `${JSON.stringify({
       project: { slug: "example-project" },
-      models: {
+      agents: {
         planner: { model: "planner", thinking: "high" },
-        implement: { model: "implementer", thinking: "medium" },
-        review: { model: "reviewer", thinking: "high" },
+        implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+        review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
       },
     })}\n`,
   );
   return root;
 }
 
-describe("project model configuration", () => {
+describe("project agent configuration", () => {
   test("loads role defaults and applies one-Ticket overrides", async () => {
     const root = await fixture();
 
     expect((await loadProjectConfig(root)).project).toEqual({ slug: "example-project" });
-    expect((await loadProjectConfig(root)).models.planner).toEqual({ model: "planner", thinking: "high" });
-    expect(await resolveTicketModelSelection(root, "implement")).toEqual({
-      model: "implementer",
-      thinking: "medium",
+    expect((await loadProjectConfig(root)).agents.planner).toEqual({ model: "planner", thinking: "high" });
+    expect(await resolveTicketAssignment(root, "implement")).toEqual({
+      model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [],
     });
-    expect(await resolveTicketModelSelection(root, "review", { model: "special-reviewer", thinking: "low" })).toEqual({
-      model: "special-reviewer",
-      thinking: "low",
+    expect(await resolveTicketAssignment(root, "review", { model: "special-reviewer", thinking: "low", isolation: "workspace", credentialGrants: [] })).toEqual({
+      model: "special-reviewer", thinking: "low", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [],
     });
+  });
+
+  test("defaults omitted worker isolation to container and rejects the former models shape", async () => {
+    const root = await fixture();
+    const config = JSON.parse(await readFile(join(root, "spike.json"), "utf8"));
+    delete config.agents.implement.isolation;
+    delete config.agents.review.isolation;
+    await writeFile(join(root, "spike.json"), `${JSON.stringify(config)}\n`);
+    expect(await resolveTicketAssignment(root, "implement")).toMatchObject({ isolation: "container" });
+    expect(await resolveTicketAssignment(root, "review")).toMatchObject({ isolation: "container" });
+    await writeFile(join(root, "spike.json"), JSON.stringify({ project: { slug: "example-project" }, models: config.agents }));
+    await expect(loadProjectConfig(root)).rejects.toThrow();
   });
 
   test("rejects missing, malformed, and incomplete configuration", async () => {
@@ -50,17 +60,17 @@ describe("project model configuration", () => {
     await writeFile(join(root, "spike.json"), "not json\n");
     await expect(loadProjectConfig(root)).rejects.toThrow("not valid JSON");
 
-    await writeFile(join(root, "spike.json"), '{"models":{}}\n');
+    await writeFile(join(root, "spike.json"), '{"agents":{}}\n');
     await expect(loadProjectConfig(root)).rejects.toThrow();
 
     await writeFile(
       join(root, "spike.json"),
       `${JSON.stringify({
         project: { slug: "Invalid Slug" },
-        models: {
+        agents: {
           planner: { model: "planner", thinking: "high" },
-          implement: { model: "implementer", thinking: "medium" },
-          review: { model: "reviewer", thinking: "high" },
+          implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+          review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
         },
       })}\n`,
     );

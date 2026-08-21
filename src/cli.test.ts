@@ -245,7 +245,9 @@ describe("spike CLI", () => {
     });
     await writeFile(
       join(repository.root, "spike.json"),
-      '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+      // Dispatch must use the assignment frozen in Ticket 001, not attempt to
+      // resolve these now-incomplete mutable agent defaults.
+      '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
     const rejectedOverride = await spikeAt(repository.root, [

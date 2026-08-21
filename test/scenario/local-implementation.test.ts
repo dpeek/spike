@@ -109,7 +109,7 @@ async function fixture() {
   await writeFile(join(repository.root, "README.md"), "dirty host edit\n");
   await writeFile(
     join(repository.root, "spike.json"),
-    '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n',
+    '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n',
   );
   const dirtyDiff = await repository.git("diff", "--", "README.md");
   const indexTree = await repository.git("write-tree");

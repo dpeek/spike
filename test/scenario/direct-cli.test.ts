@@ -121,15 +121,6 @@ describe("direct CLI tracer bullet", () => {
       "--acceptance", "The direct CLI Candidate is independently approved.",
     ]);
 
-    const missingNetworkPolicy = await spikeResult(repository.root, [
-      "ticket", "issue", "--goal", goalId, "--change", "001",
-      "--instruction", "Do not freeze an implicit local network policy.",
-    ]);
-    expect(missingNetworkPolicy).toMatchObject({
-      exitCode: 2,
-      output: { ok: false, error: { code: "usage", message: "--network-access is required" } },
-    });
-
     const issuedImplementation = await spike(repository.root, [
       "ticket", "issue", "--goal", goalId, "--change", "001",
       "--instruction", "Implement the direct CLI Candidate.",
@@ -140,7 +131,7 @@ describe("direct CLI tracer bullet", () => {
     });
 
     const config = JSON.parse(await readFile(join(repository.root, "spike.json"), "utf8"));
-    config.models.implement = { model: "changed-after-issuance", thinking: "minimal" };
+    config.agents.implement = { model: "changed-after-issuance", thinking: "minimal", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] };
     await writeFile(join(repository.root, "spike.json"), `${JSON.stringify(config, null, 2)}\n`);
 
     const implementationDispatch = await spike(repository.root, [

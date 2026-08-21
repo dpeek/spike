@@ -3,8 +3,7 @@ import { z } from "zod";
 import { changePath, changeStatus, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import {
-  resolveTicketModelSelection,
-  type ModelSelection,
+  resolveTicketAssignment,
   type ThinkingLevel,
 } from "./config.ts";
 import {
@@ -82,7 +81,7 @@ export type IssueTicketInput = {
   responseToReviewTicketId?: string;
   instruction: string;
   curatedContext?: string;
-  executionPolicy: ExecutionPolicy;
+  executionPolicy?: Partial<ExecutionPolicy>;
   model?: string;
   thinking?: ThinkingLevel;
   now?: Date;
@@ -381,14 +380,20 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   }
 
   const instruction = requireText(input.instruction, "Ticket instruction");
-  const policy = executionPolicySchema.parse({
-    ...input.executionPolicy,
-    credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")),
-  });
   const role = input.role ?? "implement";
-  const modelSelection: ModelSelection = await resolveTicketModelSelection(repository.root, role, {
+  const assignment = await resolveTicketAssignment(repository.root, role, {
     ...(input.model === undefined ? {} : { model: input.model }),
     ...(input.thinking === undefined ? {} : { thinking: input.thinking }),
+    ...(input.executionPolicy?.isolation === undefined ? {} : { isolation: input.executionPolicy.isolation }),
+    ...(input.executionPolicy?.networkAccess === undefined ? {} : { networkAccess: input.executionPolicy.networkAccess }),
+    ...(input.executionPolicy?.credentialGrants === undefined
+      ? {}
+      : { credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")) }),
+  });
+  const policy = executionPolicySchema.parse({
+    isolation: assignment.isolation,
+    networkAccess: assignment.networkAccess,
+    credentialGrants: assignment.credentialGrants,
   });
   let derivedRevision: string;
   let producingImplementationTicketId: string | undefined;
@@ -461,8 +466,8 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     issuedAt: (input.now ?? new Date()).toISOString(),
     role,
     inputRevision,
-    model: modelSelection.model,
-    thinking: modelSelection.thinking,
+    model: assignment.model,
+    thinking: assignment.thinking,
     executionPolicy: policy,
     guidance: { step: guidance.step, revision: guidance.revision },
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),

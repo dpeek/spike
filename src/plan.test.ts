@@ -32,10 +32,10 @@ async function installProjectConfig(root: string): Promise<void> {
     join(root, "spike.json"),
     JSON.stringify({
       project: { slug: "spike" },
-      models: {
+      agents: {
         planner: { model: "planner", thinking: "high" },
-        implement: { model: "implementer", thinking: "medium" },
-        review: { model: "reviewer", thinking: "high" },
+        implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+        review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
       },
     }),
   );

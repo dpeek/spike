@@ -123,6 +123,13 @@ describe("controlled Pi dispatch", () => {
       "--network-access", "unrestricted", "--model", "frozen-headed-model", "--thinking", "high",
     ]);
     expect(issued.exitCode).toBe(0);
+    // Pi dispatch shares frozen Ticket loading with controlled worker dispatch.
+    // Incomplete agent defaults after issuance must not prevent the frozen
+    // workspace assignment from reaching the worker.
+    await writeFile(
+      join(repository.root, "spike.json"),
+      '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"}}}\n',
+    );
 
     let tabInput: CreateHerdrTabInput | undefined;
     let closes = 0;
@@ -224,7 +231,7 @@ describe("controlled Pi dispatch", () => {
       "--network-access", "unrestricted", "--model", "frozen-implementation-model", "--thinking", "medium",
     ]);
     expect(issued.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"models":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal"},"review":{"model":"changed","thinking":"minimal"}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
 
     for (const override of ["--model", "--thinking", "--role", "--prompt", "--extension"]) {
       const rejected = await spike(repository.root, [
@@ -267,7 +274,7 @@ describe("controlled Pi dispatch", () => {
       "--network-access", "unrestricted", "--model", "frozen-review-model", "--thinking", "high",
     ]);
     expect(reviewIssue.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"models":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off"},"review":{"model":"later","thinking":"off"}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
 
     const reviewed = await spike(repository.root, [
       "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer", "--host", "direct",

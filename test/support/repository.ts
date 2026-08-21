@@ -45,10 +45,10 @@ export async function temporaryRepository(): Promise<{
       `${JSON.stringify(
         {
           project: { slug: "spike" },
-          models: {
+          agents: {
             planner: { model: "planner-model", thinking: "high" },
-            implement: { model: "implementation-model", thinking: "medium" },
-            review: { model: "review-model", thinking: "high" },
+            implement: { model: "implementation-model", thinking: "medium", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+            review: { model: "review-model", thinking: "high", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
           },
         },
         null,

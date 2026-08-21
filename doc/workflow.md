@@ -607,7 +607,7 @@ For each Ticket, the Worker module:
 
 Stop and cleanup are idempotent. Report publication must not depend on the worker remaining live. Herdr observation and terminal attachment may wrap the local process launch without changing this seam. Service networking, planner-to-worker follow-up, and persistent interactive continuation are deferred until the Docker workflow is reliable.
 
-## Model configuration
+## Agent configuration
 
 Project configuration records the stable Project slug and distinguishes the planner and Phase 2's executable Ticket roles using the workflow's role names:
 
@@ -616,26 +616,34 @@ Project configuration records the stable Project slug and distinguishes the plan
   "project": {
     "slug": "spike"
   },
-  "models": {
+  "agents": {
     "planner": {
       "model": "openai-codex/gpt-5.6-sol",
       "thinking": "high"
     },
     "implement": {
       "model": "openai-codex/gpt-5.6-terra",
-      "thinking": "medium"
+      "thinking": "medium",
+      "isolation": "container",
+      "networkAccess": "unrestricted",
+      "credentialGrants": ["openai-codex"]
     },
     "review": {
       "model": "openai-codex/gpt-5.6-sol",
-      "thinking": "high"
+      "thinking": "high",
+      "isolation": "container",
+      "networkAccess": "unrestricted",
+      "credentialGrants": ["openai-codex"]
     }
   }
 }
 ```
 
-When Spike issues a Ticket, it resolves the effective model and thinking selection from that Ticket role's project default and any explicit planner-specified override, then freezes the result into immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective selection.
+`agents` is strict: the former `models` shape is rejected, planner has only model and thinking, and implement/review also configure isolation, network access, and credential-grant identifiers (never secrets). Omitted worker isolation resolves to `container`. Remediation uses the implement agent; there is no remediation category.
 
-Ticket workers never inherit the planner model implicitly. Model and thinking command-line flags on Ticket issuance are explicit one-Ticket overrides. Dispatch-time overrides are rejected because they would change an already committed assignment. Change-level model policy, fallback lists, automatic routing, reviewer ensembles, cost budgets, and escalation policy are deferred until observed workflows justify them.
+When Spike issues a Ticket, it resolves the effective model, thinking, isolation, network access, and credential grants from that Ticket role's project default and any explicit one-Ticket override, then freezes model/thinking at top level and policy under `executionPolicy` in immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective assignment.
+
+Ticket workers never inherit the planner model implicitly. Model, thinking, isolation, network access, and credential command-line flags on Ticket issuance are explicit optional one-Ticket overrides. `--clear-credentials` explicitly selects an empty grant list, enabling a workspace override when container defaults configured grants. Dispatch-time overrides are rejected because they would change an already committed assignment. Change-level model policy, fallback lists, automatic routing, reviewer ensembles, cost budgets, and escalation policy are deferred until observed workflows justify them.
 
 ## Runtime policy
 

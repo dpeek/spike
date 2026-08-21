@@ -19,15 +19,15 @@ bun run check
 bin/spike --help
 ```
 
-Spike reads the stable Project slug and model defaults from tracked `spike.json`:
+Spike reads the stable Project slug and strict agent defaults from tracked `spike.json`:
 
 ```json
 {
   "project": { "slug": "spike" },
-  "models": {
+  "agents": {
     "planner": { "model": "...", "thinking": "high" },
-    "implement": { "model": "...", "thinking": "medium" },
-    "review": { "model": "...", "thinking": "high" }
+    "implement": { "model": "...", "thinking": "medium", "isolation": "container", "networkAccess": "unrestricted", "credentialGrants": ["openai-codex"] },
+    "review": { "model": "...", "thinking": "high", "isolation": "container", "networkAccess": "unrestricted", "credentialGrants": ["openai-codex"] }
   }
 }
 ```
@@ -35,8 +35,7 @@ Spike reads the stable Project slug and model defaults from tracked `spike.json`
 The Project slug qualifies monotonic Project-local Goal sequences, producing IDs
 such as `spike-001`. It is operator-chosen rather than inferred and cannot change
 after Goal allocation. Ticket issuance freezes the selected model and thinking
-level into `ticket.md`; later dispatch never rereads configuration or accepts
-model overrides.
+level and execution policy into `ticket.md`; later dispatch never rereads configuration or accepts overrides. Planner agents have only model and thinking because planner policy is not enforceable.
 
 Workflow guidance is tracked as Markdown at
 `spike/guidance/{goal,plan,change,implement,review,remediate,decide,recover}.md`.
@@ -65,7 +64,6 @@ spike ticket issue \
   --change 001 \
   --instruction "Implement the Change" \
   --context "Preserve the current filesystem contract" \
-  --network-access unrestricted \
   --model "openai-codex/gpt-5.6-terra" \
   --thinking medium
 ```
@@ -99,11 +97,13 @@ open-Request view. During explicitly approved Goal creation,
 Goal's outcome and constraints only: an approved Goal may remain queued without
 an active Change.
 
-`--model` and `--thinking` are optional one-Ticket overrides. Without them, the
-Ticket uses its role's `implement` or `review` selection from `spike.json`.
-`--network-access unrestricted` is the explicit acknowledgement required by the
-Phase 2 local-clone adapter, which provides workspace separation but cannot
-restrict host networking.
+`--model`, `--thinking`, `--isolation`, `--network-access`, and repeated
+`--credential` are optional one-Ticket overrides. Without them, a Ticket uses its
+role's `implement` or `review` agent defaults from `spike.json`. Use
+`--clear-credentials` to explicitly replace configured grants with an empty list,
+for example when overriding a Ticket to workspace isolation. Omitted worker
+isolation in configuration resolves to `container`; workspace dispatch is attended
+by default, while container dispatch is direct by default.
 Pi dispatch accepts no model, thinking, role, prompt, or extension overrides.
 Attended dispatch defaults to one headed interactive Pi TUI in a named ephemeral
 Herdr tab. It uses the immutable selection from `ticket.md`, automatically

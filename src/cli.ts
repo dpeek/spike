@@ -117,9 +117,10 @@ Ticket issuance options:
   --implementation-ticket <id>   Producing Ticket; derived for review when omitted
   --response-to-review <id>      Prior review Ticket being addressed; derived for implementation
   --context <context>            Additional planner-curated context
-  --isolation <level>            workspace (default) or container
-  --network-access <access>      Required: none, restricted, or unrestricted; local dispatch requires unrestricted
-  --credential <grant-id>        Repeat for each credential grant identifier
+  --isolation <level>            Override isolation: workspace or container
+  --network-access <access>      Override network access: none, restricted, or unrestricted
+  --credential <grant-id>        Repeat to override credential grant identifiers
+  --clear-credentials            Override configured credential grants with none
   --model <model>                Override the role's configured model for this Ticket
   --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
 
@@ -353,7 +354,7 @@ function parseTicketIssue(args: string[]): {
   role: "implement" | "review";
   producingImplementationTicketId?: string;
   responseToReviewTicketId?: string;
-  executionPolicy: ExecutionPolicy;
+  executionPolicy?: Partial<ExecutionPolicy>;
   model?: string;
   thinking?: ThinkingLevel;
 } {
@@ -366,12 +367,18 @@ function parseTicketIssue(args: string[]): {
   let role: "implement" | "review" = "implement";
   let model: string | undefined;
   let thinking: ThinkingLevel | undefined;
-  let isolation: ExecutionPolicy["isolation"] = "workspace";
+  let isolation: ExecutionPolicy["isolation"] | undefined;
   let networkAccess: ExecutionPolicy["networkAccess"] | undefined;
+  let clearCredentials = false;
   const credentialGrants: string[] = [];
 
-  for (let index = 0; index < args.length; index += 2) {
+  for (let index = 0; index < args.length;) {
     const option = args[index]!;
+    if (option === "--clear-credentials") {
+      clearCredentials = true;
+      index++;
+      continue;
+    }
     const value = valueAfter(args, index, option);
     switch (option) {
       case "--goal": goalId = value; break;
@@ -404,18 +411,24 @@ function parseTicketIssue(args: string[]): {
         break;
       default: throw new UsageError(`unknown option: ${option}`);
     }
+    index += 2;
   }
 
   if (goalId === undefined) throw new UsageError("--goal is required");
   if (changeId === undefined) throw new UsageError("--change is required");
   if (instruction === undefined) throw new UsageError("--instruction is required");
-  if (networkAccess === undefined) throw new UsageError("--network-access is required");
+  if (clearCredentials && credentialGrants.length > 0) throw new UsageError("--clear-credentials cannot be combined with --credential");
+  const executionPolicy = {
+    ...(isolation === undefined ? {} : { isolation }),
+    ...(networkAccess === undefined ? {} : { networkAccess }),
+    ...(clearCredentials ? { credentialGrants: [] } : credentialGrants.length === 0 ? {} : { credentialGrants }),
+  };
   return {
     goalId,
     changeId,
     instruction,
     role,
-    executionPolicy: { isolation, networkAccess, credentialGrants },
+    ...(Object.keys(executionPolicy).length === 0 ? {} : { executionPolicy }),
     ...(model === undefined ? {} : { model }),
     ...(thinking === undefined ? {} : { thinking }),
     ...(curatedContext === undefined ? {} : { curatedContext }),
