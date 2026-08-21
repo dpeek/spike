@@ -274,38 +274,23 @@ spike change abandon --goal <goal-id> --change 001 --statement "..." [--json]
 spike recover [--goal <goal-id>] [--json]
 ```
 
-## Apply a completed Goal locally
+## Queue and apply completed Goals
 
-After every Change is resolved and workflow cleanup is healthy, an operator may
-create the Goal's only application form: an immutable, single-parent squash
-Application onto the currently checked-out local `main`. This is a separate,
-explicit local action:
+The Project supervisor admits a completed healthy Goal with separate approval:
 
 ```bash
-spike goal apply --goal spike-001 --target main \
-  --approval "I approve applying this completed Goal" --json
+spike goal queue --goal spike-001 --target main --approval "I approve queueing this Goal" --json
 ```
 
-The command requires all three arguments and a clean-base condition: `main`
-must exactly equal the Goal initial revision. It refuses an active Change or
-Ticket, unhealthy cleanup, a detached or different checked-out branch, an
-already terminal Application, or a different current `main`, before publishing
-Application intent. It deliberately has no Spike cleanliness preflight: Git
-itself refuses a worktree update that would overwrite local work.
+Admission publishes immutable Application evidence with the pinned integrated revision, `main`, approval, request time, and Project-wide monotonic FIFO position. Position comes from published evidence rather than timestamps, so tied clocks cannot reorder Goals. Publication freezes every Goal-local Plan, Change, Ticket, Report, decision, and recovery mutation; read-only status and worker observation remain available. The matching Goal planner is released operationally afterward, and cleanup failure is reported without changing queue evidence.
 
-Spike first publishes immutable Application intent (including separate operator
-approval), creates a normalized squash Candidate whose parent is the previous
-`main` and whose tree is the Goal integration tree, then publishes its immutable
-apply decision before asking Git to advance checked-out `main` with
-`merge --ff-only`. The resulting target revision is that distinct squash
-Candidate, while `appliedRevision` remains the Goal integration revision.
-Recovery completes only the recorded exact target transition.
+Only the immutable unresolved FIFO head can be selected by the supervisor:
 
-A clean-base deterministic squash Application needs no model review. If `main`
-has advanced from the Goal base, this clean-base command refuses; the later
-diverged-target workflow requires review of the exact Application Candidate.
-Goal apply does not invoke `git push`, check out branches, create merge commits,
-rebase, cherry-pick, force-update, or resolve conflicts.
+```bash
+spike application apply-head --goal spike-001 --application 001 --json
+```
+
+It refuses missing, resolved, non-head, mismatched, stale, or non-`main` work before a Candidate, decision, ref, or worktree mutation. If checked-out `main` exactly equals the head Goal base, Spike creates the single-parent deterministic squash Candidate, publishes its exact decision, then uses `merge --ff-only` so Git preserves user changes. No model review is needed on this clean-base path. If `main` has advanced, the head remains unresolved and frozen with no Candidate or target mutation; later Applications remain blocked in FIFO order for future diverged-target Candidate work. Restart recovery reconstructs queue and head only from immutable Application/decision evidence and completes only an exact interrupted target advancement. There is no `goal apply` compatibility command.
 
 JSON mode emits exactly one `{ ok, command, data }` success object or one
 `{ ok, command, error }` failure object.

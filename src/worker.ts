@@ -12,6 +12,7 @@ import {
   serializeDocument,
 } from "./durable-state.ts";
 import { createInputBundle } from "./git-change.ts";
+import { assertGoalNotFrozen } from "./application.ts";
 import { discoverRepository, git } from "./git.ts";
 import {
   herdrOperations,
@@ -1204,6 +1205,8 @@ async function loadFinishedDockerWorker(root: string, identity: TicketIdentity, 
 }
 
 export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
+  const frozenRepository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
@@ -1272,6 +1275,8 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
  * adapter-owned restartable exact-container observer waits after attachment;
  * attachment loss is never completion evidence. */
 export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
+  const frozenRepository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
@@ -1327,6 +1332,8 @@ export type DispatchHerdrTicketInput = DispatchLocalTicketInput & {
 export async function dispatchHerdrTicket(
   input: DispatchHerdrTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
+  const frozenRepository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
@@ -1388,6 +1395,8 @@ export async function dispatchHerdrTicket(
 export async function dispatchLocalTicket(
   input: DispatchLocalTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
+  const frozenRepository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
   const repository = await discoverRepository(input.cwd);
@@ -1537,6 +1546,7 @@ export async function dispatchPiTicket(
     }
 > {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const host = selectPiHost(ticket.metadata.executionPolicy, input.host);

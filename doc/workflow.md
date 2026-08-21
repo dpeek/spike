@@ -28,6 +28,14 @@ Goal
 
 This model preserves durable evidence, resumability, exact Git provenance, and independent review with a small sequential workflow.
 
+## Application FIFO admission
+
+A completed healthy Goal is not applied immediately. Only the Project supervisor may run `spike goal queue --goal <goal> --target main --approval <statement>`. It publishes one immutable Application containing the Goal-relative Application ID, pinned integrated revision, `main`, separate nonblank approval, request time, and a Project-wide monotonic `queuePosition`. The next position is calculated from already published Application evidence, never clock order; equal or regressed timestamps therefore cannot reorder the queue.
+
+An Application freezes its Goal: Plan edits, Change and Ticket creation/decisions, Report publication, and Goal-local recovery refuse before durable or Git effects. Read-only status and worker observation remain available. Queue publication then releases the matching Herdr planner operationally; a release failure is shown separately and never removes or changes the durable queue entry.
+
+Status derives the ordered queue and exact unresolved head from Application and decision documents. Only `spike application apply-head --goal <goal> --application <id>` may select `main`, and it refuses any missing, resolved, non-head, mismatched, or stale Application before creating a Candidate, decision, ref, or worktree effect. A head whose `main` still equals its Goal initial revision creates the existing single-parent deterministic squash and advances checked-out `main` through Git. If `main` has advanced, that head remains frozen and queued with no Candidate or target decision; later entries stay behind it. Restart recovery rebuilds this order solely from immutable Application/decision evidence and only completes an already-published exact clean-base decision.
+
 ## Goal planner ownership
 
 A Project supervisor is the only Project-wide planner authority. It may start,

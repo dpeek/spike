@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, landChange } from "../../src/change.ts";
 import { serializeDocument } from "../../src/durable-state.ts";
-import { applyGoalIntegration } from "../../src/goal-apply.ts";
+import { applyQueueHead, queueGoalIntegration } from "../../src/goal-apply.ts";
 import { createGoal } from "../../src/goal.ts";
 import { reconcileGoal } from "../../src/recovery.ts";
 import { issueTicket, reportPath } from "../../src/ticket.ts";
@@ -47,8 +47,9 @@ async function readyGoal() {
 
 test("scenario: a decision-published Application recovers its checked-out main squash", async () => {
   const { repository, goalId, base } = await readyGoal();
-  await expect(applyGoalIntegration({
-    cwd: repository.root, goalId, approval: "Operator approves this scenario.",
+  const queued = await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Operator approves this scenario." });
+  await expect(applyQueueHead({
+    cwd: repository.root, goalId, applicationId: queued.applicationId,
     crash: async ({ point, moment }) => { if (point === "application-target-advance" && moment === "before") throw new Error("scenario crash"); },
   })).rejects.toThrow("scenario crash");
   expect(await repository.git("rev-parse", "main")).toBe(base);

@@ -6,6 +6,7 @@ import { acceptanceCriteria } from "./acceptance.ts";
 import { changePath, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
 import { assertGoalBelongsToProject } from "./config.ts";
+import { assertGoalNotFrozen } from "./application.ts";
 import {
   documentExists,
   installImmutable,
@@ -821,6 +822,7 @@ export async function publishBlockedReport(
   input: PublishBlockedReportInput,
 ): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
   if (await documentExists(repository.root, path)) {
@@ -862,6 +864,7 @@ export async function publishFailedReport(
   input: PublishFailedReportInput,
 ): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
   if (await documentExists(repository.root, path)) {
@@ -906,6 +909,7 @@ async function publishHostTerminalReport(
   outcome: "interrupted" | "stopped",
 ): Promise<{ root: string; report: TerminalReport }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
   if (await documentExists(repository.root, path)) {
@@ -960,6 +964,7 @@ export async function publishImplementationReport(
   input: PublishImplementationReportInput,
 ): Promise<{ root: string; report: ImplementationReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   await assertGoalBelongsToProject(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
@@ -1043,6 +1048,7 @@ export async function publishReviewReport(
   input: PublishReviewReportInput,
 ): Promise<{ root: string; report: ReviewReport; cleanup: ReportPublicationCleanup }> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
   if (await documentExists(repository.root, path)) {

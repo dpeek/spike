@@ -347,16 +347,16 @@ describe("Pi supervisor extension", () => {
     expect(invocations[20].args).toEqual(["recover", "--goal", "goal-1", "--reason", "Supervisor restarted.", "--json"]);
   });
 
-  test("registers Goal apply approval gating, forwards it exactly, preserves evidence, and propagates refusals", async () => {
+  test("registers supervisor queue approval gating and propagates refusals", async () => {
     const calls: RunSpikeJsonInput[] = [];
     const evidence = {
       goalId: "goal-1",
       targetBranch: "main",
-      previousTargetRevision: "a".repeat(40),
-      appliedRevision: "b".repeat(40),
-      resultingTargetRevision: "b".repeat(40),
+      applicationId: "001",
+      queuePosition: 1,
+      integratedRevision: "b".repeat(40),
     };
-    const refusal = new Error("Spike rejected goal apply: target cannot fast-forward");
+    const refusal = new Error("Spike rejected goal queue: admission refused");
     let refuse = false;
     const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
     registerSupervisorExtension({
@@ -367,11 +367,11 @@ describe("Pi supervisor extension", () => {
       async invoke(input) {
         calls.push(input);
         if (refuse) throw refusal;
-        return { ok: true, command: "goal apply", data: evidence };
+        return { ok: true, command: "goal queue", data: evidence };
       },
     });
 
-    const apply = tools.find((tool) => tool.name === "spike_apply_goal")!;
+    const apply = tools.find((tool) => tool.name === "spike_queue_goal")!;
     expect(apply.parameters).toEqual({
       type: "object",
       additionalProperties: false,
@@ -383,14 +383,14 @@ describe("Pi supervisor extension", () => {
       },
     });
 
-    const params = { goalId: "goal-1", targetBranch: "main", approval: "I approve this apply." };
+    const params = { goalId: "goal-1", targetBranch: "main", approval: "I approve this queue." };
     const result = await apply.execute("call", params, undefined, undefined, { cwd: "/project" });
     expect(calls).toEqual([{
       cwd: "/project",
-      args: ["goal", "apply", "--goal", "goal-1", "--target", "main", "--approval", "I approve this apply."],
-      expectedCommand: "goal apply",
+      args: ["goal", "queue", "--goal", "goal-1", "--target", "main", "--approval", "I approve this queue."],
+      expectedCommand: "goal queue",
     }]);
-    expect(result.details).toEqual({ ok: true, command: "goal apply", data: evidence });
+    expect(result.details).toEqual({ ok: true, command: "goal queue", data: evidence });
     expect(JSON.parse(result.content[0]!.text)).toEqual(result.details);
 
     refuse = true;

@@ -72,7 +72,7 @@ describe("spike CLI", () => {
     expect(JSON.parse(status.stdout)).toEqual({
       ok: true,
       command: "status",
-      data: { root: canonicalRoot, project: { slug: "spike" }, goals: [], cleanup: { healthy: true, warnings: [] } },
+      data: { root: canonicalRoot, project: { slug: "spike" }, goals: [], cleanup: { healthy: true, warnings: [] }, applicationQueue: [], queueHead: null },
     });
 
     const failed = await spikeAt(repository.root, ["change", "reject", "--json"]);

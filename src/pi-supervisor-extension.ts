@@ -104,7 +104,8 @@ export const goalPlannerToolNames = [
 export const supervisorToolNames = [
   "spike_begin_step",
   "spike_status",
-  "spike_apply_goal",
+  "spike_queue_goal",
+  "spike_apply_queue_head",
   "spike_create_goal",
   "spike_create_request",
   "spike_list_requests",
@@ -278,7 +279,8 @@ function commandSummary(response: SpikeJsonSuccess): string {
   switch (response.command) {
     case "status": return statusText(response.data);
     case "guidance show": return `Loaded ${string(data?.step) ?? "workflow"} guidance`;
-    case "goal apply": return `Applied Goal ${string(data?.goalId) ?? "unknown"} to ${string(data?.targetBranch) ?? "unknown"}`;
+    case "goal queue": return `Queued Goal ${string(data?.goalId) ?? "unknown"} at FIFO position ${String(data?.queuePosition ?? "unknown")}`;
+    case "application apply-head": return `Applied FIFO head ${string(data?.goalId) ?? "unknown"}/${string(data?.applicationId) ?? "unknown"}`;
     case "goal create": return `Created Goal ${identity(object(data?.goal)) ?? "unknown"}`;
     case "request create":
     case "request show": {
@@ -799,10 +801,10 @@ export function registerSupervisorExtension(
       },
     }, invoke, options),
     tool({
-      name: "spike_apply_goal",
-      label: "Apply completed Goal",
-      description: "Apply a completed Goal's reviewed integration revision to an explicitly selected local target branch after explicit operator approval.",
-      promptSnippet: "Apply one completed Goal only with explicit operator approval",
+      name: "spike_queue_goal",
+      label: "Queue completed Goal",
+      description: "Supervisor-only immutable FIFO admission for a completed Goal after explicit operator approval.",
+      promptSnippet: "Queue one completed Goal only with explicit operator approval",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -813,10 +815,22 @@ export function registerSupervisorExtension(
           approval: requiredNonBlankString,
         },
       },
-      command: "goal apply",
+      command: "goal queue",
       args: (params) => [
-        "goal", "apply", "--goal", params.goalId, "--target", params.targetBranch, "--approval", params.approval,
+        "goal", "queue", "--goal", params.goalId, "--target", params.targetBranch, "--approval", params.approval,
       ],
+    }, invoke, options),
+    tool({
+      name: "spike_apply_queue_head",
+      label: "Apply FIFO queue head",
+      description: "Supervisor-only clean-base application of one exact unresolved FIFO head.",
+      promptSnippet: "Apply only the exact FIFO head",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["goalId", "applicationId"],
+        properties: { goalId: requiredNonBlankString, applicationId: requiredNonBlankString },
+      },
+      command: "application apply-head",
+      args: (params) => ["application", "apply-head", "--goal", params.goalId, "--application", params.applicationId],
     }, invoke, options),
     tool({
       name: "spike_create_goal",

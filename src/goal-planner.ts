@@ -19,6 +19,8 @@ export type GoalPlannerOperations = {
   observe(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
   attach(input: GoalPlannerInput): Promise<number>;
   replace(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
+  /** Operational cleanup after durable Application admission. */
+  release(input: GoalPlannerInput): Promise<void>;
 };
 export type GoalPlannerInput = {
   cwd: string;
@@ -181,6 +183,11 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     const live = current.resources.find((resource) => liveStatuses.has(resource.status));
     if (live === undefined) throw new Error(`Goal planner ${target.identity.name} is not live`);
     return (input.herdr ?? herdrOperations).attach(live.pane);
+  },
+  async release(input) {
+    const target = await selected(input);
+    const herdr = input.herdr ?? herdrOperations;
+    await close((await observation(target.identity, herdr)).resources, herdr);
   },
   async replace(input) {
     const target = await selected(input);

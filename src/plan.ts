@@ -4,6 +4,7 @@ import { assertGoalBelongsToProject } from "./config.ts";
 import { installImmutable, readDocument, replaceAtomic, serializeDocument } from "./durable-state.ts";
 import { goalIdPattern } from "./identity.ts";
 import { loadChangeReportHistory, type ChangeReportHistory } from "./report.ts";
+import { assertGoalNotFrozen } from "./application.ts";
 import { projectRoot } from "./project.ts";
 
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -95,6 +96,7 @@ export async function loadPlan(root: string, goalId: string): Promise<Plan> {
 }
 
 export async function revisePlan(root: string, goalId: string, body: string, now = new Date().toISOString()): Promise<Plan> {
+  await assertGoalNotFrozen(root, goalId);
   if (!body.trim()) throw new Error("Plan body must not be blank");
   const current = await loadPlan(root, goalId);
   const metadata = planSchema.parse({ ...current.metadata, updatedAt: now });
@@ -175,6 +177,7 @@ export async function refreshChangeChurn(
   changeId: string,
   now = new Date().toISOString(),
 ): Promise<{ plan: Plan; indicators: ChurnIndicator[] }> {
+  await assertGoalNotFrozen(root, goalId);
   const current = await loadPlan(root, goalId);
   const history = await loadChangeReportHistory(root, goalId, changeId);
   const indicators = detectChangeChurn(history);

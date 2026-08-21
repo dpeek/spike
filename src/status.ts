@@ -17,7 +17,7 @@ import {
 } from "./report.ts";
 import { listTicketIds, loadOpenTicket } from "./ticket.ts";
 import { loadRecordedWorkerIfPresent, type TicketIdentity } from "./worker.ts";
-import { applicationEvidence } from "./application.ts";
+import { applicationEvidence, applicationState, listProjectApplications, queuedApplicationHead } from "./application.ts";
 import { goalPlannerIdentity, goalPlannerOperations, type GoalPlannerObservation } from "./goal-planner.ts";
 import { herdrOperations, type HerdrOperations } from "./herdr.ts";
 
@@ -82,6 +82,7 @@ export type DerivedGoalStatus = {
   decisions: DerivedDecision[];
   cleanup: CleanupHealth;
   application: Array<{ applicationId: string; state: "incomplete" | "inconsistent" | "applied" }>;
+  frozen: boolean;
 };
 
 export type DerivedRepositoryStatus = {
@@ -89,6 +90,8 @@ export type DerivedRepositoryStatus = {
   project: { slug: string };
   goals: DerivedGoalStatus[];
   cleanup: CleanupHealth;
+  applicationQueue: Array<{ goalId: string; applicationId: string; queuePosition: number; integratedRevision: string; state: "queued" | "applied" | "inconsistent" }>;
+  queueHead: null | { goalId: string; applicationId: string; queuePosition: number };
 };
 
 /** Operational attachment observations deliberately sit beside, never inside,
@@ -226,6 +229,7 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
     decisions,
     cleanup: { healthy: cleanupWarnings.length === 0, warnings: cleanupWarnings },
     application,
+    frozen: application.length !== 0,
   };
 }
 
@@ -236,12 +240,26 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
   for (const goalId of await listGoalIds(repository.root)) {
     goals.push(await deriveGoalStatus(repository.root, goalId));
   }
+  const queue = await listProjectApplications(repository.root);
+  // Decision publication alone is never terminal: only its exact main target
+  // projection marks an entry applied. Invalid or unexpected evidence remains
+  // visible as the FIFO barrier rather than allowing a later entry to lead.
+  const queueStates = await Promise.all(queue.map((application) => applicationState(repository.root, application)));
+  const head = await queuedApplicationHead(repository.root);
   const warnings = goals.flatMap((goal) => goal.cleanup.warnings);
   return {
     root: repository.root,
     project,
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
+    applicationQueue: queue.map((application, index) => ({
+      goalId: application.metadata.goalId,
+      applicationId: application.metadata.applicationId,
+      queuePosition: application.metadata.queuePosition,
+      integratedRevision: application.metadata.integratedRevision,
+      state: queueStates[index] === "applied" ? "applied" : queueStates[index] === "inconsistent" ? "inconsistent" : "queued",
+    })),
+    queueHead: head === undefined ? null : { goalId: head.metadata.goalId, applicationId: head.metadata.applicationId, queuePosition: head.metadata.queuePosition },
   };
 }
 

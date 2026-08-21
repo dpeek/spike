@@ -7,7 +7,8 @@ import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
 import { sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
-import { recoverApplications } from "./application.ts";
+import { assertGoalNotFrozen, listProjectApplications, listPublishedApplicationIds, recoverApplications } from "./application.ts";
+import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
 import {
   deriveCurrentCandidate,
   loadReportIfPresent,
@@ -62,6 +63,7 @@ export async function stopTicket(
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<StoppedTicket> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const reason = terminalReason(input.reason, "Stop");
   const now = input.now ?? new Date();
@@ -134,6 +136,7 @@ export async function recoverInterruptedTicket(
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<InterruptedTicketRecovery> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const reason = interruptionReason(input.reason);
   const now = input.now ?? new Date();
@@ -232,11 +235,37 @@ export type ReconciledGoal = {
   ignoredOutputPaths: string[];
 };
 
+export type PlannerCleanupWarning = { goalId: string; applicationId: string; message: string };
+
 export type RepositoryReconciliation = {
   root: string;
   goals: ReconciledGoal[];
   ignoredUnpublishedGoalIds: string[];
+  /** Operational release failures never alter immutable Application evidence. */
+  plannerCleanupWarnings: PlannerCleanupWarning[];
 };
+
+/** Project-supervisor recovery retries release for durable queue entries only.
+ * It intentionally neither admits Applications nor changes their documents. */
+export async function recoverPublishedApplicationPlanners(
+  cwd: string,
+  planners: GoalPlannerOperations = goalPlannerOperations,
+): Promise<PlannerCleanupWarning[]> {
+  const repository = await discoverRepository(cwd);
+  const warnings: PlannerCleanupWarning[] = [];
+  for (const application of await listProjectApplications(repository.root)) {
+    try {
+      await planners.release({ cwd: repository.root, goalId: application.metadata.goalId });
+    } catch (error) {
+      warnings.push({
+        goalId: application.metadata.goalId,
+        applicationId: application.metadata.applicationId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return warnings;
+}
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -316,6 +345,17 @@ export async function reconcileGoal(
 ): Promise<ReconciledGoal> {
   const repository = await discoverRepository(input.cwd);
   await loadGoal(repository.root, input.goalId);
+  // Application evidence freezes Goal-local recovery. The Project supervisor
+  // may still recover its already-published target decision, without replaying
+  // any Goal ref or workflow mutation.
+  if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0) {
+    if (input.recoverApplications !== false) await recoverApplications(repository.root);
+    return {
+      goalId: input.goalId,
+      integratedRevision: await git(repository.root, ["rev-parse", "--verify", `${integratedRef(input.goalId)}^{commit}`]),
+      currentCandidates: [], interruptedTickets: [], finalizedWorkers: [], cleanupWarnings: [], discardedRefs: [], ignoredOutputPaths: [],
+    };
+  }
   const now = input.now ?? new Date();
   const reason = interruptionReason(input.reason ?? "Supervisor restart interrupted an open Ticket before its Report was published.");
   const changeIds = await publishedChangeIds(repository.root, input.goalId);
@@ -400,8 +440,13 @@ export async function reconcileGoal(
 export async function reconcileRepository(
   input: ReconcileRepositoryInput,
   runtimeOperations?: WorkerRuntimeOperations,
+  planners: GoalPlannerOperations = goalPlannerOperations,
 ): Promise<RepositoryReconciliation> {
   const repository = await discoverRepository(input.cwd);
+  // Run operational cleanup from published evidence before any Goal-local
+  // recovery can encounter a target barrier. This is idempotent and is the
+  // only retry path needed after a crash just after Application publication.
+  const plannerCleanupWarnings = await recoverPublishedApplicationPlanners(repository.root, planners);
   const goalIds = await listAllocatedGoalIds(repository.root);
   const goals: ReconciledGoal[] = [];
   const ignoredUnpublishedGoalIds: string[] = [];
@@ -423,5 +468,5 @@ export async function reconcileRepository(
       ),
     );
   }
-  return { root: repository.root, goals, ignoredUnpublishedGoalIds };
+  return { root: repository.root, goals, ignoredUnpublishedGoalIds, plannerCleanupWarnings };
 }

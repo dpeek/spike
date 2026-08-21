@@ -20,6 +20,7 @@ import { loadGoal } from "./goal.ts";
 import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { loadPlan } from "./plan.ts";
 import { deriveCurrentCandidate, deriveCurrentReview, loadReportIfPresent } from "./report.ts";
+import { assertGoalNotFrozen } from "./application.ts";
 
 const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -266,6 +267,7 @@ export async function loadReplacementTicketIfPresent(
 
 export async function issueReplacementTicket(input: IssueReplacementTicketInput): Promise<IssuedTicket> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const [change, interrupted] = await Promise.all([
     loadChange(repository.root, input.goalId, input.changeId),
     loadTicket(repository.root, input.goalId, input.changeId, input.interruptedTicketId),
@@ -365,6 +367,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
 
 export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket> {
   const repository = await discoverRepository(input.cwd);
+  await assertGoalNotFrozen(repository.root, input.goalId);
   const [goal, change, plan] = await Promise.all([
     loadGoal(repository.root, input.goalId),
     loadChange(repository.root, input.goalId, input.changeId),

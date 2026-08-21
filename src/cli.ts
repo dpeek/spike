@@ -14,7 +14,7 @@ import type { ThinkingLevel } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
-import { applyGoalIntegration } from "./goal-apply.ts";
+import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
@@ -64,7 +64,8 @@ Usage:
   spike status [--goal <goal-id>] [--operational] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
-  spike goal apply --goal <goal-id> --target main --approval <statement> [--json]
+  spike goal queue --goal <goal-id> --target main --approval <statement> [--json]
+  spike application apply-head --goal <goal-id> --application <application-id> [--json]
   spike plan revise --goal <goal-id> [--file <path>] [--json]
   spike request create --title <title> --statement <statement> [--project <slug>] [--json]
   spike request list [--project <slug> | --unassigned] [--closed] [--json]
@@ -104,10 +105,14 @@ Goal creation options:
   --request <request-id>         Repeat for each source Request
   --repository-id <identity>     Override the inferred repository identity
 
-Goal apply options:
-  --goal <goal-id>               Completed Goal to apply
-  --target main                  Checked-out main; the only supported target
+Goal queue options:
+  --goal <goal-id>               Completed Goal to admit to the FIFO queue
+  --target main                  The only supported target
   --approval <statement>         Separate explicit operator approval for this Application
+
+Application apply-head options:
+  --goal <goal-id>               Exact Goal owning the FIFO head
+  --application <application-id> Exact FIFO-head Application ID
 
 Request options:
   --project <slug>              Repeat for each Project affinity
@@ -299,7 +304,7 @@ function parseGoalCreate(args: string[]): {
   return { title, outcome, approval, constraints, sourceRequests, ...(repositoryIdentity === undefined ? {} : { repositoryIdentity }) };
 }
 
-function parseGoalApply(args: string[]): { goalId: string; targetBranch: string; approval: string } {
+function parseGoalQueue(args: string[]): { goalId: string; targetBranch: string; approval: string } {
   let goalId: string | undefined;
   let targetBranch: string | undefined;
   let approval: string | undefined;
@@ -315,6 +320,20 @@ function parseGoalApply(args: string[]): { goalId: string; targetBranch: string;
   if (targetBranch === undefined) throw new UsageError("--target is required");
   if (approval === undefined) throw new UsageError("--approval is required");
   return { goalId, targetBranch, approval };
+}
+
+function parseApplicationApplyHead(args: string[]): { goalId: string; applicationId: string } {
+  let goalId: string | undefined;
+  let applicationId: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index]!; const value = valueAfter(args, index, option);
+    if (option === "--goal") goalId = value;
+    else if (option === "--application") applicationId = value;
+    else throw new UsageError(`unknown option: ${option}`);
+  }
+  if (goalId === undefined) throw new UsageError("--goal is required");
+  if (applicationId === undefined) throw new UsageError("--application is required");
+  return { goalId, applicationId };
 }
 
 function parseChangeCreate(args: string[]): {
@@ -745,6 +764,7 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
   for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
   if (status.application.length === 0) lines.push("  Applications none");
   else for (const application of status.application) lines.push(`  Application ${application.applicationId} ${application.state}`);
+  lines.push(status.frozen ? "  Goal frozen by Application evidence" : "  Goal unfrozen");
   lines.push(status.cleanup.healthy ? "  Cleanup healthy" : `  Cleanup warnings ${status.cleanup.warnings.length}`);
   return `${lines.join("\n")}\n`;
 }
@@ -752,7 +772,9 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
 function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
   const heading = `Project ${status.project.slug}\nRepository ${status.root}\n`;
   if (status.goals.length === 0) return `${heading}  No Goals\n  Cleanup healthy\n`;
-  return `${heading}${status.goals.map(humanGoalStatus).join("")}`;
+  const queue = status.applicationQueue.length === 0 ? "  Application queue empty\n" : `${status.applicationQueue.map((entry) => `  Queue ${entry.queuePosition} ${entry.goalId}/${entry.applicationId} ${entry.state}`).join("\n")}\n`;
+  const head = status.queueHead === null ? "  Queue head none\n" : `  Queue head ${status.queueHead.goalId}/${status.queueHead.applicationId} (${status.queueHead.queuePosition})\n`;
+  return `${heading}${queue}${head}${status.goals.map(humanGoalStatus).join("")}`;
 }
 
 function decisionData(decision: ChangeDecision): unknown {
@@ -872,18 +894,22 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       );
     }
 
-    if (args[0] === "goal" && args[1] === "apply") {
-      const input = parseGoalApply(args.slice(2));
-      const applied = await applyGoalIntegration({ cwd, ...input });
-      return success(
-        json,
-        "goal apply",
-        applied,
-        `Applied Goal ${applied.goalId} to ${applied.targetBranch}\n` +
-          `  Previous target revision ${applied.previousTargetRevision}\n` +
-          `  Applied revision ${applied.appliedRevision}\n` +
-          `  Resulting target revision ${applied.resultingTargetRevision}\n`,
-      );
+    if (args[0] === "goal" && args[1] === "queue") {
+      const input = parseGoalQueue(args.slice(2));
+      const queued = await queueGoalIntegration({ cwd, ...input });
+      return success(json, "goal queue", queued,
+        `Queued Goal ${queued.goalId} for main at FIFO position ${queued.queuePosition}\n` +
+        `  Application ${queued.applicationId}\n` +
+        `  Planner cleanup ${queued.plannerCleanup.status}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "apply-head") {
+      const input = parseApplicationApplyHead(args.slice(2));
+      const applied = await applyQueueHead({ cwd, ...input });
+      return success(json, "application apply-head", applied,
+        `Applied FIFO head ${applied.goalId}/${applied.applicationId} to main\n` +
+        `  Previous target revision ${applied.previousTargetRevision}\n` +
+        `  Resulting target revision ${applied.resultingTargetRevision}\n`);
     }
 
     if (args[0] === "goal" && args[1] === "create") {
