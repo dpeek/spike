@@ -10,7 +10,7 @@
     "spike": "bun src/cli.ts",
     "test": "bun test --path-ignore-patterns test/docker --parallel=8",
     "typecheck": "tsc --noEmit",
-    "check": "bun run typecheck && bun run test && bun build src/cli.ts --target=bun --outfile=/tmp/spike-check.js && bun build src/pi-supervisor-extension.ts --target=node --outfile=/tmp/spike-supervisor-extension-check.js && bun build src/pi-worker-extension.ts --target=node --outfile=/tmp/spike-worker-extension-check.js"
+    "check": "bun run typecheck && bun run test && bun build src/cli.ts --target=bun --outfile=/tmp/spike-check.js && bun build src/pi-supervisor-extension.ts --target=node --outfile=/tmp/spike-supervisor-extension-check.js && bun build src/pi-goal-planner-extension.ts --target=node --outfile=/tmp/spike-goal-planner-extension-check.js && bun build src/pi-worker-extension.ts --target=node --outfile=/tmp/spike-worker-extension-check.js"
   },
   "engines": {
     "bun": ">=1.3.0"

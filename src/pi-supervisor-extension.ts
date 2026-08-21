@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { realpath } from "node:fs/promises";
 
 export type SpikeJsonSuccess = { ok: true; command: string; data: unknown };
 type SpikeJsonFailure = {
@@ -76,7 +77,29 @@ export type RegisterSupervisorExtensionOptions = {
   environment?: NodeJS.ProcessEnv;
   invoke?: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>;
   waitForDone?: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>;
+  /** Set only by the Goal-planner entrypoint. It is operational scope, never workflow evidence. */
+  goalId?: string;
+  /** Exact repository identity supplied by the Goal planner's immutable environment. */
+  projectIdentity?: string;
+  /** Injection seam for the Node-compatible repository binding. */
+  validateProject?: (cwd: string, projectIdentity: string) => Promise<void>;
 };
+
+export const goalPlannerToolNames = [
+  "spike_begin_step",
+  "spike_status",
+  "spike_revise_plan",
+  "spike_create_change",
+  "spike_decide_change",
+  "spike_issue_implement",
+  "spike_issue_review",
+  "spike_issue_remediate",
+  "spike_dispatch_pi",
+  "spike_worker_status",
+  "spike_worker_read",
+  "spike_publish_report",
+  "spike_recover",
+] as const;
 
 export const supervisorToolNames = [
   "spike_begin_step",
@@ -462,6 +485,39 @@ export async function runSpikeJson(input: RunSpikeJsonInput): Promise<SpikeJsonS
   });
 }
 
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", ["-C", cwd, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer | string) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on("data", (chunk: Buffer | string) => stderr.push(Buffer.from(chunk)));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const output = Buffer.concat(stdout).toString("utf8").trim();
+      if (code === 0) resolve(output);
+      else reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `git exited with code ${code}`));
+    });
+  });
+}
+
+/** Recreate Project.repositoryIdentity without importing Bun-only core modules into Pi. */
+async function validateProjectIdentity(cwd: string, expected: string): Promise<void> {
+  if (typeof expected !== "string" || !expected.trim()) throw new Error("Goal planner Project identity must not be blank");
+  let actual: string | undefined;
+  try {
+    const remote = await gitOutput(cwd, ["config", "--get", "remote.origin.url"]);
+    if (remote) actual = remote;
+  } catch {
+    // A local repository identity is its canonical shared Git directory.
+  }
+  if (actual === undefined) {
+    const common = await gitOutput(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    actual = `file://${await realpath(common)}`;
+  }
+  if (actual !== expected) throw new Error("Goal planner Project identity does not match this checkout");
+}
+
 function optional(args: string[], option: string, value: string | undefined): void {
   if (value !== undefined) args.push(option, value);
 }
@@ -476,7 +532,7 @@ function tool(
     args: (params: any) => string[];
     stdin?: (params: any) => string | undefined;
     beforeInvoke?: (params: any, context: ToolContext) => void;
-    afterSuccess?: (params: any, response: SpikeJsonSuccess, context: ToolContext) => void;
+    afterSuccess?: (params: any, response: SpikeJsonSuccess, context: ToolContext) => void | Promise<void>;
   },
   invoke: (input: RunSpikeJsonInput) => Promise<SpikeJsonSuccess>,
   options: RegisterSupervisorExtensionOptions,
@@ -491,6 +547,21 @@ function tool(
     executionMode: "sequential",
     renderResult: (result, renderOptions) => renderToolResult(result, renderOptions),
     async execute(_toolCallId, params, signal, _onUpdate, context) {
+      if (options.goalId !== undefined) {
+        await (options.validateProject ?? validateProjectIdentity)(context.cwd, options.projectIdentity!);
+        if (typeof params !== "object" || params === null || Array.isArray(params)) {
+          throw new Error("Goal-scoped planner tool arguments must be an object");
+        }
+        if (definition.name === "spike_status") {
+          if (params.goalId === undefined) params.goalId = options.goalId;
+        }
+        if (definition.name === "spike_begin_step" && params.step === "goal") {
+          throw new Error("Goal-scoped planners cannot select Project-wide Goal guidance");
+        }
+        if (params.goalId !== options.goalId || typeof params.goalId !== "string") {
+          throw new Error(`Goal-scoped planner is restricted to Goal ${options.goalId}`);
+        }
+      }
       definition.beforeInvoke?.(params, context);
       const stdin = definition.stdin?.(params);
       const response = await invoke({
@@ -502,7 +573,7 @@ function tool(
         ...(options.command === undefined ? {} : { command: options.command }),
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       });
-      definition.afterSuccess?.(params, response, context);
+      await definition.afterSuccess?.(params, response, context);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         details: response,
@@ -548,8 +619,14 @@ export function registerSupervisorExtension(
   pi: SupervisorExtensionApi,
   options: RegisterSupervisorExtensionOptions = {},
 ): void {
+  if (options.goalId !== undefined && (typeof options.projectIdentity !== "string" || !options.projectIdentity.trim())) {
+    throw new Error("Goal planner Project identity must not be blank");
+  }
   const invoke = options.invoke ?? runSpikeJson;
   const waitForDone = options.waitForDone ?? runSpikeJson;
+  const assertProjectScope = async (cwd: string): Promise<void> => {
+    if (options.goalId !== undefined) await (options.validateProject ?? validateProjectIdentity)(cwd, options.projectIdentity!);
+  };
   const waiters = new Map<string, AbortController>();
   const notified = new Set<string>();
   let shuttingDown = false;
@@ -584,11 +661,14 @@ export function registerSupervisorExtension(
     selectedStep = undefined;
   };
 
-  const armWorkerWake = (
+  const armWorkerWake = async (
     cwd: string,
     identity: TicketIdentity,
     wakeOptions: { replace?: boolean; notifyUnavailableFailure?: boolean } = {},
-  ): void => {
+  ): Promise<void> => {
+    // A waiter invokes Spike too, so rebind the exact Project immediately
+    // before arming it rather than inheriting a prior tool/startup check.
+    await assertProjectScope(cwd);
     const key = ticketKey(identity);
     if (notified.has(key)) return;
     const existing = waiters.get(key);
@@ -639,14 +719,15 @@ export function registerSupervisorExtension(
     selectedStep = undefined;
     notified.clear();
     try {
+      await assertProjectScope(context.cwd);
       const status = await invoke({
         cwd: context.cwd,
-        args: ["status"],
+        args: options.goalId === undefined ? ["status"] : ["status", "--goal", options.goalId],
         expectedCommand: "status",
         ...(options.command === undefined ? {} : { command: options.command }),
         ...(options.environment === undefined ? {} : { environment: options.environment }),
       });
-      for (const identity of openTicketIdentities(status.data)) armWorkerWake(context.cwd, identity);
+      for (const identity of openTicketIdentities(status.data)) await armWorkerWake(context.cwd, identity);
     } catch {
       // The planner can still recover explicitly through spike_status.
     }
@@ -1036,10 +1117,10 @@ export function registerSupervisorExtension(
         "ticket", "dispatch-pi", "--goal", params.goalId, "--change", params.changeId,
         "--ticket", params.ticketId, "--worker", params.worker,
       ],
-      afterSuccess: (params, response, context) => {
+      afterSuccess: async (params, response, context) => {
         const data = response.data as { hosting?: unknown; status?: unknown } | undefined;
         if (data?.hosting !== "herdr" || data.status !== "working") return;
-        armWorkerWake(context.cwd, {
+        await armWorkerWake(context.cwd, {
           goalId: params.goalId,
           changeId: params.changeId,
           ticketId: params.ticketId,
@@ -1139,7 +1220,22 @@ export function registerSupervisorExtension(
     }, invoke, options),
   ];
 
-  for (const definition of tools) pi.registerTool(definition);
+  const visible = options.goalId === undefined
+    ? tools
+    : tools.filter((definition) => (goalPlannerToolNames as readonly string[]).includes(definition.name));
+  for (const definition of visible) pi.registerTool(definition);
+}
+
+/** Register the fail-closed subset used by a planner owned by one Goal. */
+export function registerGoalPlannerExtension(
+  pi: SupervisorExtensionApi,
+  goalId: string,
+  projectIdentity: string,
+  options: Omit<RegisterSupervisorExtensionOptions, "goalId" | "projectIdentity"> = {},
+): void {
+  if (typeof goalId !== "string" || !goalId.trim()) throw new Error("SPIKE_GOAL_ID must be a non-blank Goal ID");
+  if (typeof projectIdentity !== "string" || !projectIdentity.trim()) throw new Error("SPIKE_PROJECT_IDENTITY must be a non-blank Project identity");
+  registerSupervisorExtension(pi, { ...options, goalId, projectIdentity });
 }
 
 export default function spikeSupervisorExtension(pi: SupervisorExtensionApi): void {

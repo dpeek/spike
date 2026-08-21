@@ -1,0 +1,142 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { createGoal } from "./goal.ts";
+import { goalPlannerIdentity, goalPlannerOperations } from "./goal-planner.ts";
+import type { HerdrAgentStatus, HerdrHandles, HerdrOperations } from "./herdr.ts";
+import { temporaryRepository } from "../test/support/repository.ts";
+
+const repositories: Array<Awaited<ReturnType<typeof temporaryRepository>>> = [];
+afterEach(async () => { await Promise.all(repositories.splice(0).map((repository) => repository.remove())); });
+
+function fakeHerdr(resources: Array<HerdrHandles & { label: string; status: HerdrAgentStatus }>) {
+  const calls: string[] = [];
+  let created = 0;
+  const herdr: HerdrOperations = {
+    async createTab(input) {
+      calls.push(`create:${input.label}`);
+      created += 1;
+      const suffix = created === 1 ? "" : `-${created}`;
+      const resource = { tab: `new-tab${suffix}`, pane: `new-pane${suffix}`, label: input.label, status: "working" as const };
+      resources.push(resource);
+      return resource;
+    },
+    async run(pane, command) { calls.push(`run:${pane}:${command}`); },
+    async status(pane) { return resources.find((resource) => resource.pane === pane)?.status ?? "unavailable"; },
+    async read() { return ""; },
+    async attach(pane) { calls.push(`attach:${pane}`); return 0; },
+    async closeTab(tab) {
+      calls.push(`close:${tab}`);
+      const index = resources.findIndex((resource) => resource.tab === tab);
+      if (index >= 0) resources.splice(index, 1);
+    },
+    async findTabsByLabel(label) { calls.push(`find:${label}`); return resources.filter((resource) => resource.label === label); },
+  };
+  return { herdr, calls };
+}
+
+async function fixture() {
+  const repository = await temporaryRepository();
+  repositories.push(repository);
+  const created = await createGoal({ cwd: repository.root, title: "Goal", outcome: "Bound planners.", approval: "Approved." });
+  return { repository, goalId: created.goal.metadata.goalId };
+}
+
+describe("Goal planner ownership", () => {
+  test("uses a stable repository-qualified identity and reattaches without launch", async () => {
+    const { repository, goalId } = await fixture();
+    const identity = goalPlannerIdentity("file://other/repository", goalId);
+    expect(identity.name).toContain(goalId);
+    expect(goalPlannerIdentity("file://other/repository", goalId)).toEqual(identity);
+    expect(goalPlannerIdentity("file://different/repository", goalId).name).not.toBe(identity.name);
+
+    const actual = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    // Local test repository identity is its canonical git-common directory.
+    const { herdr, calls } = fakeHerdr([{ tab: "tab-1", pane: "pane-1", label: actual.name, status: "working" }]);
+    const result = await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr });
+    expect(result.state).toBe("live");
+    expect(calls.some((call) => call.startsWith("create:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("run:"))).toBe(false);
+  });
+
+  test("launches one persistent named scoped Pi and cleans stale resources", async () => {
+    const { repository, goalId } = await fixture();
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const { herdr, calls } = fakeHerdr([{ tab: "old-tab", pane: "old-pane", label: identity.name, status: "done" }]);
+    const result = await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr, piExecutable: "pi binary'; touch never" });
+    expect(result).toMatchObject({ state: "live", resources: [{ tab: "new-tab", pane: "new-pane" }] });
+    expect(calls).toContain("close:old-tab");
+    const command = calls.find((call) => call.startsWith("run:"))!;
+    expect(command).toContain("--name");
+    expect(command).toContain(identity.name);
+    expect(command).toContain("'pi binary'\\''; touch never'");
+    expect(command).toContain("pi-goal-planner-extension.ts");
+    expect(command).toContain("spike_create_change");
+    expect(command).not.toContain("spike_create_goal");
+  });
+
+  test("refuses duplicate live resources without close or launch and replacement closes all", async () => {
+    const { repository, goalId } = await fixture();
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const { herdr, calls } = fakeHerdr([
+      { tab: "tab-1", pane: "pane-1", label: identity.name, status: "working" },
+      { tab: "tab-2", pane: "pane-2", label: identity.name, status: "idle" },
+    ]);
+    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr })).rejects.toThrow("multiple live Goal planners");
+    expect(calls.some((call) => call.startsWith("close:") || call.startsWith("create:"))).toBe(false);
+    await goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr });
+    expect(calls).toEqual(expect.arrayContaining(["close:tab-1", "close:tab-2"]));
+  });
+
+  test("refuses a second live Goal planner in the same Project without closing it", async () => {
+    const { repository, goalId } = await fixture();
+    const other = await createGoal({ cwd: repository.root, title: "Other", outcome: "Remain exclusive.", approval: "Approved." });
+    const otherIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, other.goal.metadata.goalId);
+    const { herdr, calls } = fakeHerdr([{ tab: "other-tab", pane: "other-pane", label: otherIdentity.name, status: "working" }]);
+    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("refusing a second Project planner");
+    expect(calls).toContain(`find:${otherIdentity.name}`);
+    expect(calls.some((call) => call.startsWith("create:") || call === "close:other-tab")).toBe(false);
+  });
+
+  test("refuses cross-Goal live projections before reattachment or repeated replacement side effects", async () => {
+    const { repository, goalId } = await fixture();
+    const other = await createGoal({ cwd: repository.root, title: "Other", outcome: "Remain exclusive.", approval: "Approved." });
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const otherIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, other.goal.metadata.goalId);
+    const { herdr, calls } = fakeHerdr([
+      { tab: "selected-tab", pane: "selected-pane", label: identity.name, status: "working" },
+      { tab: "other-tab", pane: "other-pane", label: otherIdentity.name, status: "working" },
+    ]);
+
+    await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("refusing a second Project planner");
+    await expect(goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("refusing a second Project planner");
+    await expect(goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr }))
+      .rejects.toThrow("refusing a second Project planner");
+
+    expect(calls.filter((call) => call.startsWith("close:") || call.startsWith("create:") || call.startsWith("run:"))).toEqual([]);
+    expect(calls.filter((call) => call === `find:${otherIdentity.name}`)).toHaveLength(3);
+  });
+
+  test("repeated stale cleanup and replacement close only matching resources once", async () => {
+    const { repository, goalId } = await fixture();
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const { herdr, calls } = fakeHerdr([{ tab: "stale-tab", pane: "stale-pane", label: identity.name, status: "done" }]);
+    await goalPlannerOperations.startOrReattach({ cwd: repository.root, goalId, herdr });
+    await goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr });
+    await goalPlannerOperations.replace({ cwd: repository.root, goalId, herdr });
+    expect(calls.filter((call) => call === "close:stale-tab")).toEqual(["close:stale-tab"]);
+    expect(calls.filter((call) => call.startsWith("close:new-tab"))).toEqual(["close:new-tab", "close:new-tab-2"]);
+    expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(3);
+  });
+
+  test("refuses unknown Goals before Herdr side effects and malformed handles", async () => {
+    const { repository } = await fixture();
+    const { herdr, calls } = fakeHerdr([]);
+    await expect(goalPlannerOperations.observe({ cwd: repository.root, goalId: "spike-999", herdr })).rejects.toThrow();
+    expect(calls).toEqual([]);
+    const goalId = "spike-001";
+    const bad: HerdrOperations = { ...herdr, findTabsByLabel: async () => [{ tab: "bad tab", pane: "pane" }] };
+    await expect(goalPlannerOperations.observe({ cwd: repository.root, goalId, herdr: bad })).rejects.toThrow("invalid tab handle");
+  });
+});

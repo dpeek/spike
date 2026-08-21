@@ -3,7 +3,9 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  registerGoalPlannerExtension,
   registerSupervisorExtension,
+  goalPlannerToolNames,
   renderSupervisorResponse,
   runSpikeJson,
   supervisorToolNames,
@@ -446,6 +448,60 @@ describe("Pi supervisor extension", () => {
       body: "# Restarted\n",
     }, undefined, undefined, context)).rejects.toThrow("Call spike_begin_step for plan on goal-1");
     expect(calls.at(-1)!.args).toEqual(["status"]);
+  });
+
+  test("Goal planner extension registers only scoped operations and rejects cross-Goal calls before Spike", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    registerGoalPlannerExtension({ registerTool(tool) { tools.push(tool); }, on() {}, sendMessage() {} }, "goal-1", "file://selected/.git", {
+      validateProject: async (cwd, identity) => {
+        expect(cwd).toBe("/project");
+        expect(identity).toBe("file://selected/.git");
+      },
+      async invoke(input) { calls.push(input); return { ok: true, command: input.expectedCommand, data: {} }; },
+    });
+    expect(tools.map((tool) => tool.name)).toEqual([...goalPlannerToolNames]);
+    expect(tools.some((tool) => tool.name === "spike_create_goal" || tool.name === "spike_apply_goal")).toBe(false);
+    const scoped = new Map(tools.map((tool) => [tool.name, tool]));
+    await expect(scoped.get("spike_revise_plan")!.execute("call", { goalId: "other", body: "# no" }, undefined, undefined, { cwd: "/project" }))
+      .rejects.toThrow("restricted to Goal goal-1");
+    await expect(scoped.get("spike_begin_step")!.execute("call", { step: "goal" }, undefined, undefined, { cwd: "/project" }))
+      .rejects.toThrow("cannot select Project-wide");
+    expect(calls).toEqual([]);
+    await scoped.get("spike_status")!.execute("call", {}, undefined, undefined, { cwd: "/project" });
+    expect(calls[0]!.args).toEqual(["status", "--goal", "goal-1"]);
+  });
+
+  test("Goal startup binds its Project for scoped status and waiter calls, and mismatches invoke nothing", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const waits: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    const handlers = new Map<string, (event: unknown, context: { cwd: string }) => void | Promise<void>>();
+    registerGoalPlannerExtension({
+      registerTool(tool) { tools.push(tool); }, on(event, handler) { handlers.set(event, handler); }, sendMessage() {},
+    }, "goal-1", "file://selected/.git", {
+      validateProject: async (cwd, identity) => {
+        if (cwd !== "/selected" || identity !== "file://selected/.git") throw new Error("wrong Project");
+      },
+      async invoke(input) {
+        calls.push(input);
+        return { ok: true, command: "status", data: { goalId: "goal-1", currentChange: { changeId: "001", openTicket: { ticketId: "002" } } } };
+      },
+      async waitForDone(input) {
+        waits.push(input);
+        return { ok: true, command: "worker wait", data: {} };
+      },
+    });
+    await handlers.get("session_start")!({}, { cwd: "/other-project" });
+    await expect(tools.find((tool) => tool.name === "spike_status")!.execute("call", {}, undefined, undefined, { cwd: "/other-project" }))
+      .rejects.toThrow("wrong Project");
+    expect(calls).toEqual([]);
+    expect(waits).toEqual([]);
+
+    await handlers.get("session_start")!({}, { cwd: "/selected" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(["status", "--goal", "goal-1"]);
+    expect(waits[0]!.args).toEqual(["worker", "wait", "--goal", "goal-1", "--change", "001", "--ticket", "002"]);
   });
 
   test("forwards Request commands and stdin without consuming Goal guidance", async () => {

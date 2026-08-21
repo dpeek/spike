@@ -20,6 +20,7 @@ import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
 import { closeRequest, createRequest, listRequests, loadRequest, requestDataRoot, type ClosureDisposition } from "./request.ts";
 import { launchPlanner } from "./planner.ts";
+import { goalPlannerOperations } from "./goal-planner.ts";
 import {
   loadSubmissionOutcome,
   publishBlockedReport,
@@ -54,6 +55,10 @@ export function usage(): string {
 
 Usage:
   spike planner
+  spike planner start-or-reattach --goal <goal-id> [--json]
+  spike planner observe --goal <goal-id> [--json]
+  spike planner attach --goal <goal-id>
+  spike planner replace --goal <goal-id> [--json]
   spike project activate
   spike status [--goal <goal-id>] [--json]
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
@@ -125,6 +130,9 @@ Ticket issuance options:
   --clear-credentials            Override configured credential grants with none
   --model <model>                Override the role's configured model for this Ticket
   --thinking <level>             Override thinking: off, minimal, low, medium, high, or xhigh
+
+Goal planner options:
+  --goal <goal-id>             Existing Goal owned by the planner
 
 Pi dispatch options:
   --worker <identity>             Worker identity recorded in Report provenance
@@ -601,6 +609,11 @@ function parseReportPublish(args: string[]): {
   };
 }
 
+function parseGoalPlanner(args: string[]): { goalId: string } {
+  if (args.length !== 2 || args[0] !== "--goal") throw new UsageError(args.length === 0 ? "--goal is required" : `unknown planner option: ${args[0]}`);
+  return { goalId: valueAfter(args, 0, "--goal") };
+}
+
 function parseStatus(args: string[]): { goalId?: string } {
   if (args.length === 0) return {};
   if (args.length !== 2 || args[0] !== "--goal") throw new UsageError(`unknown status option: ${args[0]}`);
@@ -791,12 +804,26 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     }
 
     if (args[0] === "planner") {
-      if (args.length !== 1) throw new UsageError(`unknown planner option: ${args[1]}`);
-      if (json) throw new UsageError("planner does not support --json");
-      return launchPlanner({
-        cwd,
-        ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
-      });
+      if (args.length === 1) {
+        if (json) throw new UsageError("planner does not support --json");
+        return launchPlanner({
+          cwd,
+          ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
+        });
+      }
+      const action = args[1];
+      if (!["start-or-reattach", "observe", "attach", "replace"].includes(action ?? "")) {
+        throw new UsageError(`unknown planner option: ${action}`);
+      }
+      if (action === "attach" && json) throw new UsageError("planner attach does not support --json");
+      const input = { cwd, ...parseGoalPlanner(args.slice(2)) };
+      if (action === "attach") return goalPlannerOperations.attach(input);
+      const result = action === "observe"
+        ? await goalPlannerOperations.observe(input)
+        : action === "replace"
+          ? await goalPlannerOperations.replace(input)
+          : await goalPlannerOperations.startOrReattach(input);
+      return success(json, `planner ${action}`, result, `Goal planner ${result.name}: ${result.state}\n`);
     }
 
     if (args[0] === "status") {

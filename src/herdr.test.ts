@@ -34,6 +34,40 @@ console.log(JSON.stringify([
     }
   });
 
+  test("reconstructs exact matching planner panes from Herdr 0.8.2 list envelopes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "spike-herdr-discovery-"));
+    try {
+      const fakeHerdr = join(directory, "herdr");
+      const calls = join(directory, "calls");
+      await Bun.write(fakeHerdr, `#!/bin/sh
+printf '%s %s %s %s\\n' "$1" "$2" "$3" "$4" >> "$HERDR_CALLS"
+case "$1:$2" in
+  tab:list) printf '%s\\n' '{"result":{"tabs":[{"tab_id":"tab-match","label":"spike-goal-goal-1-identity","workspace_id":"workspace"},{"tab_id":"tab-other","label":"unrelated","workspace_id":"workspace"}]}}' ;;
+  pane:list) printf '%s\\n' '{"result":{"panes":[{"pane_id":"pane-match","tab_id":"tab-match"},{"pane_id":"pane-other","tab_id":"tab-other"}]}}' ;;
+  *) exit 9 ;;
+esac
+`);
+      await chmod(fakeHerdr, 0o755);
+      const moduleUrl = pathToFileURL(`${import.meta.dir}/herdr.ts`).href;
+      const script = `
+import { herdrOperations } from ${JSON.stringify(moduleUrl)};
+console.log(JSON.stringify(await herdrOperations.findTabsByLabel("spike-goal-goal-1-identity")));
+`;
+      const child = Bun.spawn(["bun", "-e", script], {
+        env: { ...process.env, SPIKE_HERDR_BIN: fakeHerdr, HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace", HERDR_CALLS: calls },
+        stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout)).toEqual([{ tab: "tab-match", pane: "pane-match" }]);
+      expect((await Bun.file(calls).text()).trim().split("\n")).toEqual([
+        "tab list --workspace workspace", "pane list --workspace workspace",
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a non-interactive caller before invoking Herdr", async () => {
     const moduleUrl = pathToFileURL(`${import.meta.dir}/herdr.ts`).href;
     const script = `

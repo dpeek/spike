@@ -143,7 +143,8 @@ spike worker attach --goal <goal-id> --change 001 --ticket 001
 ```
 
 Herdr `working`, `blocked`, `done`, or unavailable status and terminal output
-cannot complete the Ticket or publish a Report. `worker wait` emits one operational
+cannot complete the Ticket or publish a Report. Planner ownership follows the same
+rule: it is an operational projection, not durable workflow evidence or a lease. `worker wait` emits one operational
 notification only after the attended execution marker exists: for workspace
 hosting, the wrapper records local Pi exit; for Docker, the adapter-owned,
 restartable exact-container observer records actual exit after `docker wait` and
@@ -203,13 +204,34 @@ A completed review or blocked Report needs no commit message options. To seal a
 worker failure instead, use `--failure "<reason>"`. Report publication returns
 worker cleanup status and retains a warning when finalization must be retried.
 
-The direct planner launcher starts interactive Pi with the configured `planner`
-model and thinking level. It disables extension discovery, explicitly loads only
-`src/pi-supervisor-extension.ts`, and passes Spike's executable to that extension:
+A Project supervisor owns Project-wide workflow operations. For one existing Goal,
+it can own one replaceable Herdr-hosted planner. Its deterministic human-readable
+name includes the exact repository identity digest and Goal ID, so matching labels
+cannot be confused merely because two repositories share a Project slug. The same
+name is used for Herdr tab discovery, the tab label, and Pi's persistent `--name`.
 
 ```bash
-spike planner
+spike planner start-or-reattach --goal spike-001 --json
+spike planner observe --goal spike-001 --json
+spike planner attach --goal spike-001
+spike planner replace --goal spike-001 --json
 ```
+
+Start-or-reattach returns one exact live planner without launching another Pi.
+Duplicate live labels are refused without closing either pane; `replace` is the
+explicit operation that idempotently closes every exact matching tab and starts a
+fresh named Pi session. Done or unavailable matching resources are stale operational
+projections and are cleaned before a replacement. Reattachment preserves the live Pi
+conversation; replacement begins only from durable Goal, Plan, Ticket, Report,
+decision, and Git evidence. Neither operation reads Pi JSONL, terminal text, process
+exit, or Herdr state as workflow evidence, and neither invokes Spike recovery.
+
+The launched Pi disables extension discovery, loads only
+`src/pi-goal-planner-extension.ts`, allows only read/grep/find/ls plus Goal-scoped
+planner tools, and receives its exact Goal ID through the launch environment. Those
+tools reject a different Goal before invoking `spike`; they omit Project-wide Goal
+creation, Request inbox, and Goal application operations. `spike planner` remains
+the direct Project-supervisor launcher for interactive local operation.
 
 The supervisor extension exposes sequential structured tools for committed
 guidance selection, explicitly approved Goal creation, status, Plan revision,

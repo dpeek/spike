@@ -23,6 +23,8 @@ export type HerdrOperations = {
   read: (pane: string, input?: ReadHerdrTerminalInput) => Promise<string>;
   attach: (pane: string) => Promise<number>;
   closeTab: (tab: string) => Promise<void>;
+  /** Exact label discovery is operational only; callers must not infer state from terminal text. */
+  findTabsByLabel?: (label: string) => Promise<HerdrHandles[]>;
 };
 
 type HerdrEnvelope = {
@@ -141,5 +143,35 @@ export const herdrOperations: HerdrOperations = {
       if (error instanceof HerdrCommandError && error.code === "tab_not_found") return;
       throw error;
     }
+  },
+
+  async findTabsByLabel(label) {
+    if (typeof label !== "string" || !label.trim()) throw new Error("Herdr label must not be blank");
+    if (process.env["HERDR_ENV"] !== "1") throw new Error("Herdr planner discovery requires a Herdr-managed planner pane");
+    const workspace = process.env["HERDR_WORKSPACE_ID"];
+    if (!workspace) throw new Error("Herdr planner discovery cannot identify the planner workspace");
+    const response = envelope((await command(["tab", "list", "--workspace", workspace])).stdout);
+    const tabs = response.result?.["tabs"];
+    if (!Array.isArray(tabs)) throw new Error("Herdr did not return tab listings");
+    // Herdr 0.8.2's tab.list deliberately returns TabInfo, not a root pane.
+    // A newly created planner tab has one pane; reconstruct that opaque pane
+    // through the public pane.list envelope rather than assuming a hidden tab
+    // list field exists.
+    const matchingTabs = tabs.filter((entry): entry is Record<string, unknown> =>
+      typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["label"] === label,
+    ).map((tab) => requireHandle(tab["tab_id"], "tab"));
+    if (matchingTabs.length === 0) return [];
+    const paneResponse = envelope((await command(["pane", "list", "--workspace", workspace])).stdout);
+    const panes = paneResponse.result?.["panes"];
+    if (!Array.isArray(panes)) throw new Error("Herdr did not return pane listings");
+    return matchingTabs.map((tab) => {
+      const matchingPanes = panes.filter((entry): entry is Record<string, unknown> =>
+        typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["tab_id"] === tab,
+      );
+      if (matchingPanes.length !== 1) {
+        throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
+      }
+      return { tab, pane: requireHandle(matchingPanes[0]!["pane_id"], "pane") };
+    });
   },
 };

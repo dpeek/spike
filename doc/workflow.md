@@ -28,6 +28,32 @@ Goal
 
 This model preserves durable evidence, resumability, exact Git provenance, and independent review with a small sequential workflow.
 
+## Goal planner ownership
+
+A Project supervisor is the only Project-wide planner authority. It may start,
+discover, observe, attach to, or explicitly replace one Herdr-hosted Pi planner for
+one selected existing Goal. The planner identity is a deterministic readable name
+formed from the exact registered repository identity and Goal ID (with a stable
+identity digest); that exact name is the Herdr discovery label, tab label, Pi session
+`--name`, and operational projection key. A Project slug alone is never discovery
+authority.
+
+`spike planner start-or-reattach --goal <goal>` exact-discovers first. One live
+matching resource is reattached without a new Pi process or workflow-document
+mutation. Multiple live exact matches are surfaced and refused without closing any
+of them. `spike planner replace --goal <goal>` is the only explicit replacement: it
+idempotently closes every exact matching tab, including stale done/unavailable
+resources, then launches one fresh persistent interactive named Pi. `observe` and
+`attach` are read/terminal operations and never mutate durable workflow state.
+
+The Goal planner receives only its exact Goal ID and a thin Goal-scoped extension.
+It can use guidance, status, Plan, Change, Ticket, Report, worker observation,
+Change decision, and recovery operations only with that Goal ID. Cross-Goal IDs and
+Project-wide operations are rejected before the extension invokes the CLI. Its live
+conversation is useful solely for reattachment. A replacement reconstructs context
+from durable evidence; Pi JSONL, terminal text, Pi/session identity, process exit,
+and Herdr lifecycle are never workflow evidence and are not Spike recovery.
+
 ## Attended Docker execution
 
 Container Tickets retain Docker isolation. If the dispatching planner is Herdr-managed, Spike creates a new Herdr tab and starts headed Pi in an interactive Docker TTY; otherwise Docker dispatch is headless, and direct hosting can always be selected explicitly. Status, bounded terminal reads, and attachment are keyed by immutable Ticket identity. They are operational projections only. The adapter-owned, restartable Docker observer emits its actual-exit wake-up marker only after `docker wait`; the Herdr wrapper owns attachment only, so an attach disconnect or Herdr tab state cannot complete work. On recovery the marker-backed waiter is re-armed; Report publication still validates only declared exchange output. Stop and cleanup stop the container before retiring the tab and temporary wrapper directory, and are idempotent.
