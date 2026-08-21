@@ -1,14 +1,18 @@
 # Phase 2 dogfood
 
-## Attended safety
+## Execution safety and agent assignment
 
-Use only a disposable repository. The Phase 2 local-clone adapter provides workspace separation, not security isolation. Ticket issuance must explicitly acknowledge `--network-access unrestricted`. Do not grant valuable credentials.
+Use only a disposable repository for a workspace Ticket. The local-clone workspace adapter provides workspace separation, not security isolation, and can run only Tickets with `networkAccess: "unrestricted"` and no credential grants. Do not grant valuable credentials to workspace Tickets.
+
+Tracked `spike.json` uses strict `agents` defaults: `planner` has only `model` and `thinking`; `implement` and `review` additionally have `isolation`, `networkAccess`, and `credentialGrants`. Remediation uses the `implement` defaults. Credential grants are identifiers, never secrets. The normal project defaults select container isolation (and this Project selects the `openai-codex` grant); a container Ticket's policy comes from those defaults unless it is explicitly overridden when issued.
+
+`--model`, `--thinking`, `--isolation`, `--network-access`, repeated `--credential`, and `--clear-credentials` are optional one-Ticket issuance overrides, not required acknowledgements. With no such flags, issuance uses the applicable agent defaults. Workspace isolation requires the *resolved* `networkAccess` value to be `unrestricted` and credential grants to be empty. The tracked defaults already resolve network access to `unrestricted`, so the minimum workspace override from those container defaults is `--isolation workspace --clear-credentials`; adding `--network-access unrestricted` is redundant (but remains an optional explicit override). Container Tickets dispatch through direct mode by default; workspace Tickets dispatch through attended Herdr by default. Issuance freezes the resolved model and thinking at the Ticket top level and its execution policy in `ticket.md`; dispatch uses those immutable settings and does not reread `spike.json` or accept overrides.
 
 ## Real-Pi Goal procedure
 
-From a Herdr-managed planner pane. The shell commands below remain valid raw operator commands. When exercising the supervisor, call `spike_begin_step` and read its exact committed Markdown immediately before each Goal, Plan, Change, Implement, Review, Remediate, Decide, or Recover mutation; verify a matching mutation consumes the selection and planner restart discards it.
+From a Herdr-managed planner pane. The shell commands below remain valid raw operator commands. The procedure exercises the configured container defaults and therefore direct dispatch. To exercise attended workspace dispatch instead, issue each Ticket with the explicit workspace override described above. When exercising the supervisor, call `spike_begin_step` and read its exact committed Markdown immediately before each Goal, Plan, Change, Implement, Review, Remediate, Decide, or Recover mutation; verify a matching mutation consumes the selection and planner restart discards it.
 
-1. Create a temporary Git repository with one initial commit, a tracked `spike.json` containing a stable Project slug plus planner, `implement`, and `review` model defaults, and all eight tracked files under `spike/guidance/`.
+1. Create a temporary Git repository with one initial commit, a tracked `spike.json` containing a stable Project slug and `agents` defaults for planner, implement, and review, and all eight tracked files under `spike/guidance/`.
 2. Create the approved Goal:
    ```sh
    spike goal create --title "..." --outcome "..." --approval "..." --json
@@ -18,37 +22,42 @@ From a Herdr-managed planner pane. The shell commands below remain valid raw ope
    spike change create --goal <goal> --title "..." --intent "..." \
      --rationale "..." --acceptance "..." --json
    ```
-4. Issue implementation Ticket `001`:
+4. Issue implementation Ticket `001` from its configured `implement` defaults:
    ```sh
    spike ticket issue --goal <goal> --change 001 --role implement \
-     --instruction "..." --network-access unrestricted --json
+     --instruction "..." --json
    ```
-   Confirm `ticket.md` freezes the configured implementation model/thinking and exact Change base.
-5. Dispatch a fresh headed real Pi worker in Herdr:
+   Confirm `ticket.md` freezes the configured implementation model/thinking, container execution policy, and exact Change base. To test a one-Ticket override, add only the intended optional flags; use the complete workspace override from the assignment section when selecting workspace isolation.
+5. Dispatch a fresh real Pi worker using the Ticket's frozen default container policy:
    ```sh
    spike ticket dispatch-pi --goal <goal> --change 001 --ticket 001 \
      --worker pi-implementer --json
    ```
-   Confirm the ephemeral tab shows Pi's interactive TUI and that the immutable Ticket/context prompt was submitted automatically. The launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
-6. Observe with `spike worker status` and `spike worker read`, then exercise `spike worker attach` from a real TTY and detach without ending the worker. Treat all terminal interaction as operational only. A rejected completion remains in the same headed Ticket for retry. An accepted completion ends the turn and asks Pi to shut down gracefully. Do not poll from the planner: the supervisor's one-shot waiter should wake it with a full-identity operational recheck only after the wrapper execution marker records Pi's exit. Confirm the planner calls `spike_status`; terminal, wake-message, or Herdr agent state does not complete the Ticket.
+   Confirm direct dispatch uses the immutable Ticket/context prompt and role completion extension. It must not reread changed project defaults. A workspace-issued Ticket instead opens the attended Herdr TUI; that launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
+6. The default direct dispatch completes synchronously and returns its completion classification. It has no terminal to read, marker-backed supervisor wake-up, or Herdr tab to attach or close. Confirm the returned classification and that the direct worker used the immutable Ticket/context prompt and role completion extension. A workspace-issued Ticket instead has attended lifecycle: observe it with `spike worker status` and `spike worker read`, and exercise `spike worker attach` from a real TTY and detach without ending the worker. Treat terminal interaction as operational only. A rejected completion remains in the same Ticket for retry; an accepted completion asks Pi to shut down gracefully. Do not poll from the planner: only for attended Herdr hosting, the supervisor's one-shot waiter wakes it with a full-identity operational recheck after the wrapper execution marker records Pi's exit. Confirm the planner calls `spike_status`; terminal, wake-message, or Herdr agent state does not complete the Ticket.
 7. Publish the implementation Report and normalized Candidate:
    ```sh
    spike report publish --goal <goal> --change 001 --ticket 001 \
      --commit-summary "..." --json
    ```
    Confirm the Candidate parent equals the Change base, the Report records worker and Candidate revisions, the host branch is unchanged, and worker cleanup is finalized.
-8. Issue review Ticket `002` for the current Candidate and producing implementation Ticket:
+8. Issue review Ticket `002` for the current Candidate and producing implementation Ticket from its configured `review` defaults:
    ```sh
    spike ticket issue --goal <goal> --change 001 --role review \
-     --implementation-ticket 001 --instruction "..." \
-     --network-access unrestricted --json
+     --implementation-ticket 001 --instruction "..." --json
    ```
-9. Dispatch a fresh real Pi reviewer and let the marker-backed notification wake the planner, then inspect staging `submission.md`. Confirm the planner rechecks `spike_status`, and that the Submission assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket.
+   Confirm its separately resolved model, thinking, and container execution policy are frozen in `ticket.md`.
+9. Dispatch a fresh real Pi reviewer using that frozen default container policy:
+   ```sh
+   spike ticket dispatch-pi --goal <goal> --change 001 --ticket 002 \
+     --worker pi-reviewer --json
+   ```
+   Direct dispatch returns synchronously with its completion classification; then inspect staging `submission.md`. Confirm that the Submission assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket. For an explicitly workspace-issued review Ticket, use the attended observation, marker-backed wake-up, and `spike_status` recheck described in step 6 instead.
 10. Publish the review Report:
     ```sh
     spike report publish --goal <goal> --change 001 --ticket 002 --json
     ```
-    Confirm the verdict is `approve`, cleanup is finalized, and the ephemeral tab closes.
+    Confirm the verdict is `approve` and cleanup is finalized. For attended workspace/Herdr hosting, also confirm finalization closes the ephemeral tab; direct dispatch has no Herdr tab.
 11. Land the approved Candidate:
     ```sh
     spike change land --goal <goal> --change 001 --statement "..." --json
