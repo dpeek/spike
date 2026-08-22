@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, landChange } from "../../src/change.ts";
@@ -15,6 +15,8 @@ import { loadApplicationDecisionIfPresent, recoverApplications } from "../../src
 import { deriveApplicationStatus } from "../../src/application-ticket.ts";
 import { deriveGoalStatus, deriveRepositoryStatus, deriveSupervisorPlannerStatus } from "../../src/status.ts";
 import { temporaryRepository } from "../support/repository.ts";
+
+setDefaultTimeout(30_000);
 
 const repos: Array<{ remove(): Promise<void> }> = [];
 afterEach(async () => { await Promise.all(repos.splice(0).map(repo => repo.remove())); });

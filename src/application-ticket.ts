@@ -157,6 +157,13 @@ export async function issueApplicationTicket(input: Omit<IssueApplicationTicketI
   return { root: repository.root, ticket: { metadata, body: document } };
 }
 async function exists(path: string) { try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; } }
+async function removeApplicationExchange(root: string, identity: ApplicationTicketIdentity): Promise<void> {
+  const exchange = applicationExchangePath(root, identity);
+  // Preparation makes input read-only. Restore directory write permission so
+  // recursive removal can unlink its children reliably, especially on APFS.
+  await chmod(join(exchange, "input"), 0o700).catch((error) => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  await rm(exchange, { recursive: true, force: true });
+}
 export async function applicationCleanupWarnings(root: string, goalId: string, applicationId: string): Promise<string[]> {
   const warnings: string[] = [];
   for (const ticketId of await listApplicationTicketIds(root, goalId, applicationId)) {
@@ -344,7 +351,7 @@ export async function deriveApplicationStatus(cwd: string, goalId: string, appli
 /** Retryable operational cleanup does not publish or rewrite any Application evidence. */
 export async function cleanupApplicationTicketRuntime(cwd: string, goalId: string, applicationId: string, ticketId: string): Promise<{ root: string }> {
   const repository = await discoverRepository(cwd);
-  await rm(applicationExchangePath(repository.root, { goalId, applicationId, ticketId }), { recursive: true, force: true });
+  await removeApplicationExchange(repository.root, { goalId, applicationId, ticketId });
   await (await import("./application-worker.ts")).cleanupApplicationWorker(repository.root, { goalId, applicationId, ticketId });
   const quarantines = await git(repository.root, ["for-each-ref", "--format=%(refname)", `refs/spike/quarantine/goals/${goalId}/applications/${applicationId}/tickets/${ticketId}/`]);
   for (const ref of quarantines.split("\n").filter(Boolean)) await git(repository.root, ["update-ref", "-d", ref]);
@@ -368,7 +375,7 @@ export async function recoverApplicationTicket(cwd: string, goalId: string, appl
     const metadata = applicationReportSchema.parse({ kind: "application-report", goalId, applicationId, ticketId, role: "implement", outcome: "interrupted", publishedAt: new Date().toISOString(), targetRevision: ticket.metadata.targetRevision, goalRevision: ticket.metadata.goalRevision, mergeBase: ticket.metadata.mergeBase, integrationClassification: ticket.metadata.integration.classification, inputRevision: ticket.metadata.inputRevision, artifacts: [], execution: { adapter: "configured-application-adapter", isolation: ticket.metadata.executionPolicy.isolation, worker: "interrupted", model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt: ticket.metadata.issuedAt, finishedAt: new Date().toISOString() } });
     await installImmutable(repository.root, path, serializeDocument(metadata, `# Application Ticket interrupted\n\n${text(reason, "Interruption reason")}\n`));
   }
-  await rm(applicationExchangePath(repository.root, identity), { recursive: true, force: true });
+  await removeApplicationExchange(repository.root, identity);
   // Retention is derived from Reports: clear an unreported ref left between
   // normalization and Report publication, then rebuild only reported objects.
   const prefix = `refs/spike/goals/${goalId}/applications/${applicationId}/`;

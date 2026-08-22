@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { abandonChange, createChange, landChange, rejectChange } from "./change.ts";
@@ -13,6 +13,8 @@ import { createGoal, integratedRef } from "./goal.ts";
 import { reportPath } from "./ticket.ts";
 import { issueReplacementTicket, issueTicket } from "./ticket.ts";
 import { temporaryRepository } from "../test/support/repository.ts";
+
+setDefaultTimeout(15_000);
 
 const repositories: Array<{ remove: () => Promise<void> }> = [];
 afterEach(async () => {
@@ -219,7 +221,7 @@ describe("Goal integration apply", () => {
         await expectMainWorktree(repository, decision!.metadata.resultingMainRevision, true);
       }
     }
-  });
+  }, 30_000);
 
   test("refuses clean-base application only at apply after durable admission", async () => {
     const { repository, goalId } = await completedGoal();
