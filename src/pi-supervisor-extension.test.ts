@@ -348,7 +348,10 @@ describe("Pi supervisor extension", () => {
     const tools = registeredTools(fake.executable, { ...process.env, FAKE_SPIKE_CALLS: fake.calls });
 
     expect([...tools.keys()]).toEqual([...supervisorToolNames]);
-    for (const definition of tools.values()) expect(definition.executionMode).toBe("sequential");
+    for (const definition of tools.values()) {
+      expect(definition.executionMode).toBe("sequential");
+      expect(definition.renderCall({}, undefined, undefined).render(80)).toEqual([]);
+    }
     expect(tools.has("spike_issue_ticket")).toBe(false);
     expect(tools.get("spike_create_goal")!.parameters).toMatchObject({ required: ["title", "outcome", "approval"] });
     expect(tools.get("spike_issue_review")!.parameters).toMatchObject({

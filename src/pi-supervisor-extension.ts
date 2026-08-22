@@ -42,6 +42,11 @@ type ToolDefinition = {
     onUpdate: unknown,
     context: ToolContext,
   ) => Promise<ToolResult>;
+  renderCall: (
+    args: unknown,
+    theme: unknown,
+    context: unknown,
+  ) => RenderComponent;
   renderResult: (
     result: ToolRenderResult,
     options: { expanded: boolean; isPartial: boolean },
@@ -454,6 +459,10 @@ function textComponent(text: string): RenderComponent {
   };
 }
 
+function emptyComponent(): RenderComponent {
+  return { render: () => [], invalidate() {} };
+}
+
 function renderToolResult(result: ToolRenderResult, options: { expanded: boolean; isPartial: boolean }): RenderComponent {
   if (options.isPartial) return textComponent("Working…");
   if (result.details?.ok === true) {
@@ -605,7 +614,7 @@ function repeated(args: string[], option: string, values: string[] | undefined):
 }
 
 function tool(
-  definition: Omit<ToolDefinition, "executionMode" | "execute" | "renderResult"> & {
+  definition: Omit<ToolDefinition, "executionMode" | "execute" | "renderCall" | "renderResult"> & {
     command: string | ((params: any) => string);
     args: (params: any) => string[];
     stdin?: (params: any) => string | undefined;
@@ -623,6 +632,7 @@ function tool(
     ...(definition.promptGuidelines === undefined ? {} : { promptGuidelines: definition.promptGuidelines }),
     parameters: definition.parameters,
     executionMode: "sequential",
+    renderCall: () => emptyComponent(),
     renderResult: (result, renderOptions) => renderToolResult(result, renderOptions),
     async execute(_toolCallId, params, signal, _onUpdate, context) {
       if (options.goalId !== undefined) {
