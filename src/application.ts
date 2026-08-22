@@ -106,7 +106,7 @@ export async function listProjectApplications(root: ProjectPaths): Promise<Queue
   for (let index = 1; index < entries.length; index++) if (entries[index - 1]!.metadata.queuePosition === entries[index]!.metadata.queuePosition) throw new Error("Application queue has duplicate immutable positions");
   return entries;
 }
-/** Validate an Application's decision against the exact checked-out main projection. */
+/** Validate an Application's decision against the current main history. */
 export async function applicationState(root: ProjectPaths, application: QueuedApplication): Promise<ApplicationEvidenceState> {
   if (application.invalidDecision === true) return "inconsistent";
   if (application.decision === undefined) return "incomplete";
@@ -115,10 +115,10 @@ export async function applicationState(root: ProjectPaths, application: QueuedAp
   try { current = await main(root); } catch { return "inconsistent"; }
   if (current === application.decision.metadata.resultingMainRevision) return "applied";
   if (current === application.decision.metadata.expectedPreviousMainRevision) return isReviewedDecision(application.decision) ? "decision-pending" : "incomplete";
-  // After a reviewed CAS has reached C, a later FIFO squash necessarily makes
-  // C an ancestor. Historical owners stay applied; only an unrelated target
-  // movement while the owner is pending is a target mismatch.
-  if (isReviewedDecision(application.decision) && await git(root.root, ["merge-base", "--is-ancestor", application.decision.metadata.resultingMainRevision, current]).then(() => true).catch(() => false)) return "applied";
+  // After any valid decision has reached C, a later FIFO squash necessarily
+  // makes C an ancestor. Historical owners stay applied; only unrelated target
+  // movement fails closed.
+  if (await git(root.root, ["merge-base", "--is-ancestor", application.decision.metadata.resultingMainRevision, current]).then(() => true).catch(() => false)) return "applied";
   return isReviewedDecision(application.decision) ? "target-mismatch" : "inconsistent";
 }
 

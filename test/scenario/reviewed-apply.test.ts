@@ -11,8 +11,9 @@ import { issueApplicationTicket, publishApplicationImplementationReport, recover
 import { dispatchApplicationWorker } from "../../src/application-worker.ts";
 import { issueApplicationReviewTicket, publishApplicationReviewReport } from "../../src/application-review.ts";
 import { dispatchApplicationReviewWorker } from "../../src/application-review-worker.ts";
-import { loadApplicationDecisionIfPresent, recoverApplications } from "../../src/application.ts";
+import { listProjectApplications, loadApplicationDecisionIfPresent, recoverApplications, validDecision } from "../../src/application.ts";
 import { deriveApplicationStatus } from "../../src/application-ticket.ts";
+import { reconcileRepository } from "../../src/recovery.ts";
 import { deriveGoalStatus, deriveRepositoryStatus, deriveSupervisorPlannerStatus } from "../../src/status.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
@@ -73,8 +74,8 @@ async function moveMain(repository: Awaited<ReturnType<typeof temporaryRepositor
 }
 
 /** Drive the production Application implementation, cleanup, review, and approval seams. */
-async function reviewedApplication(repository: Awaited<ReturnType<typeof temporaryRepository>>, goal: Awaited<ReturnType<typeof landedGoal>>, marker: string) {
-  const queued = await queueGoalIntegration({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goalId, approval: `Approve ${goal.goalId}.` });
+async function reviewedApplication(repository: Awaited<ReturnType<typeof temporaryRepository>>, goal: Awaited<ReturnType<typeof landedGoal>>, marker: string, existingQueue?: Awaited<ReturnType<typeof queueGoalIntegration>>) {
+  const queued = existingQueue ?? await queueGoalIntegration({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goalId, approval: `Approve ${goal.goalId}.` });
   const issued = await issueApplicationTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goalId, applicationId: queued.applicationId, instruction: "Produce reviewed Candidate.", executionPolicy: policy });
   const identity = { goalId: goal.goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
   const run = await dispatchApplicationWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...identity, worker: `application-${marker}`, command: implementationCommand(`application-${marker}.txt`, `${marker}\n`) });
@@ -192,6 +193,35 @@ describe("reviewed application production scenarios", () => {
 
 
 describe("reviewed application production scenarios", () => {
+  test("a clean-base Application remains terminal after the next FIFO Application advances main", async () => {
+    const repo = await repository();
+    const first = await landedGoal(repo, "clean-first.txt", "first\n");
+    const second = await landedGoal(repo, "clean-second.txt", "second\n");
+    const firstQueued = await queueGoalIntegration({ cwd: repo.root, hostPaths: repo.hostPaths, goalId: first.goalId, approval: "Apply first Goal." });
+    const secondQueued = await queueGoalIntegration({ cwd: repo.root, hostPaths: repo.hostPaths, goalId: second.goalId, approval: "Apply second Goal." });
+    expect([firstQueued.queuePosition, secondQueued.queuePosition]).toEqual([1, 2]);
+
+    const firstApplied = await applyQueueHead({ cwd: repo.root, hostPaths: repo.hostPaths, goalId: first.goalId, applicationId: firstQueued.applicationId });
+    expect(firstApplied.form).toBe("clean-base");
+    const secondApplication = await reviewedApplication(repo, second, "after-clean", secondQueued);
+    const secondApplied = await applyQueueHead({ cwd: repo.root, hostPaths: repo.hostPaths, goalId: second.goalId, applicationId: secondQueued.applicationId });
+    expect(secondApplied.previousTargetRevision).toBe(firstApplied.resultingTargetRevision);
+    expect(secondApplied.resultingTargetRevision).toBe(secondApplication.candidate);
+
+    const applications = await listProjectApplications(repo.project);
+    expect(await validDecision(repo.project, applications[0]!, applications[0]!.decision!)).toBe(true);
+    expect(await repo.git("merge-base", "--is-ancestor", firstApplied.resultingTargetRevision, secondApplied.resultingTargetRevision)).toBe("");
+    const status = await deriveRepositoryStatus(repo.root, repo.hostPaths);
+    const beforeRecovery = await repo.git("rev-parse", "main");
+    await reconcileRepository({ cwd: repo.root, hostPaths: repo.hostPaths }, undefined, { ...({} as any), release: async () => undefined });
+    expect(await repo.git("rev-parse", "main")).toBe(beforeRecovery);
+    expect(status.applicationQueue.map(entry => ({ state: entry.state, queueMember: entry.queueMember }))).toEqual([
+      { state: "applied", queueMember: false },
+      { state: "applied", queueMember: false },
+    ]);
+    expect(status.queueHead).toBeNull();
+  });
+
   test("clean-base apply and Change review remain unchanged", async () => {
     const repo = await repository();
     const goal = await landedGoal(repo, "clean-goal.txt", "clean content\n");

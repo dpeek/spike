@@ -2,7 +2,7 @@ import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { abandonChange, createChange, landChange, rejectChange } from "../../src/change.ts";
-import { applicationEvidence, applicationPath, createSquashCandidate, listApplicationIds, listProjectApplications, loadApplicationDecisionIfPresent, publishApplyDecision, queuedApplicationHead } from "../../src/application.ts";
+import { applicationDecisionPath, applicationEvidence, applicationPath, createSquashCandidate, listApplicationIds, listProjectApplications, loadApplicationDecisionIfPresent, publishApplyDecision, queuedApplicationHead, recoverApplications } from "../../src/application.ts";
 import { reconcileGoal, reconcileRepository, recoverInterruptedTicket, stopTicket } from "../../src/recovery.ts";
 import { refreshChangeChurn, revisePlan } from "../../src/plan.ts";
 import { publishBlockedReport } from "../../src/report.ts";
@@ -136,6 +136,31 @@ describe("Goal integration apply", () => {
     expect(change.change.metadata.changeId).toBe("002");
   });
 
+  test("keeps malformed decisions and invalid Candidates closed", async () => {
+    for (const evidence of ["malformed-decision", "invalid-candidate"] as const) {
+      const { repository, goalId, base } = await completedGoal();
+      const queued = await queueGoalIntegration({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, approval: "Approved." });
+      if (evidence === "malformed-decision") {
+        await writeFile(applicationDecisionPath(repository.project, goalId, queued.applicationId), "not a decision document\n");
+      } else {
+        const invalidCandidate = await repository.git("commit-tree", `${base}^{tree}`, "-p", base, "-m", "Invalid Candidate tree");
+        const application = (await listProjectApplications(repository.project))[0]!;
+        await publishApplyDecision(repository.project, application, invalidCandidate, base);
+      }
+
+      if (evidence === "malformed-decision") {
+        expect((await listProjectApplications(repository.project))[0]).toMatchObject({ invalidDecision: true });
+        expect(await queuedApplicationHead(repository.project)).toMatchObject({ metadata: { goalId, applicationId: queued.applicationId, queuePosition: 1 } });
+      } else {
+        const status = await deriveRepositoryStatus(repository.root, repository.hostPaths);
+        expect(status.applicationQueue[0]).toMatchObject({ state: "inconsistent", queueMember: true });
+        expect(status.queueHead).toMatchObject({ goalId, applicationId: queued.applicationId, queuePosition: 1 });
+      }
+      await expect(recoverApplications(repository.project)).rejects.toThrow("invalid decision evidence");
+      expect(await repository.git("rev-parse", "main")).toBe(base);
+    }
+  });
+
   test("classifies a published decision at expected main as recoverable incomplete, displays it, and recovers exactly", async () => {
     const { repository, goalId, base } = await completedGoal();
     await expect(applyGoalIntegration({
@@ -259,12 +284,15 @@ describe("Goal integration apply", () => {
     expect(await repository.git("rev-parse", "main")).toBe(moved);
   });
 
-  test("marks a decision inconsistent when main no longer exactly projects its target", async () => {
-    const { repository, goalId } = await completedGoal();
+  test("marks a decision inconsistent when main moves to unrelated history", async () => {
+    const { repository, goalId, base } = await completedGoal();
     await applyGoalIntegration({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, approval: "Approved." });
+    await repository.git("checkout", "--quiet", "-b", "unrelated-main", base);
     await writeFile(join(repository.root, "later.txt"), "later\n");
     await repository.git("add", "later.txt");
-    await repository.git("commit", "--quiet", "-m", "Later main movement");
+    await repository.git("commit", "--quiet", "-m", "Unrelated main movement");
+    await repository.git("branch", "-f", "main", "HEAD");
+    await repository.git("checkout", "--quiet", "main");
     expect(await applicationEvidence(repository.project, goalId)).toEqual([{ applicationId: "001", state: "inconsistent" }]);
     expect((await cli(repository, ["status", "--goal", goalId])).stdout).toContain("Application 001 inconsistent");
     await expect(createChange({
