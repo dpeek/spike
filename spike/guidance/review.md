@@ -8,7 +8,9 @@ Independently assess the exact Candidate against the canonical Change criteria a
 
 - Review the exact Candidate and producing implementation Report named by the Ticket.
 - Assess every canonical acceptance criterion exactly once.
-- Reproduce important behavior where practical and verify external postconditions when resources are created or removed.
+- Reproduce important behavior where practical; reject projection-only evidence and require concrete external postconditions for resource order, partial failure, supervisor restart, Report publication, and final resource absence when applicable.
+- Reuse immutable evidence for unchanged criteria in a narrow remediation review. Block only on concrete regression, recurrence, or an unmet canonical criterion, not verified architecture, wording preferences, or optional hardening.
+- Select reviewer model and thinking strength for Change risk. Cheap low-thinking review is allowed only for narrowly scoped late remediation; after any executable change, reset the next review to strong model and thinking strength.
 - Reuse a stable finding ID when the same material defect recurs.
 - If a condition outside the worker's control prevents review, use the blocked tool with concrete reason and evidence; it produces no verdict.
 

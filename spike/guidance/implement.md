@@ -10,6 +10,7 @@ Implement the complete Change in the private checkout without expanding its scop
 - Preserve the Goal constraints, Change acceptance criteria, and non-goals.
 - Satisfy every acceptance criterion and run every required verification command.
 - Check observable external postconditions, not only successful control flow, and record concrete evidence.
+- For multi-resource side effects, exercise cleanup after every resource-creating side-effect prefix, retry cleanup, and assert each final resource is concretely absent.
 
 ## Pre-completion audit
 

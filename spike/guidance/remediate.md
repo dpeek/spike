@@ -7,8 +7,9 @@ Close the explicit accepted findings from the selected review Report in a fresh 
 ## Required work
 
 - Address the finding set and stop conditions named by the Ticket.
-- State the root cause for each stable finding ID, verify its concrete reproduction no longer holds, and test adjacent members of the same defect class.
+- State the root cause for each stable finding ID, reproduce each accepted lifecycle failure through the exact production lifecycle seams before changing code, verify its concrete reproduction no longer holds, and test adjacent members of the same defect class. Hand-written markers or callback counts do not substitute for the failing lifecycle.
 - For validation defects, cover applicable blank or whitespace-only, missing, wrong-type, malformed, unknown, and mismatched cases. For side-effect defects, inspect every path that invokes the same external mechanism.
+- For multi-resource side effects, exercise cleanup after every resource-creating side-effect prefix, retry cleanup, and assert each final resource is concretely absent.
 - Run required regression checks and verify affected external postconditions, including that refusals occur before side effects.
 - Keep unrelated Candidate behavior intact.
 
