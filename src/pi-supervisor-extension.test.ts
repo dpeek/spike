@@ -521,6 +521,30 @@ describe("Pi supervisor extension", () => {
     expect(calls.at(-1)!.args).toEqual(["status"]);
   });
 
+  test("requests operational observations only for repository status", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    registerSupervisorExtension({
+      registerTool(tool) { tools.push(tool); },
+      on() {},
+      sendMessage() {},
+    }, {
+      async invoke(input) {
+        calls.push(input);
+        return { ok: true, command: "status", data: {} };
+      },
+    });
+    const status = tools.find((tool) => tool.name === "spike_status")!;
+
+    await status.execute("repository", {}, undefined, undefined, { cwd: "/project" });
+    await status.execute("goal", { goalId: "goal-1" }, undefined, undefined, { cwd: "/project" });
+
+    expect(calls.map((call) => call.args)).toEqual([
+      ["status", "--operational"],
+      ["status", "--goal", "goal-1"],
+    ]);
+  });
+
   test("Goal planner extension registers only scoped operations and rejects cross-Goal calls before Spike", async () => {
     const calls: RunSpikeJsonInput[] = [];
     const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
@@ -541,7 +565,8 @@ describe("Pi supervisor extension", () => {
     expect(calls).toEqual([]);
     await scoped.get("spike_status")!.execute("call", {}, undefined, undefined, { cwd: "/project" });
     expect(calls[0]!.args).toEqual(["status", "--goal", "goal-1"]);
-    await scoped.get("spike_begin_step")!.execute("call", { step: "recover", goalId: "goal-1" }, undefined, undefined, { cwd: "/project" });
+    await scoped.get("spike_begin_step")!.execute("call", { step: "recover", goalId: "goal-1", changeId: "001" }, undefined, undefined, { cwd: "/project" });
+    expect(calls.at(-1)!.args).toEqual(["guidance", "show", "--step", "recover", "--goal", "goal-1"]);
     await scoped.get("spike_recover")!.execute("call", { goalId: "goal-1", reason: "Restarted." }, undefined, undefined, { cwd: "/project" });
     expect(calls.at(-1)!.args).toEqual(["recover", "--goal-local", "--goal", "goal-1", "--reason", "Restarted."]);
   });

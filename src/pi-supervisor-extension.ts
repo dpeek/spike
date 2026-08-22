@@ -727,14 +727,20 @@ export function registerSupervisorExtension(
   let shuttingDown = false;
   let selectedStep: SelectedStep | undefined;
 
+  const guidanceSelection = (params: any): SelectedStep => {
+    const step = params.step as PlannerStep;
+    return {
+      step,
+      ...(step === "goal" || params.goalId === undefined ? {} : { goalId: params.goalId }),
+      ...(!["implement", "review", "remediate", "decide"].includes(step) || params.changeId === undefined
+        ? {}
+        : { changeId: params.changeId }),
+    };
+  };
+
   const selectStep = (params: any): void => {
     selectedStep = undefined;
-    const step = params.step as PlannerStep;
-    selectedStep = {
-      step,
-      ...(params.goalId === undefined ? {} : { goalId: params.goalId }),
-      ...(params.changeId === undefined ? {} : { changeId: params.changeId }),
-    };
+    selectedStep = guidanceSelection(params);
   };
 
   const requireStep = (step: PlannerStep, params: any): void => {
@@ -850,15 +856,16 @@ export function registerSupervisorExtension(
         required: ["step"],
         properties: {
           step: { type: "string", enum: plannerSteps },
-          goalId: optionalIdentity,
-          changeId: optionalIdentity,
+          goalId: { ...optionalIdentity, description: "Required for every step except Goal." },
+          changeId: { ...optionalIdentity, description: "Required only for Implement, Review, Remediate, and Decide. Omit for Goal, Plan, Change, and Recover." },
         },
       },
       command: "guidance show",
       args(params) {
-        const args = ["guidance", "show", "--step", params.step];
-        optional(args, "--goal", params.goalId);
-        optional(args, "--change", params.changeId);
+        const selection = guidanceSelection(params);
+        const args = ["guidance", "show", "--step", selection.step];
+        optional(args, "--goal", selection.goalId);
+        optional(args, "--change", selection.changeId);
         return args;
       },
       beforeInvoke: () => { selectedStep = undefined; },
@@ -882,7 +889,7 @@ export function registerSupervisorExtension(
       command: "status",
       args(params) {
         const args = ["status"];
-        if (options.goalId === undefined) args.push("--operational");
+        if (params.goalId === undefined) args.push("--operational");
         optional(args, "--goal", params.goalId);
         return args;
       },
