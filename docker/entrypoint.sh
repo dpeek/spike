@@ -15,4 +15,12 @@ git -C /work/repository checkout --quiet --detach "$SPIKE_INPUT_REVISION"
 actual=$(git -C /work/repository rev-parse --verify HEAD^{commit})
 [ "$actual" = "$SPIKE_INPUT_REVISION" ]
 cd /work/repository
+if [ -n "${SPIKE_WORKER_SETUP_B64:-}" ]; then
+  bun -e '
+const command = JSON.parse(Buffer.from(process.env.SPIKE_WORKER_SETUP_B64, "base64").toString("utf8"));
+const child = Bun.spawn(command, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+process.exit(await child.exited);
+'
+  unset SPIKE_WORKER_SETUP_B64
+fi
 exec "$@"

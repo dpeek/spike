@@ -33,6 +33,11 @@ const executionPolicySchema = z
     credentialGrants: z.array(z.string().min(1)),
   })
   .strict();
+const setupCommandSchema = z.array(z.string()).superRefine((command, context) => {
+  if (command.length > 0 && command[0]!.trim().length === 0) {
+    context.addIssue({ code: "custom", message: "Ticket setup executable must not be blank" });
+  }
+});
 const commonTicketSchema = z.object({
   kind: z.literal("ticket"),
   goalId: z.string().regex(goalIdPattern),
@@ -43,6 +48,7 @@ const commonTicketSchema = z.object({
   replacesTicketId: z.string().regex(sequenceIdPattern).optional(),
   model: z.string().trim().min(1),
   thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]),
+  setupCommand: setupCommandSchema.optional().default([]),
   executionPolicy: executionPolicySchema,
   guidance: z
     .object({
@@ -328,6 +334,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
       existing.metadata.role !== interrupted.metadata.role ||
       existing.metadata.inputRevision !== inputRevision ||
       JSON.stringify(existing.metadata.executionPolicy) !== JSON.stringify(interrupted.metadata.executionPolicy) ||
+      JSON.stringify(existing.metadata.setupCommand) !== JSON.stringify(interrupted.metadata.setupCommand) ||
       existing.body !== interrupted.body
     ) {
       throw new Error("existing replacement Ticket does not reproduce the interrupted assignment");
@@ -476,6 +483,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     inputRevision,
     model: assignment.model,
     thinking: assignment.thinking,
+    setupCommand: assignment.setupCommand,
     executionPolicy: policy,
     guidance: { step: guidance.step, revision: guidance.revision },
     ...(producingImplementationTicketId === undefined ? {} : { producingImplementationTicketId }),

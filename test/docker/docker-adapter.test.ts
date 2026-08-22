@@ -24,8 +24,21 @@ beforeAll(async () => {
   if (code !== 0) throw new Error(stderr);
 }, 120_000);
 
-async function fixture(policy: ExecutionPolicy = { isolation: "container", networkAccess: "none", credentialGrants: [] }, modelOverride?: string, instruction = "Execute Docker contract.") {
+async function fixture(
+  policy: ExecutionPolicy = { isolation: "container", networkAccess: "none", credentialGrants: [] },
+  modelOverride?: string,
+  instruction = "Execute Docker contract.",
+  setupCommand?: string[],
+) {
   const repository = await temporaryRepository();
+  if (setupCommand !== undefined) {
+    const path = join(repository.root, "spike.json");
+    const config = await Bun.file(path).json();
+    config.worker = { setup: setupCommand };
+    await Bun.write(path, `${JSON.stringify(config, null, 2)}\n`);
+    await repository.git("add", "spike.json");
+    await repository.git("commit", "--quiet", "-m", "Configure worker setup");
+  }
   const model = modelOverride ?? (policy.credentialGrants.length === 1 ? `${policy.credentialGrants[0]}/test-model` : "contract-model");
   const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Docker adapter", outcome: "Exercise Docker isolation.", approval: "Approved." });
   await createChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId, title: "Docker", intent: "Run Docker.", rationale: "Exercise the adapter.", acceptanceCriteria: ["Docker runs."] });
@@ -163,6 +176,33 @@ process.stdout.write(resolved + "\\n");
       expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
       expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
+    } finally {
+      await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
+      await active.remove();
+    }
+  }, 30_000);
+
+  test("runs frozen setup in the container and prevents the worker command after setup failure", async () => {
+    const setup = ["bun", "-e", "await Bun.write(process.env.SPIKE_OUTPUT_DIR + '/container-setup-failed', 'failed'); console.error('container setup failed'); process.exit(29)"];
+    const active = await fixture(
+      { isolation: "container", networkAccess: "none", credentialGrants: [] },
+      undefined,
+      "Fail during setup.",
+      setup,
+    );
+    try {
+      const dispatched = await dockerWorkerAdapter.dispatch({
+        cwd: active.root,
+        hostPaths: active.hostPaths,
+        ...active.identity,
+        worker: "container-setup-failure",
+        command: ["bun", "-e", "await Bun.write(process.env.SPIKE_OUTPUT_DIR + '/worker-started', 'started')"],
+      });
+      expect(dispatched.execution).toMatchObject({ exitCode: 29 });
+      expect(dispatched.execution.stderr).toContain("container setup failed\n");
+      expect(await Bun.file(join(dispatched.exchange.outputDirectory, "container-setup-failed")).exists()).toBe(true);
+      expect(await Bun.file(join(dispatched.exchange.outputDirectory, "worker-started")).exists()).toBe(false);
       expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
@@ -395,26 +435,25 @@ process.stdout.write(resolved + "\\n");
     }
   }, 30_000);
 
-  test("installs the unchanged lockfile and completes literal bun run check in the real Spike repository", async () => {
+  test("automatically installs the unchanged lockfile before running the real Spike check", async () => {
     const active = await spikeRepositoryFixture();
     try {
       const command = ["sh", "-c", [
         "set -eu",
-        "before=$(sha256sum bun.lock | cut -d ' ' -f 1)",
-        "bun install --frozen-lockfile",
-        "after=$(sha256sum bun.lock | cut -d ' ' -f 1)",
-        "[ \"$before\" = \"$after\" ]",
+        "[ -d node_modules/zod ]",
         "git diff --exit-code -- bun.lock",
-        "printf 'locked install left bun.lock unchanged\\n'",
-        "unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG SPIKE_DOCKER_IMAGE HERDR_ENV HERDR_WORKSPACE_ID HERDR_PANE_ID SPIKE_WORKER_IMAGE_DIGEST IMAGE_DIGEST CONTAINER_ID",
+        "printf 'automatic locked install prepared dependencies without changing bun.lock\\n'",
+        "unset DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG SPIKE_DOCKER_IMAGE HERDR_ENV HERDR_WORKSPACE_ID HERDR_PANE_ID SPIKE_WORKER_IMAGE_DIGEST IMAGE_DIGEST CONTAINER_ID SPIKE_BIN SPIKE_INPUT_DIR SPIKE_OUTPUT_DIR SPIKE_INPUT_REVISION SPIKE_GOAL_ID SPIKE_CHANGE_ID SPIKE_TICKET_ID SPIKE_TICKET_ROLE SPIKE_MODEL SPIKE_THINKING SPIKE_WORKER_SETUP_B64",
         "! command -v docker >/dev/null 2>&1",
         "[ ! -e /var/run/docker.sock ]",
         "bun run check",
         "printf 'literal bun run check completed\\n'",
       ].join("\n")];
       const dispatched = await dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "repository-check-regression", command });
-      expect(dispatched.execution.exitCode).toBe(0);
-      expect(dispatched.execution.stdout).toContain("locked install left bun.lock unchanged\n");
+      if (dispatched.execution.exitCode !== 0) {
+        throw new Error(`repository check exited ${dispatched.execution.exitCode}\nstdout:\n${dispatched.execution.stdout}\nstderr:\n${dispatched.execution.stderr}`);
+      }
+      expect(dispatched.execution.stdout).toContain("automatic locked install prepared dependencies without changing bun.lock\n");
       expect(dispatched.execution.stdout).toContain("literal bun run check completed\n");
       const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string; imageDigest: string };

@@ -13,11 +13,17 @@ const workerAgentSchema = modelSelectionSchema.extend({
   networkAccess: networkAccessSchema,
   credentialGrants: z.array(nonBlankString),
 }).strict();
+const setupCommandSchema = z.array(z.string()).superRefine((command, context) => {
+  if (command.length > 0 && command[0]!.trim().length === 0) {
+    context.addIssue({ code: "custom", message: "worker setup executable must not be blank" });
+  }
+});
 const projectIdentitySchema = z.object({
   project: z.object({ slug: z.string().regex(projectSlugPattern) }).strict(),
 }).passthrough();
 const projectConfigSchema = z.object({
   project: z.object({ slug: z.string().regex(projectSlugPattern) }).strict(),
+  worker: z.object({ setup: setupCommandSchema }).strict().optional(),
   agents: z.object({
     planner: modelSelectionSchema,
     implement: workerAgentSchema,
@@ -31,6 +37,7 @@ export type ExecutionPolicyDefaults = Pick<z.infer<typeof workerAgentSchema>, "i
 export type WorkerAgent = z.infer<typeof workerAgentSchema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type ExecutableTicketRole = "implement" | "review";
+export type TicketAssignment = ModelSelection & ExecutionPolicyDefaults & { setupCommand: string[] };
 
 export function configPath(root: string): string { return join(root, "spike.json"); }
 
@@ -67,7 +74,11 @@ export async function resolveTicketAssignment(
   root: string,
   role: ExecutableTicketRole,
   override: Partial<ModelSelection & ExecutionPolicyDefaults> = {},
-): Promise<ModelSelection & ExecutionPolicyDefaults> {
-  const configured = (await loadProjectConfig(root)).agents[role];
-  return workerAgentSchema.parse({ ...configured, ...override });
+): Promise<TicketAssignment> {
+  const config = await loadProjectConfig(root);
+  const configured = config.agents[role];
+  return {
+    ...workerAgentSchema.parse({ ...configured, ...override }),
+    setupCommand: [...(config.worker?.setup ?? [])],
+  };
 }

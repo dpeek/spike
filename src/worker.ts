@@ -1195,6 +1195,9 @@ function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: A
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",
     PI_TELEMETRY: "0",
+    ...(ticket.metadata.setupCommand.length === 0
+      ? {}
+      : { SPIKE_WORKER_SETUP_B64: Buffer.from(JSON.stringify(ticket.metadata.setupCommand)).toString("base64") }),
     ...(credential === undefined ? {} : { SPIKE_PI_AUTH_B64: credential.encodedAuth }),
   };
   return Object.entries(values).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
@@ -1397,7 +1400,8 @@ export async function dispatchHerdrTicket(
   const marker = join(workspace, "herdr-execution.json");
   const script = join(workspace, "run-worker");
   const launchedCommand = input.command.map(shellQuote).join(" ");
-  await writeFile(script, `#!/bin/sh\nset +e\n${launchedCommand}\nstatus=$?\nfinished=$(date -u '+%Y-%m-%dT%H:%M:%SZ')\ntmp=${shellQuote(marker)}.tmp.$$\nprintf '{"exitCode":%s,"finishedAt":"%s"}\\n' "$status" "$finished" > "$tmp"\nmv "$tmp" ${shellQuote(marker)}\nexit "$status"\n`, { mode: 0o700 });
+  const setupCommand = ticket.metadata.setupCommand.map(shellQuote).join(" ");
+  await writeFile(script, `#!/bin/sh\nset +e\nstatus=0\n${setupCommand === "" ? "" : `${setupCommand}\nstatus=$?\n`}if [ "$status" -eq 0 ]; then\n  ${launchedCommand}\n  status=$?\nfi\nfinished=$(date -u '+%Y-%m-%dT%H:%M:%SZ')\ntmp=${shellQuote(marker)}.tmp.$$\nprintf '{"exitCode":%s,"finishedAt":"%s"}\\n' "$status" "$finished" > "$tmp"\nmv "$tmp" ${shellQuote(marker)}\nexit "$status"\n`, { mode: 0o700 });
 
   const clock = input.clock ?? (() => new Date());
   const startedAt = clock().toISOString();
@@ -1486,28 +1490,53 @@ export async function dispatchLocalTicket(
       throw new Error(`local clone started at ${checkoutRevision}, expected ${ticket.metadata.inputRevision}`);
     }
 
-    if (liveWorker.stopRequested) throw new Error("direct worker was stopped before launch");
-    const child = Bun.spawn(input.command, {
-      cwd: checkout,
-      env: { ...(input.environment ?? process.env), ...workerEnvironment(exchange, ticket.metadata.inputRevision, ticket, (input.hostOptions ?? defaultWorkerHostOptions).spikeExecutable) },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    liveWorker.process = child;
-    workerRecord = {
-      ...workerRecord,
-      metadata: workerRecordSchema.parse({
-        ...workerRecord.metadata,
-        runtime: { adapter: "local-clone", resource: { host: "direct", workspace, pid: child.pid } },
-      }),
+    const environment = {
+      ...(input.environment ?? process.env),
+      ...workerEnvironment(exchange, ticket.metadata.inputRevision, ticket, (input.hostOptions ?? defaultWorkerHostOptions).spikeExecutable),
     };
-    await replaceWorkerRecord(repository, workerRecord);
-    [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
+    const run = async (command: string[]) => {
+      const child = Bun.spawn(command, {
+        cwd: checkout,
+        env: environment,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      liveWorker.process = child;
+      workerRecord = {
+        ...workerRecord!,
+        metadata: workerRecordSchema.parse({
+          ...workerRecord!.metadata,
+          runtime: { adapter: "local-clone", resource: { host: "direct", workspace, pid: child.pid } },
+        }),
+      };
+      await replaceWorkerRecord(repository, workerRecord);
+      const [code, commandStdout, commandStderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      return { code, stdout: commandStdout, stderr: commandStderr };
+    };
+
+    if (ticket.metadata.setupCommand.length > 0) {
+      try {
+        const setup = await run(ticket.metadata.setupCommand);
+        exitCode = setup.code;
+        stdout = setup.stdout;
+        stderr = setup.stderr;
+      } catch (error) {
+        exitCode = -1;
+        stderr = `Worker setup could not start: ${error instanceof Error ? error.message : String(error)}\n`;
+      }
+    }
+    if (exitCode === 0 || ticket.metadata.setupCommand.length === 0) {
+      if (liveWorker.stopRequested) throw new Error("direct worker was stopped before launch");
+      const execution = await run(input.command);
+      exitCode = execution.code;
+      stdout += execution.stdout;
+      stderr += execution.stderr;
+    }
     finishedAt = clock().toISOString();
   } finally {
     try {

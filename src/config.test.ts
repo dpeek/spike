@@ -11,6 +11,7 @@ async function fixture(): Promise<string> {
     join(root, "spike.json"),
     `${JSON.stringify({
       project: { slug: "example-project" },
+      worker: { setup: ["bun", "install", "--frozen-lockfile"] },
       agents: {
         planner: { model: "planner", thinking: "high" },
         implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
@@ -29,20 +30,39 @@ describe("project agent configuration", () => {
     expect((await loadProjectConfig(root)).agents.planner).toEqual({ model: "planner", thinking: "high" });
     expect(await resolveTicketAssignment(root, "implement")).toEqual({
       model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [],
+      setupCommand: ["bun", "install", "--frozen-lockfile"],
     });
     expect(await resolveTicketAssignment(root, "review", { model: "special-reviewer", thinking: "low", isolation: "workspace", credentialGrants: [] })).toEqual({
       model: "special-reviewer", thinking: "low", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [],
+      setupCommand: ["bun", "install", "--frozen-lockfile"],
     });
   });
 
-  test("defaults omitted worker isolation to container and rejects the former models shape", async () => {
+  test("defaults omitted worker setup to no-op and worker isolation to container", async () => {
     const root = await fixture();
     const config = JSON.parse(await readFile(join(root, "spike.json"), "utf8"));
+    delete config.worker;
     delete config.agents.implement.isolation;
     delete config.agents.review.isolation;
     await writeFile(join(root, "spike.json"), `${JSON.stringify(config)}\n`);
-    expect(await resolveTicketAssignment(root, "implement")).toMatchObject({ isolation: "container" });
-    expect(await resolveTicketAssignment(root, "review")).toMatchObject({ isolation: "container" });
+    expect(await resolveTicketAssignment(root, "implement")).toMatchObject({ isolation: "container", setupCommand: [] });
+    expect(await resolveTicketAssignment(root, "review")).toMatchObject({ isolation: "container", setupCommand: [] });
+  });
+
+  test("rejects shell setup strings and blank setup executables", async () => {
+    const root = await fixture();
+    const config = JSON.parse(await readFile(join(root, "spike.json"), "utf8"));
+    config.worker.setup = "bun install --frozen-lockfile";
+    await writeFile(join(root, "spike.json"), `${JSON.stringify(config)}\n`);
+    await expect(loadProjectConfig(root)).rejects.toThrow();
+    config.worker.setup = ["  ", "install"];
+    await writeFile(join(root, "spike.json"), `${JSON.stringify(config)}\n`);
+    await expect(loadProjectConfig(root)).rejects.toThrow("worker setup executable must not be blank");
+  });
+
+  test("rejects the former models shape", async () => {
+    const root = await fixture();
+    const config = JSON.parse(await readFile(join(root, "spike.json"), "utf8"));
     await writeFile(join(root, "spike.json"), JSON.stringify({ project: { slug: "example-project" }, models: config.agents }));
     await expect(loadProjectConfig(root)).rejects.toThrow();
   });

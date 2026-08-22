@@ -180,7 +180,7 @@ The Worker module has one real seam: a host-local clone adapter proves the workf
 The adapters share one filesystem exchange contract:
 
 1. Spike prepares a read-only input directory containing `ticket.md`, `context.md`, and `repository.bundle` at the Ticket's exact input revision.
-2. The adapter creates a private checkout from that bundle and starts the worker there.
+2. The adapter creates a private checkout from that bundle, runs the Ticket's frozen setup argv there, and starts the worker only when setup succeeds.
 3. The worker writes only to its assigned output directory: `submission.md`, an output `repository.bundle` for a completed `implement` Ticket, and declared artifacts.
 4. Spike imports the output bundle into a quarantine ref, verifies that it contains the submitted `workerRevision`, validates the Submission and artifact digests, and only then normalizes a Candidate.
 5. Spike never publishes a Report by inspecting an unreported live checkout. The exchange output must contain everything required for publication after the worker stops.
@@ -410,7 +410,8 @@ A Ticket owns:
 - exact input Candidate or base revision;
 - curated context snapshot;
 - adapter-independent execution policy for isolation, network access, and credential grants;
-- effective model and thinking selection, resolved from the Ticket role default plus any explicit one-Ticket override when the Ticket is issued.
+- effective model and thinking selection, resolved from the Ticket role default plus any explicit one-Ticket override when the Ticket is issued;
+- project-level worker setup argv resolved when the Ticket is issued, with an absent command frozen as a no-op.
 
 The full identity of a Ticket is its Goal ID, Change ID, and Ticket ID. The Ticket ID is also its sequence within the Change.
 
@@ -687,6 +688,9 @@ Project configuration records the stable Project slug and distinguishes the plan
   "project": {
     "slug": "spike"
   },
+  "worker": {
+    "setup": ["bun", "install", "--frozen-lockfile"]
+  },
   "agents": {
     "planner": {
       "model": "openai-codex/gpt-5.6-sol",
@@ -710,9 +714,9 @@ Project configuration records the stable Project slug and distinguishes the plan
 }
 ```
 
-`agents` is strict: the former `models` shape is rejected, planner has only model and thinking, and implement/review also configure isolation, network access, and credential-grant identifiers (never secrets). Omitted worker isolation resolves to `container`. Remediation uses the implement agent; there is no remediation category.
+`agents` is strict: the former `models` shape is rejected, planner has only model and thinking, and implement/review also configure isolation, network access, and credential-grant identifiers (never secrets). Omitted worker isolation resolves to `container`. Remediation uses the implement agent; there is no remediation category. Optional `worker.setup` is an argv array; absence resolves to an empty no-op command rather than a shell string.
 
-When Spike issues a Ticket, it resolves the effective model, thinking, isolation, network access, and credential grants from that Ticket role's project default and any explicit one-Ticket override, then freezes model/thinking at top level and policy under `executionPolicy` in immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective assignment.
+When Spike issues a Ticket, it resolves the effective model, thinking, isolation, network access, credential grants, and worker setup command from project configuration and any permitted one-Ticket override, then freezes model/thinking and `setupCommand` at top level and policy under `executionPolicy` in immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective assignment, including setup argv. Each adapter runs setup in the exact fresh checkout before starting Pi. A nonzero setup exit prevents Pi startup and is ordinary failed Worker execution evidence, sealable through a failed Report.
 
 Ticket workers never inherit the planner model implicitly. Model, thinking, isolation, network access, and credential command-line flags on Ticket issuance are explicit optional one-Ticket overrides. `--clear-credentials` explicitly selects an empty grant list, enabling a workspace override when container defaults configured grants. Dispatch-time overrides are rejected because they would change an already committed assignment. Change-level model policy, fallback lists, automatic routing, reviewer ensembles, cost budgets, and escalation policy are deferred until observed workflows justify them.
 

@@ -28,6 +28,7 @@ Spike reads the stable Project slug and strict agent defaults from tracked `spik
 ```json
 {
   "project": { "slug": "spike" },
+  "worker": { "setup": ["bun", "install", "--frozen-lockfile"] },
   "agents": {
     "planner": { "model": "...", "thinking": "high" },
     "implement": { "model": "...", "thinking": "medium", "isolation": "container", "networkAccess": "unrestricted", "credentialGrants": ["openai-codex"] },
@@ -38,8 +39,8 @@ Spike reads the stable Project slug and strict agent defaults from tracked `spik
 
 The Project slug qualifies monotonic Project-local Goal sequences, producing IDs
 such as `spike-001`. It is operator-chosen rather than inferred and cannot change
-after Goal allocation. Ticket issuance freezes the selected model and thinking
-level and execution policy into `ticket.md`; later dispatch never rereads configuration or accepts overrides. Planner agents have only model and thinking because planner policy is not enforceable.
+after Goal allocation. Ticket issuance freezes the selected model, thinking
+level, execution policy, and project-level worker setup argv into `ticket.md`; later dispatch never rereads configuration or accepts overrides. An absent `worker.setup` is a no-op. Every fresh workspace or container checkout runs the frozen setup command before Pi starts; setup failure prevents Pi launch and remains failed Worker execution evidence. Planner agents have only model and thinking because planner policy is not enforceable.
 
 Workflow guidance is tracked as Markdown at
 `spike/guidance/{goal,plan,change,implement,review,remediate,decide,recover}.md`.

@@ -2,6 +2,9 @@
   "project": {
     "slug": "spike"
   },
+  "worker": {
+    "setup": ["bun", "install", "--frozen-lockfile"]
+  },
   "agents": {
     "planner": {
       "model": "openai-codex/gpt-5.6-sol",

@@ -30,6 +30,10 @@ describe("interrupted Ticket recovery", () => {
       acceptanceCriteria: ["Candidate A is produced by replacement Ticket 002."],
     });
     const baseRevision = change.change.metadata.baseRevision;
+    const configPath = join(repository.root, "spike.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.worker = { setup: ["bun", "install", "--frozen-lockfile"] };
+    await writeFile(configPath, `${JSON.stringify(config)}\n`);
     const first = await issueTicket({
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
@@ -43,6 +47,7 @@ describe("interrupted Ticket recovery", () => {
       ticketId: "001",
       model: "controlled-model",
       thinking: "low",
+      setupCommand: ["bun", "install", "--frozen-lockfile"],
     });
     await writeFile(
       join(repository.root, "spike.json"),
@@ -170,6 +175,7 @@ describe("interrupted Ticket recovery", () => {
       replacesTicketId: "001",
       model: "controlled-model",
       thinking: "low",
+      setupCommand: ["bun", "install", "--frozen-lockfile"],
       executionPolicy: policy,
     });
     expect(replacement.body).toContain("## Instruction\n\nProduce Candidate A.");

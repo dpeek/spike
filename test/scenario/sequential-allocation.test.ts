@@ -135,6 +135,7 @@ describe("sequential Change and Ticket allocation", () => {
       inputRevision: change.change.metadata.baseRevision,
       model: "implementation-model",
       thinking: "medium",
+      setupCommand: [],
       executionPolicy,
       guidance: { step: "implement", revision: change.change.metadata.baseRevision },
     });
