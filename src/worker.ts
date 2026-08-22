@@ -1556,6 +1556,13 @@ function piTerminalTools(role: "implement" | "review"): { complete: string; bloc
     : { complete: "spike_complete_review", blocked: "spike_block_review" };
 }
 
+export function piWorkerPrompt(role: "implement" | "review", isolation: "workspace" | "container"): string {
+  const terminalTools = piTerminalTools(role);
+  const instruction = `Execute the attached immutable ${role} Ticket in this exact checkout. Finish with ${terminalTools.complete}, or use ${terminalTools.blocked} only when a condition outside the worker's control prevents completion.`;
+  if (isolation === "workspace") return instruction;
+  return `${instruction}\n\nContainer tools available: Bun, Node.js, Git, ripgrep (\`rg\`), fd (\`fdfind\`), jq, and curl. Their installation does not grant network access; the immutable Ticket execution policy remains authoritative.`;
+}
+
 async function acceptedSubmission(outputDirectory: string): Promise<boolean> {
   try {
     const stat = await lstat(join(outputDirectory, "submission.md"));
@@ -1616,7 +1623,7 @@ export async function dispatchPiTicket(
     `read,bash,edit,write,${terminalTools.complete},${terminalTools.blocked}`,
     `@${join(inputDirectory, "ticket.md")}`,
     `@${join(inputDirectory, "context.md")}`,
-    `Execute the attached immutable ${ticket.metadata.role} Ticket in this exact checkout. Finish with ${terminalTools.complete}, or use ${terminalTools.blocked} only when a condition outside the worker's control prevents completion.`,
+    piWorkerPrompt(ticket.metadata.role, ticket.metadata.executionPolicy.isolation),
   ];
   const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
   if (host === "herdr") {

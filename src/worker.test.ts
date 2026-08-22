@@ -2,7 +2,7 @@ import { describe, expect, onTestFinished, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveDockerCredential, selectPiHost, stopDirectProcess, type DirectProcess, type WorkerHostOptions } from "./worker.ts";
+import { piWorkerPrompt, resolveDockerCredential, selectPiHost, stopDirectProcess, type DirectProcess, type WorkerHostOptions } from "./worker.ts";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -26,6 +26,24 @@ describe("Pi host selection", () => {
 
   test("permits explicit attended container dispatch", () => {
     expect(selectPiHost({ isolation: "container" }, "herdr", false)).toBe("herdr");
+  });
+});
+
+describe("Pi worker prompt", () => {
+  test("describes container tooling without implying network access", () => {
+    for (const role of ["implement", "review"] as const) {
+      const prompt = piWorkerPrompt(role, "container");
+      expect(prompt).toContain("Container tools available: Bun, Node.js, Git, ripgrep (`rg`), fd (`fdfind`), jq, and curl.");
+      expect(prompt).toContain("installation does not grant network access");
+      expect(prompt).toContain("immutable Ticket execution policy remains authoritative");
+      expect(prompt).toContain(role === "implement" ? "spike_complete_implementation" : "spike_complete_review");
+    }
+  });
+
+  test("keeps runtime-specific tooling out of workspace prompts", () => {
+    const prompt = piWorkerPrompt("implement", "workspace");
+    expect(prompt).not.toContain("Container tools available");
+    expect(prompt).not.toContain("network access");
   });
 });
 
