@@ -73,6 +73,20 @@ export type DerivedDecision = {
   statement: string;
 };
 
+export type DerivedApplicationCleanup = { healthy: boolean; warnings: string[] };
+
+export type DerivedApplicationProjection = {
+  applicationId: string;
+  state: "incomplete" | "decision-pending" | "target-mismatch" | "inconsistent" | "applied";
+  resolution: "return" | "stale" | "malformed" | null;
+  candidate: { ticketId: string; revision: string } | null;
+  review: unknown;
+  decision: unknown;
+  queue: { position: number; member: boolean; head: boolean };
+  cleanup: DerivedApplicationCleanup;
+  churnWarnings: ApplicationChurnWarning[];
+};
+
 export type DerivedGoalStatus = {
   goalId: string;
   integratedRevision: string;
@@ -82,7 +96,7 @@ export type DerivedGoalStatus = {
   currentChange: DerivedChangeStatus | null;
   decisions: DerivedDecision[];
   cleanup: CleanupHealth;
-  application: Array<{ applicationId: string; state: "incomplete" | "inconsistent" | "applied"; resolution: "return" | "stale" | "malformed" | null; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
+  application: DerivedApplicationProjection[];
   frozen: boolean;
   returnedRequeueEligible: boolean;
   stale: boolean;
@@ -93,7 +107,7 @@ export type DerivedRepositoryStatus = {
   project: { slug: string };
   goals: DerivedGoalStatus[];
   cleanup: CleanupHealth;
-  applicationQueue: Array<{ goalId: string; applicationId: string; queuePosition: number; integratedRevision: string; queueMember: boolean; state: "queued" | "applied" | "inconsistent" | "return" | "stale" | "malformed"; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
+  applicationQueue: Array<{ goalId: string; applicationId: string; queuePosition: number; integratedRevision: string; queueMember: boolean; state: "queued" | "decision-pending" | "target-mismatch" | "applied" | "inconsistent" | "return" | "stale" | "malformed"; evidenceState: DerivedApplicationProjection["state"]; candidate: DerivedApplicationProjection["candidate"]; review: unknown; decision: unknown; cleanup: DerivedApplicationCleanup; churnWarnings: ApplicationChurnWarning[] }>;
   queueHead: null | { goalId: string; applicationId: string; queuePosition: number };
 };
 
@@ -228,7 +242,12 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
     const status = await deriveApplicationStatus(repository.root, goalId, entry.applicationId);
     let resolution: "return" | "stale" | "malformed" | null = null;
     try { const evidence = await loadApplicationResolutionIfPresent(repository.root, goalId, entry.applicationId); resolution = evidence?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
-    return { ...entry, resolution, review: status.review, churnWarnings: status.churnWarnings };
+    return {
+      applicationId: entry.applicationId, state: entry.state, resolution, candidate: status.candidate,
+      review: status.review, decision: status.decision, queue: status.queue,
+      cleanup: status.cleanup,
+      churnWarnings: status.churnWarnings,
+    };
   }));
   let freeze: Awaited<ReturnType<typeof goalApplicationFreeze>>;
   try { freeze = await goalApplicationFreeze(repository.root, goalId); } catch { freeze = { frozen: true, returnedRequeueEligible: false, stale: false }; }
@@ -265,16 +284,21 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
     project,
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
-    applicationQueue: await Promise.all(queue.map(async (application, index) => { const status = await deriveApplicationStatus(repository.root, application.metadata.goalId, application.metadata.applicationId); let resolution: "return" | "stale" | "malformed" | null = null; try { resolution = (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; } return {
-      goalId: application.metadata.goalId,
-      applicationId: application.metadata.applicationId,
-      queuePosition: application.metadata.queuePosition,
-      integratedRevision: application.metadata.integratedRevision,
-      queueMember: resolution === null && queueStates[index] !== "applied",
-      state: resolution ?? (queueStates[index] === "applied" ? "applied" : queueStates[index] === "inconsistent" ? "inconsistent" : "queued"),
-      review: status.review,
-      churnWarnings: status.churnWarnings,
-    }; })),
+    applicationQueue: await Promise.all(queue.map(async (application, index) => {
+      const status = await deriveApplicationStatus(repository.root, application.metadata.goalId, application.metadata.applicationId);
+      let resolution: "return" | "stale" | "malformed" | null = null;
+      try { resolution = (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
+      const evidenceState = queueStates[index]!;
+      return {
+        goalId: application.metadata.goalId, applicationId: application.metadata.applicationId,
+        queuePosition: application.metadata.queuePosition, integratedRevision: application.metadata.integratedRevision,
+        queueMember: resolution === null && evidenceState !== "applied",
+        state: resolution ?? (evidenceState === "applied" ? "applied" : evidenceState === "decision-pending" ? "decision-pending" : evidenceState === "target-mismatch" ? "target-mismatch" : evidenceState === "inconsistent" ? "inconsistent" : "queued"),
+        evidenceState, candidate: status.candidate, review: status.review, decision: status.decision,
+        cleanup: status.cleanup,
+        churnWarnings: status.churnWarnings,
+      };
+    })),
     queueHead: head === undefined ? null : { goalId: head.metadata.goalId, applicationId: head.metadata.applicationId, queuePosition: head.metadata.queuePosition },
   };
 }

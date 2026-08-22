@@ -159,6 +159,74 @@ describe("Pi supervisor extension", () => {
     expect(rendered.every((line) => Array.from(line).length <= 30)).toBe(true);
   });
 
+  test("renders reviewed Application evidence for pending, applied, and target-mismatch states with or without a Change", () => {
+    const revision = (character: string) => character.repeat(40);
+    const application = (applicationId: string, state: "decision-pending" | "applied" | "target-mismatch", position: number, head: boolean, member: boolean) => ({
+      applicationId,
+      state,
+      evidenceState: state,
+      candidate: { ticketId: "001", revision: revision(applicationId === "001" ? "a" : applicationId === "002" ? "b" : "c") },
+      review: {
+        verdict: "approve",
+        highestReview: { ticketId: "002", candidateRevision: revision(applicationId === "001" ? "a" : applicationId === "002" ? "b" : "c") },
+        approvalUsable: state === "decision-pending",
+      },
+      decision: {
+        kind: "application-reviewed-apply-decision",
+        candidateRevision: revision(applicationId === "001" ? "a" : applicationId === "002" ? "b" : "c"),
+        expectedPreviousMainRevision: revision("m"),
+        reviewTicketId: "002",
+      },
+      queue: { position, head, member },
+      cleanup: { healthy: true, warnings: [] },
+      churnWarnings: [],
+    });
+    const pending = application("001", "decision-pending", 1, true, true);
+    const applied = application("002", "applied", 2, false, false);
+    const mismatch = application("003", "target-mismatch", 3, false, true);
+    const status: SpikeJsonSuccess = {
+      ok: true,
+      command: "status",
+      data: {
+        project: { slug: "example" },
+        goals: [
+          { goalId: "example-pending", decisions: [], cleanup: { healthy: true, warnings: [] }, application: [pending] },
+          {
+            goalId: "example-applied",
+            currentChange: { changeId: "004", openTicket: null, candidate: null, review: null, latestReport: null, churnWarnings: [] },
+            decisions: [], cleanup: { healthy: true, warnings: [] }, application: [applied],
+          },
+          { goalId: "example-mismatch", decisions: [], cleanup: { healthy: true, warnings: [] }, application: [mismatch] },
+        ],
+        cleanup: { healthy: true, warnings: [] },
+        applicationQueue: [
+          { goalId: "example-pending", ...pending, queuePosition: 1, queueMember: true },
+          { goalId: "example-applied", ...applied, queuePosition: 2, queueMember: false },
+          { goalId: "example-mismatch", ...mismatch, queuePosition: 3, queueMember: true },
+        ],
+        queueHead: { goalId: "example-pending", applicationId: "001", queuePosition: 1 },
+      },
+    };
+
+    const rendered = renderSupervisorResponse(status, false);
+    for (const [applicationId, state, candidate] of [
+      ["001", "decision-pending", revision("a")],
+      ["002", "applied", revision("b")],
+      ["003", "target-mismatch", revision("c")],
+    ]) {
+      expect(rendered).toContain(`Application ${applicationId} · State ${state} · Evidence ${state}`);
+      expect(rendered).toContain(`Candidate ${candidate} (Ticket 001)`);
+      expect(rendered).toContain("Review approve (Ticket 002)");
+      expect(rendered).toContain("Decision application-reviewed-apply-decision");
+      expect(rendered).toContain(`"candidateRevision":"${candidate}"`);
+      expect(rendered).toContain('"reviewTicketId":"002"');
+    }
+    expect(rendered).toContain("Queue 1 · head · member");
+    expect(rendered).toContain('Application cleanup healthy · {"healthy":true,"warnings":[]}');
+    expect(rendered).toContain("Queue 3 example-mismatch/003 · State target-mismatch · Evidence target-mismatch");
+    expect(rendered).toContain("Queue head example-pending/001 (1)");
+  });
+
   test("wakes the planner once with an operational recheck for a marker-backed open Ticket", async () => {
     const goalId = "goal-1";
     const identity = { goalId, changeId: "001", ticketId: "003" };

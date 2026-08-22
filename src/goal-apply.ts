@@ -2,14 +2,14 @@ import { deriveGoalIntegratedRevision } from "./change.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
 import { deriveGoalStatus } from "./status.ts";
-import { advanceDecision, applicationRequeueEligibility, applicationState, createSquashCandidate, hasTerminalApplication, listPublishedApplicationIds, publishApplication, publishApplyDecision, queuedApplicationHead, validDecision } from "./application.ts";
+import { advanceDecision, applicationRequeueEligibility, applicationState, createSquashCandidate, hasTerminalApplication, listPublishedApplicationIds, publishApplication, publishApplyDecision, publishReviewedApplyDecision, queuedApplicationHead, validDecision } from "./application.ts";
 import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
 import type { CrashInjector } from "./crash.ts";
 
 export type QueueGoalIntegrationInput = { cwd: string; goalId: string; targetBranch?: string; approval: string; now?: Date; crash?: CrashInjector; planners?: GoalPlannerOperations };
 export type QueuedGoalIntegration = { goalId: string; applicationId: string; targetBranch: "main"; integratedRevision: string; queuePosition: number; plannerCleanup: { status: "released" } | { status: "failed"; message: string } };
 export type ApplyQueueHeadInput = { cwd: string; goalId: string; applicationId: string; now?: Date; crash?: CrashInjector };
-export type AppliedQueueHead = { goalId: string; applicationId: string; targetBranch: "main"; previousTargetRevision: string; appliedRevision: string; resultingTargetRevision: string };
+export type AppliedQueueHead = { goalId: string; applicationId: string; targetBranch: "main"; previousTargetRevision: string; appliedRevision: string; resultingTargetRevision: string; form: "clean-base" | "reviewed" };
 function refuse(message: string): never { throw new Error(`apply refused: ${message}`); }
 
 /** Supervisor-only admission: publish durable queue evidence before optional planner cleanup. */
@@ -48,17 +48,46 @@ export async function applyQueueHead(input: ApplyQueueHeadInput): Promise<Applie
     if (state === "inconsistent" || !(await validDecision(repository.root, head, head.decision))) refuse("Application has invalid decision evidence or an unexpected main projection");
     refuse("Application has a published decision awaiting exact target recovery");
   }
-  let branch: string; try { branch = await git(repository.root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { refuse("main must be the currently checked-out local branch"); }
-  if (branch !== "main") refuse("main must be the currently checked-out local branch");
   const goal = await loadGoal(repository.root, input.goalId);
   const previousTargetRevision = await git(repository.root, ["rev-parse", "--verify", "refs/heads/main^{commit}"]);
-  if (previousTargetRevision !== goal.metadata.repository.initialRevision) refuse(`main ${previousTargetRevision} does not equal queue-head Goal initial revision ${goal.metadata.repository.initialRevision}`);
   const rebuilt = await deriveGoalIntegratedRevision(repository.root, input.goalId);
   const ref = await git(repository.root, ["rev-parse", "--verify", `${integratedRef(input.goalId)}^{commit}`]);
   if (rebuilt !== head.metadata.integratedRevision || ref !== head.metadata.integratedRevision) refuse("queue-head Application integration revision no longer matches durable Goal evidence");
-  // Refusals are complete; the first target side effect is the detached squash object.
-  const candidate = await createSquashCandidate(repository.root, input.goalId, head.metadata.integratedRevision, previousTargetRevision);
-  const decision = await publishApplyDecision(repository.root, head, candidate, previousTargetRevision, input.now, input.crash);
+  if (previousTargetRevision === goal.metadata.repository.initialRevision) {
+    // Preserve the existing clean-base workflow (including Git's checked-out
+    // worktree safety semantics) unchanged.
+    let branch: string; try { branch = await git(repository.root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); } catch { refuse("main must be the currently checked-out local branch"); }
+    if (branch !== "main") refuse("main must be the currently checked-out local branch");
+    const candidate = await createSquashCandidate(repository.root, input.goalId, head.metadata.integratedRevision, previousTargetRevision);
+    const decision = await publishApplyDecision(repository.root, head, candidate, previousTargetRevision, input.now, input.crash);
+    await advanceDecision(repository.root, decision, input.crash);
+    return { goalId: input.goalId, applicationId: input.applicationId, targetBranch: "main", previousTargetRevision, appliedRevision: head.metadata.integratedRevision, resultingTargetRevision: candidate, form: "clean-base" };
+  }
+  // Diverged application: every authorization check is read-only and precedes
+  // reviewed-decision publication and the sole refs/heads/main CAS.
+  const tickets = await import("./application-ticket.ts"); const reviews = await import("./application-review.ts");
+  const ticketIds = await tickets.listApplicationTicketIds(repository.root, input.goalId, input.applicationId);
+  if (ticketIds.length === 0) refuse(`main ${previousTargetRevision} does not equal queue-head Goal initial revision ${goal.metadata.repository.initialRevision}`);
+  const first = await tickets.loadApplicationTicket(repository.root, input.goalId, input.applicationId, ticketIds[0]!);
+  if (first.metadata.targetRevision !== previousTargetRevision) refuse(`main ${previousTargetRevision} does not equal pinned M ${first.metadata.targetRevision}`);
+  if (first.metadata.goalRevision !== head.metadata.integratedRevision) refuse("reviewed apply Goal revision does not match Application evidence");
+  const reports = await Promise.all(ticketIds.map(id => tickets.loadApplicationReportIfPresent(repository.root, input.goalId, input.applicationId, id)));
+  if (reports.some(report => report === undefined)) refuse("reviewed apply requires every implementation Ticket to be reported");
+  let candidate: { ticketId: string; revision: string } | undefined;
+  for (let index = ticketIds.length - 1; index >= 0; index--) { const report = reports[index]!; if (report.metadata.outcome === "completed" && report.metadata.candidateRevision) { candidate = { ticketId: ticketIds[index]!, revision: report.metadata.candidateRevision }; break; } }
+  if (!candidate) refuse("reviewed apply requires a completed current Candidate");
+  const reviewIds = await reviews.listApplicationReviewTicketIds(repository.root, input.goalId, input.applicationId);
+  if (reviewIds.length === 0) refuse("reviewed apply requires an approving review Ticket");
+  const reviewReports = await Promise.all(reviewIds.map(id => reviews.loadApplicationReviewReportIfPresent(repository.root, input.goalId, input.applicationId, id)));
+  if (reviewReports.some(report => report === undefined)) refuse("reviewed apply requires every review Ticket to be reported");
+  const reviewId = reviewIds.at(-1)!; const review = reviewReports.at(-1)!;
+  const reviewTicket = await reviews.loadApplicationReviewTicket(repository.root, input.goalId, input.applicationId, reviewId);
+  if (review.metadata.outcome !== "completed" || review.metadata.verdict !== "approve" || reviewTicket.metadata.candidateRevision !== candidate.revision || reviewTicket.metadata.producingImplementationTicketId !== candidate.ticketId || review.metadata.candidateRevision !== candidate.revision || review.metadata.producingImplementationTicketId !== candidate.ticketId) refuse("reviewed apply requires the usable highest approve Report for the exact current Candidate and producer");
+  const cleanup = await tickets.applicationCleanupWarnings(repository.root, input.goalId, input.applicationId);
+  if (cleanup.length) refuse(`reviewed apply requires healthy cleanup: ${cleanup.join("; ")}`);
+  const parents = (await git(repository.root, ["rev-list", "--parents", "-n", "1", candidate.revision])).split(/\s+/);
+  if (parents.length !== 2 || parents[0] !== candidate.revision || parents[1] !== previousTargetRevision) refuse("reviewed Candidate must have pinned M as its sole parent");
+  const decision = await publishReviewedApplyDecision(repository.root, head, { expectedPreviousMainRevision: previousTargetRevision, goalRevision: first.metadata.goalRevision, mergeBase: first.metadata.mergeBase, candidateRevision: candidate.revision, producingImplementationTicketId: candidate.ticketId, approvingReviewTicketId: reviewId }, input.now, input.crash);
   await advanceDecision(repository.root, decision, input.crash);
-  return { goalId: input.goalId, applicationId: input.applicationId, targetBranch: "main", previousTargetRevision, appliedRevision: head.metadata.integratedRevision, resultingTargetRevision: candidate };
+  return { goalId: input.goalId, applicationId: input.applicationId, targetBranch: "main", previousTargetRevision, appliedRevision: head.metadata.integratedRevision, resultingTargetRevision: candidate.revision, form: "reviewed" };
 }

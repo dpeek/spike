@@ -17,6 +17,16 @@ After a completed implementation Candidate and healthy cleanup, the supervisor m
 
 Application recovery interrupts open Application Tickets and rebuilds operational projections without changing `M`, `G`, Candidate refs, Goal refs, host worktree, or `main`. Target-decision recovery is supervisor-owned: it skips valid terminal return/stale attempts and advances only the earliest unresolved published decision owner. Malformed terminal evidence blocks only when that entry is reached; an unrelated later entry is not preflight-scanned.
 
+## Reviewed apply by compare-and-swap
+
+A diverged head is applied only after its highest fully reported review is an exact `approve` for the current Candidate and producing implementation Ticket, every implementation and review Ticket is reported, cleanup is healthy, and the separate immutable Application approval remains present. The supervisor then writes an immutable **reviewed apply decision** binding Application/Goal identity, squash form, pinned `M`, `G`, `B`, Candidate `C`, producer Ticket, approving review Ticket, approval text, and decision time.
+
+Decision publication precedes target mutation. The supervisor advances only `refs/heads/main`, with Git `update-ref` compare-and-swap from exact `M` to exact `C`; it does not inspect, check out, merge, reset, or otherwise alter the host worktree, Goal refs, or unrelated refs. A moved target is never overwritten.
+
+A reviewed decision is a FIFO barrier until `main == C`: `main == M` is **decision-pending** and recovery retries the CAS; `main == C` is **applied** and releases the next unresolved head; any other `main` is visible as **target-mismatch** and recovery makes no mutation. No decision with `main == M` has work to recover. Candidate retention is rebuildable evidence and never defines applied state. Target mismatch requires explicit operator intervention; it is not automatically resolved.
+
+The Project supervisor exposes reviewed apply, status, and target recovery. Goal planners and workers cannot mutate `main`. Every Application still requires its own separate operator approval, including two disjoint Goals delivered in FIFO order as two sole-parent squash commits.
+
 ## Return and stale resolution
 
 Only the supervisor can resolve the unresolved FIFO head, after every implementation/review Ticket is reported and cleanup is healthy. Both documents are immutable and bind identity, pinned `M`, `G`, and decision time. They never apply to `main` or mutate Goal/Candidate refs or the host worktree.

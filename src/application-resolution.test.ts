@@ -301,7 +301,8 @@ describe("Application terminal resolution", () => {
     expect(withoutApplications.some((tool) => tool.name === "spike_return_application")).toBe(false);
     expect(withApplications.some((tool) => tool.name === "spike_return_application")).toBe(true);
     expect(withApplications.some((tool) => tool.name === "spike_stale_application")).toBe(true);
-    expect(withApplications.some((tool) => tool.name === "spike_apply_queue_head")).toBe(false);
+    expect(withApplications.some((tool) => tool.name === "spike_apply_queue_head")).toBe(true);
+    expect(withApplications.some((tool) => tool.name === "spike_recover_application_apply")).toBe(true);
 
     const plannerTools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
     registerGoalPlannerExtension({ registerTool(tool) { plannerTools.push(tool); }, on() {}, sendMessage() {} }, goalId, "fixture-project", { validateProject: async () => undefined, invoke: async (input) => ({ ok: true, command: input.expectedCommand, data: {} }) });

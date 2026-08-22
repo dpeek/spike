@@ -304,7 +304,43 @@ export async function deriveApplicationChurn(root: string, goalId: string, appli
   for (let index = 1; index < reports.length; index++) if (["partial", "blocked"].includes(reports[index - 1]?.metadata.outcome ?? "") && ["partial", "blocked"].includes(reports[index]?.metadata.outcome ?? "")) { warnings.push({ kind: "non-progress", message: "two consecutive partial or blocked implementation Reports are recorded" }); break; }
   return warnings;
 }
-export async function deriveApplicationStatus(cwd: string, goalId: string, applicationId: string) { const repository = await discoverRepository(cwd); const application = await loadApplication(repository.root, goalId, applicationId); let resolution: "return" | "stale" | "malformed" | null = null; try { resolution = (await loadApplicationResolutionIfPresent(repository.root, goalId, applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; } const ticketIds = await listApplicationTicketIds(repository.root, goalId, applicationId); const reports = await Promise.all(ticketIds.map((ticketId) => loadApplicationReportIfPresent(repository.root, goalId, applicationId, ticketId))); const open = ticketIds.find((_id, i) => reports[i] === undefined) ?? null; const completed = reports.map((report, i) => ({ report, ticketId: ticketIds[i]! })).filter((value): value is { report: ApplicationReport; ticketId: string } => value.report?.metadata.outcome === "completed").at(-1); const pinned = ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.targetRevision : null; let current: string | null = null; try { current = await main(repository.root); } catch { /* status remains inspectable */ } const review = await (await import("./application-review.ts")).deriveApplicationReviewStatus(cwd, goalId, applicationId); const worker = open === null ? null : await (await import("./application-worker.ts")).observeApplicationWorker(repository.root, { goalId, applicationId, ticketId: open }); return { goalId, applicationId, queuePosition: application.metadata.queuePosition, resolution, openTicketId: open, latestReport: reports.filter(Boolean).at(-1)?.metadata ?? null, candidate: completed === undefined ? null : { ticketId: completed.ticketId, revision: completed.report.metadata.candidateRevision }, pinnedTargetRevision: pinned, integrationClassification: ticketIds.length ? (await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!)).metadata.integration.classification : null, targetMismatch: pinned !== null && current !== null && pinned !== current, cleanupWarnings: await applicationCleanupWarnings(repository.root, goalId, applicationId), churnWarnings: await deriveApplicationChurn(repository.root, goalId, applicationId), worker, review }; }
+export async function deriveApplicationStatus(cwd: string, goalId: string, applicationId: string) {
+  const repository = await discoverRepository(cwd);
+  const application = await loadApplication(repository.root, goalId, applicationId);
+  let resolution: "return" | "stale" | "malformed" | null = null;
+  try { resolution = (await loadApplicationResolutionIfPresent(repository.root, goalId, applicationId))?.metadata.disposition ?? null; }
+  catch { resolution = "malformed"; }
+  const ticketIds = await listApplicationTicketIds(repository.root, goalId, applicationId);
+  const reports = await Promise.all(ticketIds.map(ticketId => loadApplicationReportIfPresent(repository.root, goalId, applicationId, ticketId)));
+  const open = ticketIds.find((_id, index) => reports[index] === undefined) ?? null;
+  const completed = reports.map((report, index) => ({ report, ticketId: ticketIds[index]! }))
+    .filter((value): value is { report: ApplicationReport; ticketId: string } => value.report?.metadata.outcome === "completed").at(-1);
+  const first = ticketIds.length ? await loadApplicationTicket(repository.root, goalId, applicationId, ticketIds[0]!) : undefined;
+  const pinned = first?.metadata.targetRevision ?? null;
+  let current: string | null = null;
+  try { current = await main(repository.root); } catch { /* status remains inspectable */ }
+  const decision = await (await import("./application.ts")).loadApplicationDecisionIfPresent(repository.root, goalId, applicationId);
+  const evidenceState = await (await import("./application.ts")).applicationState(repository.root, { ...application, ...(decision === undefined ? {} : { decision }) });
+  const head = await queuedApplicationHead(repository.root);
+  const review = await (await import("./application-review.ts")).deriveApplicationReviewStatus(cwd, goalId, applicationId);
+  const cleanupWarnings = await applicationCleanupWarnings(repository.root, goalId, applicationId);
+  const worker = open === null ? null : await (await import("./application-worker.ts")).observeApplicationWorker(repository.root, { goalId, applicationId, ticketId: open });
+  return {
+    goalId, applicationId, queuePosition: application.metadata.queuePosition, resolution, evidenceState,
+    decision: decision?.metadata ?? null, openTicketId: open, latestReport: reports.filter(Boolean).at(-1)?.metadata ?? null,
+    candidate: completed === undefined ? null : { ticketId: completed.ticketId, revision: completed.report.metadata.candidateRevision! },
+    // Queue membership and head are immutable-evidence projections, not a
+    // mutable applied marker. They use the same state that renders CAS facts.
+    queue: { position: application.metadata.queuePosition, member: resolution === null && evidenceState !== "applied", head: head?.metadata.goalId === goalId && head.metadata.applicationId === applicationId },
+    pinnedTargetRevision: pinned, integrationClassification: first?.metadata.integration.classification ?? null,
+    // Target mismatch is an evidence-state conclusion. A successful reviewed
+    // CAS intentionally leaves M different from main, but that state is applied.
+    targetMismatch: evidenceState === "target-mismatch",
+    pinnedTargetMoved: pinned !== null && current !== null && pinned !== current,
+    cleanupWarnings, cleanup: { healthy: cleanupWarnings.length === 0, warnings: cleanupWarnings },
+    churnWarnings: await deriveApplicationChurn(repository.root, goalId, applicationId), worker, review,
+  };
+}
 /** Retryable operational cleanup does not publish or rewrite any Application evidence. */
 export async function cleanupApplicationTicketRuntime(cwd: string, goalId: string, applicationId: string, ticketId: string): Promise<{ root: string }> {
   const repository = await discoverRepository(cwd);

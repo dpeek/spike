@@ -15,7 +15,7 @@ import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
-import { returnApplication, staleApplication } from "./application.ts";
+import { recoverApplications, returnApplication, staleApplication } from "./application.ts";
 import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, publishApplicationPartialReport, recoverApplicationTicket } from "./application-ticket.ts";
 import { deriveApplicationReviewStatus, issueApplicationReviewTicket, prepareApplicationReviewExchange, publishApplicationReviewReport, recoverApplicationReviewTicket } from "./application-review.ts";
 import { dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker, loadFinishedApplicationReviewWorker, observeApplicationReviewWorker, readApplicationReviewWorker } from "./application-review-worker.ts";
@@ -73,6 +73,7 @@ Usage:
   spike application return --goal <goal-id> --application <application-id> --statement <statement> [--json]
   spike application stale --goal <goal-id> --application <application-id> [--json]
   spike application apply-head --goal <goal-id> --application <application-id> [--json]
+  spike application recover-apply [--json]
   spike application ticket issue --goal <goal-id> --application <application-id> --instruction <instruction> [options]
   spike application ticket prepare --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
   spike application review issue --goal <goal-id> --application <application-id> --instruction <instruction> [--json]
@@ -824,7 +825,11 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
   }
   for (const decision of status.decisions) lines.push(`  Decision ${decision.changeId} ${decision.disposition}`);
   if (status.application.length === 0) lines.push("  Applications none");
-  else for (const application of status.application) lines.push(`  Application ${application.applicationId} ${application.state}${application.churnWarnings.length ? `; churn warnings ${application.churnWarnings.length}` : ""}`);
+  else for (const application of status.application) {
+    lines.push(`  Application ${application.applicationId} ${application.state}; queue ${application.queue.position}${application.queue.head ? " head" : ""}${application.queue.member ? " member" : " released"}`);
+    lines.push(`    Candidate ${application.candidate?.revision ?? "none"}; Review ${JSON.stringify(application.review)}; Decision ${JSON.stringify(application.decision)}`);
+    lines.push(application.cleanup.healthy ? "    Cleanup healthy" : `    Cleanup warnings ${application.cleanup.warnings.length}`);
+  }
   lines.push(status.frozen ? "  Goal frozen by Application evidence" : "  Goal unfrozen");
   lines.push(status.cleanup.healthy ? "  Cleanup healthy" : `  Cleanup warnings ${status.cleanup.warnings.length}`);
   return `${lines.join("\n")}\n`;
@@ -833,7 +838,7 @@ function humanGoalStatus(status: DerivedGoalStatus): string {
 function humanRepositoryStatus(status: DerivedRepositoryStatus): string {
   const heading = `Project ${status.project.slug}\nRepository ${status.root}\n`;
   if (status.goals.length === 0) return `${heading}  No Goals\n  Cleanup healthy\n`;
-  const queue = status.applicationQueue.length === 0 ? "  Application queue empty\n" : `${status.applicationQueue.map((entry) => `  Queue ${entry.queuePosition} ${entry.goalId}/${entry.applicationId} ${entry.state}${entry.churnWarnings.length ? `; churn warnings ${entry.churnWarnings.length}` : ""}`).join("\n")}\n`;
+  const queue = status.applicationQueue.length === 0 ? "  Application queue empty\n" : `${status.applicationQueue.map((entry) => `  Queue ${entry.queuePosition} ${entry.goalId}/${entry.applicationId} ${entry.state} (evidence ${entry.evidenceState}; Candidate ${entry.candidate?.revision ?? "none"}; Review ${JSON.stringify(entry.review)}; Decision ${JSON.stringify(entry.decision)}; Cleanup ${entry.cleanup.healthy ? "healthy" : `${entry.cleanup.warnings.length} warnings`})`).join("\n")}\n`;
   const head = status.queueHead === null ? "  Queue head none\n" : `  Queue head ${status.queueHead.goalId}/${status.queueHead.applicationId} (${status.queueHead.queuePosition})\n`;
   return `${heading}${queue}${head}${status.goals.map(humanGoalStatus).join("")}`;
 }
@@ -1058,7 +1063,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "application" && args[1] === "status") {
       const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, input.goalId, input.applicationId);
-      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n  Churn warnings ${status.churnWarnings.length}\n`);
+      return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Evidence state ${status.evidenceState}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Decision ${status.decision === null ? "none" : JSON.stringify(status.decision)}\n  Queue ${status.queue.position}${status.queue.head ? " head" : ""}${status.queue.member ? " member" : " released"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Pinned target moved ${status.pinnedTargetMoved ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n  Cleanup ${status.cleanup.healthy ? "healthy" : `${status.cleanup.warnings.length} warnings`}\n  Churn warnings ${status.churnWarnings.length}\n`);
     }
 
     if (args[0] === "application" && args[1] === "recover") {
@@ -1082,6 +1087,11 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         `Applied FIFO head ${applied.goalId}/${applied.applicationId} to main\n` +
         `  Previous target revision ${applied.previousTargetRevision}\n` +
         `  Resulting target revision ${applied.resultingTargetRevision}\n`);
+    }
+    if (args[0] === "application" && args[1] === "recover-apply") {
+      if (args.length !== 2) throw new UsageError(`unknown application recover-apply option: ${args[2]}`);
+      const repository = await discoverRepository(cwd); await recoverApplications(repository.root);
+      return success(json, "application recover-apply", { root: repository.root }, "Recovered Application target decision\n");
     }
 
     if (args[0] === "goal" && args[1] === "create") {

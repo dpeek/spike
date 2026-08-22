@@ -104,7 +104,7 @@ export const goalPlannerToolNames = [
 ] as const;
 
 export const applicationSupervisorToolNames = [
-  "spike_return_application", "spike_stale_application", "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_publish_application_blocked", "spike_publish_application_partial", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
+  "spike_apply_queue_head", "spike_recover_application_apply", "spike_return_application", "spike_stale_application", "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_publish_application_blocked", "spike_publish_application_partial", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
 ] as const;
 
 export const supervisorToolNames = [
@@ -185,20 +185,62 @@ function findingSummary(findings: unknown): string | undefined {
   return `${total} finding${total === 1 ? "" : "s"} (${breakdown})`;
 }
 
+function evidenceText(value: unknown): string {
+  if (value === undefined || value === null) return "none";
+  try { return JSON.stringify(value) ?? "none"; } catch { return "unrenderable"; }
+}
+
+function cleanupStatusText(value: unknown, label = "cleanup"): string {
+  const cleanup = object(value);
+  return cleanup?.healthy === true
+    ? `${label} healthy`
+    : `${Array.isArray(cleanup?.warnings) ? cleanup.warnings.length : "?"} ${label} warning(s)`;
+}
+
+function applicationStatusLines(value: unknown): string[] {
+  const application = object(value);
+  if (application === undefined) return ["Invalid Application status"];
+  const candidate = object(application.candidate);
+  const review = object(application.review);
+  const decision = object(application.decision);
+  const queue = object(application.queue);
+  const queuePosition = queue?.position ?? application.queuePosition ?? "unknown";
+  const head = queue?.head === true ? "head" : "not head";
+  const membership = queue?.member === true || application.queueMember === true ? "member" : "not a member";
+  const candidateText = candidate === undefined
+    ? "Candidate none"
+    : `Candidate ${string(candidate.revision) ?? "unknown"} (Ticket ${string(candidate.ticketId) ?? "unknown"})`;
+  const reviewText = review === undefined
+    ? "Review none"
+    : `Review ${string(review.verdict) ?? "unknown"}${string(object(review.highestReview)?.ticketId) === undefined ? "" : ` (Ticket ${string(object(review.highestReview)?.ticketId)})`} · ${evidenceText(application.review)}`;
+  const decisionText = decision === undefined
+    ? "Decision none"
+    : `Decision ${string(decision.kind) ?? "unknown"} · ${evidenceText(application.decision)}`;
+  return [
+    `Application ${string(application.applicationId) ?? "unknown"} · State ${string(application.state) ?? "unknown"} · Evidence ${string(application.evidenceState) ?? "unknown"}`,
+    candidateText,
+    reviewText,
+    decisionText,
+    `Queue ${String(queuePosition)} · ${head} · ${membership}`,
+    `${cleanupStatusText(application.cleanup, "Application cleanup")} · ${evidenceText(application.cleanup)}`,
+  ];
+}
+
 function goalStatusLines(value: unknown): string[] {
   const goal = object(value);
   if (goal === undefined) return ["Invalid Goal status"];
   const goalId = string(goal.goalId) ?? "unknown Goal";
-  const cleanup = object(goal.cleanup);
-  const cleanupText = cleanup?.healthy === true
-    ? "cleanup healthy"
-    : `${Array.isArray(cleanup?.warnings) ? cleanup.warnings.length : "?"} cleanup warning(s)`;
+  const cleanupText = cleanupStatusText(goal.cleanup);
   const change = object(goal.currentChange);
   if (change === undefined) {
     const decisions = Array.isArray(goal.decisions) ? goal.decisions.length : 0;
     const applications = Array.isArray(goal.application) ? goal.application : [];
     const warnings = applications.reduce((count: number, application: unknown) => { const record = object(application); return count + (Array.isArray(record?.churnWarnings) ? record.churnWarnings.length : 0); }, 0);
-    return [`Goal ${goalId}`, `No active Change · ${decisions} resolved · ${cleanupText}${warnings ? ` · ${warnings} Application churn warning(s)` : ""}`];
+    return [
+      `Goal ${goalId}`,
+      `No active Change · ${decisions} resolved · ${cleanupText}${warnings ? ` · ${warnings} Application churn warning(s)` : ""}`,
+      ...applications.flatMap(applicationStatusLines),
+    ];
   }
 
   const lines = [`Goal ${goalId} · Change ${string(change.changeId) ?? "unknown"}`];
@@ -223,7 +265,12 @@ function goalStatusLines(value: unknown): string[] {
   const churn = Array.isArray(change.churnWarnings) ? change.churnWarnings.length : 0;
   if (churn > 0) lines.push(`${churn} churn warning(s)`);
   const applications = Array.isArray(goal.application) ? goal.application : [];
-  for (const application of applications) { const record = object(application); const churn = Array.isArray(record?.churnWarnings) ? record.churnWarnings.length : 0; if (churn > 0) lines.push(`Application ${string(record?.applicationId) ?? "unknown"} · ${churn} churn warning(s)`); }
+  for (const application of applications) {
+    const record = object(application);
+    lines.push(...applicationStatusLines(application));
+    const churn = Array.isArray(record?.churnWarnings) ? record.churnWarnings.length : 0;
+    if (churn > 0) lines.push(`Application ${string(record?.applicationId) ?? "unknown"} · ${churn} churn warning(s)`);
+  }
   lines.push(cleanupText);
   return lines;
 }
@@ -238,6 +285,20 @@ function statusText(data: unknown): string {
   const lines = [`Project ${string(project?.slug) ?? "unknown"}`];
   if (goals.length === 0) lines.push("No Goals");
   for (const goal of goals) lines.push(...goalStatusLines(goal));
+  if (Array.isArray(status.applicationQueue)) {
+    if (status.applicationQueue.length === 0) lines.push("Application queue empty");
+    else for (const entry of status.applicationQueue) {
+      const application = object(entry);
+      lines.push(`Queue ${String(application?.queuePosition ?? "unknown")} ${string(application?.goalId) ?? "unknown Goal"}/${string(application?.applicationId) ?? "unknown"} · State ${string(application?.state) ?? "unknown"} · Evidence ${string(application?.evidenceState) ?? "unknown"}`);
+    }
+    const queueHead = status.queueHead;
+    const head = object(queueHead);
+    lines.push(queueHead === null
+      ? "Queue head none"
+      : head === undefined
+        ? "Queue head unknown"
+        : `Queue head ${string(head.goalId) ?? "unknown Goal"}/${string(head.applicationId) ?? "unknown"} (${String(head.queuePosition ?? "unknown")})`);
+  }
   const cleanup = object(status.cleanup);
   if (cleanup?.healthy === false) {
     lines.push(`${Array.isArray(cleanup.warnings) ? cleanup.warnings.length : "?"} repository cleanup warning(s)`);
@@ -832,14 +893,18 @@ export function registerSupervisorExtension(
     tool({
       name: "spike_apply_queue_head",
       label: "Apply FIFO queue head",
-      description: "Supervisor-only clean-base application of one exact unresolved FIFO head.",
-      promptSnippet: "Apply only the exact FIFO head",
+      description: "Project-supervisor-only clean-base or reviewed diverged application of one exact unresolved FIFO head.",
+      promptSnippet: "Apply only the exact FIFO head", 
       parameters: {
         type: "object", additionalProperties: false, required: ["goalId", "applicationId"],
         properties: { goalId: requiredNonBlankString, applicationId: requiredNonBlankString },
       },
       command: "application apply-head",
       args: (params) => ["application", "apply-head", "--goal", params.goalId, "--application", params.applicationId],
+    }, invoke, options),
+    tool({
+      name: "spike_recover_application_apply", label: "Recover Application apply", description: "Project-supervisor-only deterministic recovery of the FIFO reviewed decision owner.", promptSnippet: "Recover only the durable reviewed decision owner",
+      parameters: { type: "object", additionalProperties: false, properties: {} }, command: "application recover-apply", args: () => ["application", "recover-apply"],
     }, invoke, options),
     tool({
       name: "spike_return_application", label: "Return Application", description: "Supervisor-only immutable return of the exact reviewed FIFO head; it never changes main.", promptSnippet: "Return exact reviewed Application with an explicit statement",
@@ -1339,7 +1404,7 @@ export function registerSupervisorExtension(
   ];
 
   const visible = options.goalId === undefined
-    ? tools.filter((definition) => definition.name !== "spike_apply_queue_head" && (options.applications === true || !(applicationSupervisorToolNames as readonly string[]).includes(definition.name)))
+    ? tools.filter((definition) => options.applications === true || !(applicationSupervisorToolNames as readonly string[]).includes(definition.name))
     : tools.filter((definition) => (goalPlannerToolNames as readonly string[]).includes(definition.name));
   for (const definition of visible) pi.registerTool(definition);
 }
