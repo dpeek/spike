@@ -249,7 +249,11 @@ Repository status is a durable projection of every Goal's documents, Reports,
 decisions, Applications, and Git evidence; it remains available without planners.
 Supervisor planner observations are a separate operational projection and never alter
 durable phase, cleanup health, or recovery. The supervisor extension exposes
-sequential structured tools for committed guidance selection, explicitly approved Goal creation, status, Plan revision,
+supervisor-only `spike_start_goal_planner`, `spike_observe_goal_planner`, and
+`spike_replace_goal_planner` lifecycle tools; replacement requires an explicit
+operator instruction, and starting a planner remains distinct from queueing a Goal
+for Application. It also exposes sequential structured tools for committed guidance
+selection, explicitly approved Goal creation, status, Plan revision,
 Change creation and decisions, focused Implement/Review/Remediate Ticket issuance,
 Pi dispatch, Report publication, and recovery. `spike_begin_step` must run
 immediately before each guided mutation. It loads the selected Markdown through

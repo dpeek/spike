@@ -545,6 +545,64 @@ describe("Pi supervisor extension", () => {
     ]);
   });
 
+  test("exposes focused Goal-planner lifecycle tools only to the Project supervisor", async () => {
+    const calls: RunSpikeJsonInput[] = [];
+    const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
+    let starts = 0;
+    const refusal = new Error("Spike rejected planner start-or-reattach: Goal planner admission limit of 2 is reached");
+    registerSupervisorExtension({
+      registerTool(tool) { tools.push(tool); },
+      on() {},
+      sendMessage() {},
+    }, {
+      async invoke(input) {
+        calls.push(input);
+        const goalId = input.args.at(-1)!;
+        if (goalId === "goal-refused") throw refusal;
+        if (input.expectedCommand === "planner start-or-reattach") {
+          const action = starts++ === 0 ? "launched" : "reattached";
+          return { ok: true, command: input.expectedCommand, data: { goalId, name: `planner-${goalId}`, state: "live", action, resources: [{ tab: "tab", pane: "pane", paneCount: 1, status: "working" }] } };
+        }
+        if (input.expectedCommand === "planner replace") {
+          return { ok: true, command: input.expectedCommand, data: { goalId, name: `planner-${goalId}`, state: "live", action: "replaced", resources: [{ tab: "new-tab", pane: "new-pane", paneCount: 1, status: "working" }] } };
+        }
+        return { ok: true, command: input.expectedCommand, data: { goalId, name: `planner-${goalId}`, state: "stale", resources: [{ tab: "old-tab", pane: "old-pane", paneCount: 1, status: "done" }] } };
+      },
+    });
+    const registered = new Map(tools.map((tool) => [tool.name, tool]));
+    const context = { cwd: "/project" };
+
+    const launched = await registered.get("spike_start_goal_planner")!.execute("launch", { goalId: "goal-1" }, undefined, undefined, context);
+    const reattached = await registered.get("spike_start_goal_planner")!.execute("reattach", { goalId: "goal-1" }, undefined, undefined, context);
+    const observed = await registered.get("spike_observe_goal_planner")!.execute("observe", { goalId: "goal-1" }, undefined, undefined, context);
+    const replaced = await registered.get("spike_replace_goal_planner")!.execute("replace", {
+      goalId: "goal-1", replacementInstruction: "Replace this Goal planner now.",
+    }, undefined, undefined, context);
+
+    expect(calls.map((call) => call.args)).toEqual([
+      ["planner", "start-or-reattach", "--goal", "goal-1"],
+      ["planner", "start-or-reattach", "--goal", "goal-1"],
+      ["planner", "observe", "--goal", "goal-1"],
+      ["planner", "replace", "--goal", "goal-1"],
+    ]);
+    expect(renderSupervisorResponse(launched.details, false)).toBe("Goal planner goal-1 · launched · live · 1 resource");
+    expect(renderSupervisorResponse(reattached.details, false)).toBe("Goal planner goal-1 · reattached · live · 1 resource");
+    expect(renderSupervisorResponse(observed.details, false)).toBe("Goal planner goal-1 · observed · stale · 1 resource");
+    expect(renderSupervisorResponse(replaced.details, false)).toBe("Goal planner goal-1 · replaced · live · 1 resource");
+    expect(registered.get("spike_replace_goal_planner")!.parameters).toMatchObject({
+      required: ["goalId", "replacementInstruction"],
+      properties: { replacementInstruction: { minLength: 1, pattern: "\\S" } },
+    });
+
+    await expect(registered.get("spike_replace_goal_planner")!.execute("replace", {
+      goalId: "goal-1", replacementInstruction: " ",
+    }, undefined, undefined, context)).rejects.toThrow("explicit operator replacement instruction");
+    expect(calls).toHaveLength(4);
+    await expect(registered.get("spike_start_goal_planner")!.execute("refused", {
+      goalId: "goal-refused",
+    }, undefined, undefined, context)).rejects.toBe(refusal);
+  });
+
   test("Goal planner extension registers only scoped operations and rejects cross-Goal calls before Spike", async () => {
     const calls: RunSpikeJsonInput[] = [];
     const tools: Array<Parameters<SupervisorExtensionApi["registerTool"]>[0]> = [];
@@ -557,6 +615,7 @@ describe("Pi supervisor extension", () => {
     });
     expect(tools.map((tool) => tool.name)).toEqual([...goalPlannerToolNames]);
     expect(tools.some((tool) => tool.name === "spike_create_goal" || tool.name === "spike_apply_goal")).toBe(false);
+    expect(tools.some((tool) => tool.name.includes("goal_planner"))).toBe(false);
     const scoped = new Map(tools.map((tool) => [tool.name, tool]));
     await expect(scoped.get("spike_revise_plan")!.execute("call", { goalId: "other", body: "# no" }, undefined, undefined, { cwd: "/project" }))
       .rejects.toThrow("restricted to Goal goal-1");

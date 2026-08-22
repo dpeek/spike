@@ -54,7 +54,7 @@ describe("Goal planner ownership", () => {
     // Local test repository identity is its canonical git-common directory.
     const { herdr, calls } = fakeHerdr([{ tab: "tab-1", pane: "pane-1", label: actual.name, status: "working" }]);
     const result = await goalPlannerOperations.startOrReattach({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr });
-    expect(result.state).toBe("live");
+    expect(result).toMatchObject({ state: "live", action: "reattached" });
     expect(calls.some((call) => call.startsWith("create:"))).toBe(false);
     expect(calls.some((call) => call.startsWith("run:"))).toBe(false);
   });
@@ -64,7 +64,7 @@ describe("Goal planner ownership", () => {
     const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
     const { herdr, calls } = fakeHerdr([{ tab: "old-tab", pane: "old-pane", label: identity.name, status: "done" }]);
     const result = await goalPlannerOperations.startOrReattach({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr, piExecutable: "pi binary'; touch never" });
-    expect(result).toMatchObject({ state: "live", resources: [{ tab: "new-tab", pane: "new-pane" }] });
+    expect(result).toMatchObject({ state: "live", action: "launched", resources: [{ tab: "new-tab", pane: "new-pane" }] });
     expect(calls).toContain("close:old-tab");
     const command = calls.find((call) => call.startsWith("run:"))!;
     expect(command).toContain("--name");
@@ -94,7 +94,8 @@ describe("Goal planner ownership", () => {
     ]);
     await expect(goalPlannerOperations.startOrReattach({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr })).rejects.toThrow("multiple live Goal planners");
     expect(calls.some((call) => call.startsWith("close:") || call.startsWith("create:"))).toBe(false);
-    await goalPlannerOperations.replace({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr });
+    const replaced = await goalPlannerOperations.replace({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr });
+    expect(replaced.action).toBe("replaced");
     expect(calls).toEqual(expect.arrayContaining(["close:tab-1", "close:tab-2"]));
   });
 

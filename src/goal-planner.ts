@@ -14,14 +14,16 @@ export type GoalPlannerObservation = GoalPlannerIdentity & {
   resources: Array<HerdrTabMatch & { status: HerdrAgentStatus }>;
   state: "live" | "stale" | "absent" | "duplicate" | "unavailable";
 };
+export type GoalPlannerStartResult = GoalPlannerObservation & { action: "launched" | "reattached" };
+export type GoalPlannerReplaceResult = GoalPlannerObservation & { action: "replaced" };
 
 /** The fixed Project-supervisor admission limit. It is deliberately not config. */
 export const maximumActiveGoalPlanners = 2;
 export type GoalPlannerOperations = {
-  startOrReattach(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
+  startOrReattach(input: GoalPlannerInput): Promise<GoalPlannerStartResult>;
   observe(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
   attach(input: GoalPlannerInput): Promise<number>;
-  replace(input: GoalPlannerInput): Promise<GoalPlannerObservation>;
+  replace(input: GoalPlannerInput): Promise<GoalPlannerReplaceResult>;
   /** Operational cleanup after durable Application admission. */
   release(input: GoalPlannerInput): Promise<void>;
 };
@@ -195,12 +197,12 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     // happens before selected stale tabs are closed, a tab is created, Pi is
     // launched, or any workflow path/ref is touched.
     assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
-    if (current.state === "live") return current;
+    if (current.state === "live") return { ...current, action: "reattached" };
     if (current.state === "stale" || current.state === "unavailable") {
       assertNoSiblingPanes(current);
       await close(current.resources, herdr);
     }
-    return launch(target, input, herdr);
+    return { ...await launch(target, input, herdr), action: "launched" };
   },
   async attach(input) {
     const target = await selected(input);
@@ -226,6 +228,6 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
     assertNoSiblingPanes(current);
     await close(current.resources, herdr);
-    return launch(target, input, herdr);
+    return { ...await launch(target, input, herdr), action: "replaced" };
   },
 };

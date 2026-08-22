@@ -115,6 +115,9 @@ export const applicationSupervisorToolNames = [
 export const supervisorToolNames = [
   "spike_begin_step",
   "spike_status",
+  "spike_start_goal_planner",
+  "spike_observe_goal_planner",
+  "spike_replace_goal_planner",
   "spike_queue_goal",
   "spike_create_goal",
   "spike_create_request",
@@ -201,6 +204,15 @@ function cleanupStatusText(value: unknown, label = "cleanup"): string {
   return cleanup?.healthy === true
     ? `${label} healthy`
     : `${Array.isArray(cleanup?.warnings) ? cleanup.warnings.length : "?"} ${label} warning(s)`;
+}
+
+function plannerLifecycleText(command: string, value: unknown): string {
+  const planner = object(value);
+  const action = command === "planner observe"
+    ? "observed"
+    : string(planner?.action) ?? (command === "planner replace" ? "replaced" : "started or reattached");
+  const resources = Array.isArray(planner?.resources) ? planner.resources.length : 0;
+  return `Goal planner ${string(planner?.goalId) ?? "unknown"} · ${action} · ${string(planner?.state) ?? "unknown"} · ${resources} resource${resources === 1 ? "" : "s"}`;
 }
 
 function applicationStatusLines(value: unknown): string[] {
@@ -354,6 +366,9 @@ function commandSummary(response: SpikeJsonSuccess): string {
   const data = object(response.data);
   switch (response.command) {
     case "status": return statusText(response.data);
+    case "planner start-or-reattach":
+    case "planner observe":
+    case "planner replace": return plannerLifecycleText(response.command, response.data);
     case "guidance show": return `Loaded ${string(data?.step) ?? "workflow"} guidance`;
     case "goal queue": return `Queued Goal ${string(data?.goalId) ?? "unknown"} at FIFO position ${String(data?.queuePosition ?? "unknown")}`;
     case "application apply-head": return `Applied FIFO head ${string(data?.goalId) ?? "unknown"}/${string(data?.applicationId) ?? "unknown"}`;
@@ -892,6 +907,63 @@ export function registerSupervisorExtension(
         if (params.goalId === undefined) args.push("--operational");
         optional(args, "--goal", params.goalId);
         return args;
+      },
+    }, invoke, options),
+    tool({
+      name: "spike_start_goal_planner",
+      label: "Start Goal planner",
+      description: "Supervisor-only start or safe reattachment of one existing Goal's dedicated planner through exact Project-qualified discovery and admission.",
+      promptSnippet: "Start or reattach one dedicated Goal planner",
+      promptGuidelines: [
+        "This is operational planner lifecycle only; it does not queue a completed Goal for Application or change durable workflow state.",
+      ],
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId"],
+        properties: { goalId: requiredNonBlankString },
+      },
+      command: "planner start-or-reattach",
+      args: (params) => ["planner", "start-or-reattach", "--goal", params.goalId],
+    }, invoke, options),
+    tool({
+      name: "spike_observe_goal_planner",
+      label: "Observe Goal planner",
+      description: "Supervisor-only focused operational observation of one existing Goal's exact planner resources.",
+      promptSnippet: "Observe one dedicated Goal planner without changing it",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId"],
+        properties: { goalId: requiredNonBlankString },
+      },
+      command: "planner observe",
+      args: (params) => ["planner", "observe", "--goal", params.goalId],
+    }, invoke, options),
+    tool({
+      name: "spike_replace_goal_planner",
+      label: "Replace Goal planner",
+      description: "Supervisor-only explicit replacement of one Goal planner. Requires the operator's replacement instruction and preserves Spike's selected-Goal cleanup and admission checks.",
+      promptSnippet: "Replace one Goal planner only when explicitly instructed by the operator",
+      promptGuidelines: [
+        "Do not infer replacement permission from stale, unavailable, duplicate, or blocked status; require an explicit operator instruction.",
+        "Replacement is operational only and must not be used to retire a Goal planner's active worker pane.",
+      ],
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["goalId", "replacementInstruction"],
+        properties: {
+          goalId: requiredNonBlankString,
+          replacementInstruction: { ...requiredNonBlankString, description: "The operator's explicit instruction to replace this Goal planner." },
+        },
+      },
+      command: "planner replace",
+      args: (params) => ["planner", "replace", "--goal", params.goalId],
+      beforeInvoke(params) {
+        if (typeof params.replacementInstruction !== "string" || !params.replacementInstruction.trim()) {
+          throw new Error("Replacing a Goal planner requires an explicit operator replacement instruction");
+        }
       },
     }, invoke, options),
     tool({
