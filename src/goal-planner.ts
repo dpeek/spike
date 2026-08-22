@@ -135,6 +135,17 @@ function shellArgument(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+function kickoffPrompt(goalId: string): string {
+  return [
+    `You are the dedicated planner for Goal ${goalId}.`,
+    `Start work now by calling spike_status with goalId ${goalId} to load the Goal's authoritative durable state.`,
+    "Then plan and execute the Goal under tracked guidance through small coherent Changes, fresh implementation Tickets, independent review Tickets, and explicit landing of each approved Change.",
+    "Call spike_begin_step immediately before each guided mutation.",
+    "Continue autonomously until the Goal is complete or genuine operator input is required.",
+    "Do not queue or apply the completed Goal; Application is owned by the Project supervisor.",
+  ].join(" ");
+}
+
 async function launch(selectedGoal: { project: ProjectPaths; identity: GoalPlannerIdentity }, input: GoalPlannerInput, herdr: HerdrOperations): Promise<GoalPlannerObservation> {
   const selection = (await loadProjectConfig(selectedGoal.project.root)).agents.planner;
   const tab = await herdr.createTab({
@@ -154,6 +165,7 @@ async function launch(selectedGoal: { project: ProjectPaths; identity: GoalPlann
     pi, "--name", selectedGoal.identity.name, "--model", selection.model, "--thinking", selection.thinking,
     "--no-approve", "--no-extensions", "--extension", extension,
     "--tools", ["read", "grep", "find", "ls", ...goalPlannerToolNames].join(","),
+    kickoffPrompt(selectedGoal.identity.goalId),
   ].map(shellArgument).join(" ");
   try {
     await herdr.run(handles.pane, command);

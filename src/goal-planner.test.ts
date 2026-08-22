@@ -73,6 +73,16 @@ describe("Goal planner ownership", () => {
     expect(command).toContain("pi-goal-planner-extension.ts");
     expect(command).toContain("spike_create_change");
     expect(command).not.toContain("spike_create_goal");
+    const kickoff = [
+      `You are the dedicated planner for Goal ${goalId}.`,
+      `Start work now by calling spike_status with goalId ${goalId} to load the Goal's authoritative durable state.`,
+      "Then plan and execute the Goal under tracked guidance through small coherent Changes, fresh implementation Tickets, independent review Tickets, and explicit landing of each approved Change.",
+      "Call spike_begin_step immediately before each guided mutation.",
+      "Continue autonomously until the Goal is complete or genuine operator input is required.",
+      "Do not queue or apply the completed Goal; Application is owned by the Project supervisor.",
+    ].join(" ");
+    expect(kickoff.trim()).not.toBe("");
+    expect(command).toEndWith(`'${kickoff.replaceAll("'", "'\\''")}'`);
   });
 
   test("refuses duplicate live resources without close or launch and replacement closes all", async () => {
@@ -151,6 +161,9 @@ describe("Goal planner ownership", () => {
     expect(calls.filter((call) => call === "close:stale-tab")).toEqual(["close:stale-tab"]);
     expect(calls.filter((call) => call.startsWith("close:new-tab"))).toEqual(["close:new-tab", "close:new-tab-2"]);
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(3);
+    const launches = calls.filter((call) => call.startsWith("run:"));
+    expect(launches).toHaveLength(3);
+    expect(launches.every((call) => call.includes(`Start work now by calling spike_status with goalId ${goalId}`))).toBe(true);
   });
 
   test("does not replace a planner while its Goal tab owns a worker pane", async () => {
