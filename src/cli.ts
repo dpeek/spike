@@ -15,6 +15,7 @@ import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
 import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
+import { returnApplication, staleApplication } from "./application.ts";
 import { deriveApplicationStatus, issueApplicationTicket, prepareApplicationTicketExchange, publishApplicationImplementationReport, publishApplicationPartialReport, recoverApplicationTicket } from "./application-ticket.ts";
 import { deriveApplicationReviewStatus, issueApplicationReviewTicket, prepareApplicationReviewExchange, publishApplicationReviewReport, recoverApplicationReviewTicket } from "./application-review.ts";
 import { dispatchApplicationReviewPiTicket, dispatchApplicationReviewWorker, loadFinishedApplicationReviewWorker, observeApplicationReviewWorker, readApplicationReviewWorker } from "./application-review-worker.ts";
@@ -69,6 +70,8 @@ Usage:
   spike guidance show --step <step> [--goal <goal-id>] [--change <change-id>] [--json]
   spike goal create --title <title> --outcome <outcome> --approval <statement> [options]
   spike goal queue --goal <goal-id> --target main --approval <statement> [--json]
+  spike application return --goal <goal-id> --application <application-id> --statement <statement> [--json]
+  spike application stale --goal <goal-id> --application <application-id> [--json]
   spike application apply-head --goal <goal-id> --application <application-id> [--json]
   spike application ticket issue --goal <goal-id> --application <application-id> --instruction <instruction> [options]
   spike application ticket prepare --goal <goal-id> --application <application-id> --ticket <ticket-id> [--json]
@@ -357,6 +360,13 @@ function parseApplicationPartialPublish(args: string[]): { goalId: string; appli
   let goalId: string | undefined, applicationId: string | undefined, ticketId: string | undefined, worker: string | undefined, reason: string | undefined;
   for (let index = 0; index < args.length; index += 2) { const option = args[index]!, value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--ticket") ticketId = value; else if (option === "--worker") worker = value; else if (option === "--reason") reason = value; else throw new UsageError(`unknown option: ${option}`); }
   if (!goalId) throw new UsageError("--goal is required"); if (!applicationId) throw new UsageError("--application is required"); if (!ticketId) throw new UsageError("--ticket is required"); if (!worker) throw new UsageError("--worker is required"); if (!reason) throw new UsageError("--reason is required"); return { goalId, applicationId, ticketId, worker, reason };
+}
+
+function parseApplicationResolution(args: string[], requiresStatement: boolean): { goalId: string; applicationId: string; statement?: string } {
+  let goalId: string | undefined, applicationId: string | undefined, statement: string | undefined;
+  for (let index = 0; index < args.length; index += 2) { const option = args[index]!, value = valueAfter(args, index, option); if (option === "--goal") goalId = value; else if (option === "--application") applicationId = value; else if (option === "--statement" && requiresStatement) statement = value; else throw new UsageError(`unknown option: ${option}`); }
+  if (goalId === undefined) throw new UsageError("--goal is required"); if (applicationId === undefined) throw new UsageError("--application is required"); if (requiresStatement && statement === undefined) throw new UsageError("--statement is required");
+  return { goalId, applicationId, ...(statement === undefined ? {} : { statement }) };
 }
 
 function parseApplicationApplyHead(args: string[]): { goalId: string; applicationId: string } {
@@ -1054,6 +1064,15 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     if (args[0] === "application" && args[1] === "recover") {
       const input = parseApplicationIdentity(args.slice(2), { ticket: true, reason: true }); const recovered = await recoverApplicationTicket(cwd, input.goalId, input.applicationId, input.ticketId!, input.reason);
       return success(json, "application recover", recovered, `Recovered Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
+    }
+
+    if (args[0] === "application" && args[1] === "return") {
+      const input = parseApplicationResolution(args.slice(2), true); const resolved = await returnApplication({ cwd, ...input, statement: input.statement! });
+      return success(json, "application return", { resolution: resolved.resolution.metadata }, `Returned Application ${input.goalId}/${input.applicationId}\n`);
+    }
+    if (args[0] === "application" && args[1] === "stale") {
+      const input = parseApplicationResolution(args.slice(2), false); const resolved = await staleApplication({ cwd, ...input });
+      return success(json, "application stale", { resolution: resolved.resolution.metadata }, `Marked Application stale ${input.goalId}/${input.applicationId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "apply-head") {

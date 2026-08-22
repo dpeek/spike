@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { loadProjectConfig } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { listGoalIds, loadGoal } from "./goal.ts";
+import { assertGoalNotFrozen } from "./application.ts";
 import { type HerdrAgentStatus, herdrOperations, type HerdrHandles, type HerdrOperations } from "./herdr.ts";
 import { goalPlannerToolNames } from "./pi-supervisor-extension.ts";
 
@@ -165,6 +166,7 @@ export const goalPlannerOperations: GoalPlannerOperations = {
   },
   async startOrReattach(input) {
     const target = await selected(input);
+    await assertGoalNotFrozen(target.root, input.goalId);
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
     if (current.state === "duplicate") throw new Error(`multiple live Goal planners found for ${target.identity.name}; refusing to choose or close either`);
@@ -191,6 +193,7 @@ export const goalPlannerOperations: GoalPlannerOperations = {
   },
   async replace(input) {
     const target = await selected(input);
+    await assertGoalNotFrozen(target.root, input.goalId);
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
     // Replacement keeps the selected Goal's one owner. At capacity its old

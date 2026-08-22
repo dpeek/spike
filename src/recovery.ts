@@ -7,7 +7,7 @@ import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
 import { sequenceIdPattern } from "./identity.ts";
 import { projectRoot } from "./project.ts";
-import { assertGoalNotFrozen, listProjectApplications, listPublishedApplicationIds, recoverApplications } from "./application.ts";
+import { assertGoalNotFrozen, goalApplicationFreeze, listProjectApplications, listPublishedApplicationIds, loadApplicationResolutionIfPresent, recoverApplications } from "./application.ts";
 import { listApplicationTicketIds, recoverApplicationTicket } from "./application-ticket.ts";
 import { listApplicationReviewTicketIds, recoverApplicationReviewTicket } from "./application-review.ts";
 import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
@@ -256,6 +256,10 @@ export async function recoverPublishedApplicationPlanners(
   const repository = await discoverRepository(cwd);
   const warnings: PlannerCleanupWarning[] = [];
   for (const application of await listProjectApplications(repository.root)) {
+    // Resolved history never owns a planner. A malformed resolution remains a
+    // durable barrier for its own operation, not a reason to touch runtime.
+    try { if (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId)) continue; }
+    catch { continue; }
     try {
       await planners.release({ cwd: repository.root, goalId: application.metadata.goalId });
     } catch (error) {
@@ -350,20 +354,17 @@ export async function reconcileGoal(
   // Application evidence freezes Goal-local recovery. The Project supervisor
   // may still recover its already-published target decision, without replaying
   // any Goal ref or workflow mutation.
-  if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0) {
-    // Application Tickets are a separate Goal/Application/Ticket namespace.
-    // They are recoverable without reissuing work or rebuilding their target pin.
+  if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0 && (await goalApplicationFreeze(repository.root, input.goalId)).frozen) {
+    // A resolved attempt has no active runtime ownership: return/stale preconditions
+    // require all reports and healthy cleanup. Unresolved attempts retain the
+    // existing projection-rebuild recovery, but terminal history is never revived.
     for (const application of await listProjectApplications(repository.root)) {
       if (application.metadata.goalId !== input.goalId) continue;
-      for (const ticketId of await listApplicationTicketIds(repository.root, input.goalId, application.metadata.applicationId)) {
-        // Recovery reconciles every durable Application Report, including
-        // completed ones whose rebuildable retention/runtime projections were
-        // lost after publication.
-        await recoverApplicationTicket(repository.root, input.goalId, application.metadata.applicationId, ticketId, input.reason);
-      }
-      for (const reviewId of await listApplicationReviewTicketIds(repository.root, input.goalId, application.metadata.applicationId)) {
-        await recoverApplicationReviewTicket(repository.root, input.goalId, application.metadata.applicationId, reviewId, input.reason);
-      }
+      let resolution;
+      try { resolution = await loadApplicationResolutionIfPresent(repository.root, input.goalId, application.metadata.applicationId); } catch { continue; }
+      if (resolution !== undefined) continue;
+      for (const ticketId of await listApplicationTicketIds(repository.root, input.goalId, application.metadata.applicationId)) await recoverApplicationTicket(repository.root, input.goalId, application.metadata.applicationId, ticketId, input.reason);
+      for (const reviewId of await listApplicationReviewTicketIds(repository.root, input.goalId, application.metadata.applicationId)) await recoverApplicationReviewTicket(repository.root, input.goalId, application.metadata.applicationId, reviewId, input.reason);
     }
     if (input.recoverApplications !== false) await recoverApplications(repository.root);
     return {

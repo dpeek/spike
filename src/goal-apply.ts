@@ -2,7 +2,7 @@ import { deriveGoalIntegratedRevision } from "./change.ts";
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
 import { deriveGoalStatus } from "./status.ts";
-import { advanceDecision, applicationState, createSquashCandidate, hasTerminalApplication, listPublishedApplicationIds, publishApplication, publishApplyDecision, queuedApplicationHead, validDecision } from "./application.ts";
+import { advanceDecision, applicationRequeueEligibility, applicationState, createSquashCandidate, hasTerminalApplication, listPublishedApplicationIds, publishApplication, publishApplyDecision, queuedApplicationHead, validDecision } from "./application.ts";
 import { goalPlannerOperations, type GoalPlannerOperations } from "./goal-planner.ts";
 import type { CrashInjector } from "./crash.ts";
 
@@ -20,7 +20,9 @@ export async function queueGoalIntegration(input: QueueGoalIntegrationInput): Pr
   const status = await deriveGoalStatus(repository.root, input.goalId);
   if (status.currentChange !== null) refuse(`Goal ${input.goalId} has an active Change ${status.currentChange.changeId}`);
   if (!status.cleanup.healthy) refuse(`Goal ${input.goalId} has unhealthy workflow cleanup`);
-  if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0) refuse(`Goal ${input.goalId} already has immutable Application evidence`);
+  const priorApplications = await listPublishedApplicationIds(repository.root, input.goalId);
+  const requeue = await applicationRequeueEligibility(repository.root, input.goalId);
+  if (priorApplications.length !== 0 && requeue === "none") refuse(`Goal ${input.goalId} is not eligible to requeue from its immutable Application evidence`);
   if (await hasTerminalApplication(repository.root, input.goalId)) refuse(`Goal ${input.goalId} is terminal after application`);
   if (status.application.some((entry) => entry.state === "inconsistent")) refuse(`Goal ${input.goalId} has an inconsistent Application; run recovery`);
   const integratedRevision = await deriveGoalIntegratedRevision(repository.root, input.goalId);

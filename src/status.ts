@@ -17,7 +17,7 @@ import {
 } from "./report.ts";
 import { listTicketIds, loadOpenTicket } from "./ticket.ts";
 import { loadRecordedWorkerIfPresent, type TicketIdentity } from "./worker.ts";
-import { applicationEvidence, applicationState, listProjectApplications, queuedApplicationHead } from "./application.ts";
+import { applicationEvidence, applicationState, goalApplicationFreeze, listProjectApplications, loadApplicationResolutionIfPresent, queuedApplicationHead } from "./application.ts";
 import { deriveApplicationStatus, type ApplicationChurnWarning } from "./application-ticket.ts";
 import { goalPlannerIdentity, goalPlannerOperations, type GoalPlannerObservation } from "./goal-planner.ts";
 import { herdrOperations, type HerdrOperations } from "./herdr.ts";
@@ -82,8 +82,10 @@ export type DerivedGoalStatus = {
   currentChange: DerivedChangeStatus | null;
   decisions: DerivedDecision[];
   cleanup: CleanupHealth;
-  application: Array<{ applicationId: string; state: "incomplete" | "inconsistent" | "applied"; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
+  application: Array<{ applicationId: string; state: "incomplete" | "inconsistent" | "applied"; resolution: "return" | "stale" | "malformed" | null; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
   frozen: boolean;
+  returnedRequeueEligible: boolean;
+  stale: boolean;
 };
 
 export type DerivedRepositoryStatus = {
@@ -91,7 +93,7 @@ export type DerivedRepositoryStatus = {
   project: { slug: string };
   goals: DerivedGoalStatus[];
   cleanup: CleanupHealth;
-  applicationQueue: Array<{ goalId: string; applicationId: string; queuePosition: number; integratedRevision: string; state: "queued" | "applied" | "inconsistent"; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
+  applicationQueue: Array<{ goalId: string; applicationId: string; queuePosition: number; integratedRevision: string; queueMember: boolean; state: "queued" | "applied" | "inconsistent" | "return" | "stale" | "malformed"; review: unknown; churnWarnings: ApplicationChurnWarning[] }>;
   queueHead: null | { goalId: string; applicationId: string; queuePosition: number };
 };
 
@@ -222,7 +224,14 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
       ? null
       : await deriveActiveChangeStatus(repository.root, goalId, activeChangeId);
 
-  const applicationWithReview = await Promise.all(application.map(async entry => { const status = await deriveApplicationStatus(repository.root, goalId, entry.applicationId); return { ...entry, review: status.review, churnWarnings: status.churnWarnings }; }));
+  const applicationWithReview = await Promise.all(application.map(async entry => {
+    const status = await deriveApplicationStatus(repository.root, goalId, entry.applicationId);
+    let resolution: "return" | "stale" | "malformed" | null = null;
+    try { const evidence = await loadApplicationResolutionIfPresent(repository.root, goalId, entry.applicationId); resolution = evidence?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
+    return { ...entry, resolution, review: status.review, churnWarnings: status.churnWarnings };
+  }));
+  let freeze: Awaited<ReturnType<typeof goalApplicationFreeze>>;
+  try { freeze = await goalApplicationFreeze(repository.root, goalId); } catch { freeze = { frozen: true, returnedRequeueEligible: false, stale: false }; }
   return {
     goalId,
     integratedRevision,
@@ -231,7 +240,9 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
     decisions,
     cleanup: { healthy: cleanupWarnings.length === 0, warnings: cleanupWarnings },
     application: applicationWithReview,
-    frozen: application.length !== 0,
+    frozen: freeze.frozen,
+    returnedRequeueEligible: freeze.returnedRequeueEligible,
+    stale: freeze.stale,
   };
 }
 
@@ -254,12 +265,13 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
     project,
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
-    applicationQueue: await Promise.all(queue.map(async (application, index) => { const status = await deriveApplicationStatus(repository.root, application.metadata.goalId, application.metadata.applicationId); return {
+    applicationQueue: await Promise.all(queue.map(async (application, index) => { const status = await deriveApplicationStatus(repository.root, application.metadata.goalId, application.metadata.applicationId); let resolution: "return" | "stale" | "malformed" | null = null; try { resolution = (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; } return {
       goalId: application.metadata.goalId,
       applicationId: application.metadata.applicationId,
       queuePosition: application.metadata.queuePosition,
       integratedRevision: application.metadata.integratedRevision,
-      state: queueStates[index] === "applied" ? "applied" : queueStates[index] === "inconsistent" ? "inconsistent" : "queued",
+      queueMember: resolution === null && queueStates[index] !== "applied",
+      state: resolution ?? (queueStates[index] === "applied" ? "applied" : queueStates[index] === "inconsistent" ? "inconsistent" : "queued"),
       review: status.review,
       churnWarnings: status.churnWarnings,
     }; })),

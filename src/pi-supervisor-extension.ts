@@ -104,14 +104,13 @@ export const goalPlannerToolNames = [
 ] as const;
 
 export const applicationSupervisorToolNames = [
-  "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_publish_application_blocked", "spike_publish_application_partial", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
+  "spike_return_application", "spike_stale_application", "spike_issue_application_implement", "spike_prepare_application_ticket", "spike_dispatch_application_pi", "spike_application_worker_status", "spike_application_worker_read", "spike_publish_application_report", "spike_publish_application_blocked", "spike_publish_application_partial", "spike_recover_application", "spike_issue_application_review", "spike_prepare_application_review", "spike_dispatch_application_review", "spike_publish_application_review", "spike_application_review_status", "spike_recover_application_review",
 ] as const;
 
 export const supervisorToolNames = [
   "spike_begin_step",
   "spike_status",
   "spike_queue_goal",
-  "spike_apply_queue_head",
   "spike_create_goal",
   "spike_create_request",
   "spike_list_requests",
@@ -843,6 +842,16 @@ export function registerSupervisorExtension(
       args: (params) => ["application", "apply-head", "--goal", params.goalId, "--application", params.applicationId],
     }, invoke, options),
     tool({
+      name: "spike_return_application", label: "Return Application", description: "Supervisor-only immutable return of the exact reviewed FIFO head; it never changes main.", promptSnippet: "Return exact reviewed Application with an explicit statement",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "statement"], properties: { goalId: nonBlankString, applicationId: nonBlankString, statement: requiredNonBlankString } }, command: "application return",
+      args: (params) => ["application", "return", "--goal", params.goalId, "--application", params.applicationId, "--statement", params.statement],
+    }, invoke, options),
+    tool({
+      name: "spike_stale_application", label: "Mark Application stale", description: "Supervisor-only immutable stale resolution of the exact moved-target FIFO head; it never changes main.", promptSnippet: "Record exact moved-target Application as stale",
+      parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId"], properties: { goalId: nonBlankString, applicationId: nonBlankString } }, command: "application stale",
+      args: (params) => ["application", "stale", "--goal", params.goalId, "--application", params.applicationId],
+    }, invoke, options),
+    tool({
       name: "spike_issue_application_review", label: "Issue Application Review Ticket", description: "Supervisor-only issue of a review Ticket for the exact current Application Candidate.", promptSnippet: "Issue exact Application Candidate review",
       parameters: { type: "object", additionalProperties: false, required: ["goalId", "applicationId", "instruction"], properties: { goalId: nonBlankString, applicationId: nonBlankString, instruction: nonBlankString } }, command: "application review issue",
       args: (params) => ["application", "review", "issue", "--goal", params.goalId, "--application", params.applicationId, "--instruction", params.instruction],
@@ -1330,7 +1339,7 @@ export function registerSupervisorExtension(
   ];
 
   const visible = options.goalId === undefined
-    ? tools.filter((definition) => options.applications === true || !(applicationSupervisorToolNames as readonly string[]).includes(definition.name))
+    ? tools.filter((definition) => definition.name !== "spike_apply_queue_head" && (options.applications === true || !(applicationSupervisorToolNames as readonly string[]).includes(definition.name)))
     : tools.filter((definition) => (goalPlannerToolNames as readonly string[]).includes(definition.name));
   for (const definition of visible) pi.registerTool(definition);
 }

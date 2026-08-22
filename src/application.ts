@@ -11,13 +11,22 @@ const revision = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const time = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const identity = z.object({ kind: z.literal("application"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), target: z.literal("main"), integratedRevision: revision, approval: z.string().trim().min(1), requestedAt: time, queuePosition: z.number().int().positive() }).strict();
 const decisionSchema = z.object({ kind: z.literal("application-decision"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), candidateRevision: revision, expectedPreviousMainRevision: revision, resultingMainRevision: revision, decidedAt: time }).strict();
+const resolutionIdentity = z.object({ kind: z.literal("application-resolution"), goalId: z.string().regex(goalIdPattern), applicationId: z.string().regex(sequenceIdPattern), expectedMainRevision: revision, goalRevision: revision, decidedAt: time }).strict();
+const returnedResolutionSchema = resolutionIdentity.extend({ disposition: z.literal("return"), candidateRevision: revision, producingImplementationTicketId: z.string().regex(sequenceIdPattern), highestReviewTicketId: z.string().regex(sequenceIdPattern), statement: z.string().trim().min(1) }).strict();
+// Stale provenance is deliberately all-or-nothing. A Candidate without its
+// producer (or vice versa) cannot identify the evidence it purports to retain.
+const staleResolutionWithoutCandidateSchema = resolutionIdentity.extend({ disposition: z.literal("stale"), observedMainRevision: revision }).strict();
+const staleResolutionWithCandidateSchema = resolutionIdentity.extend({ disposition: z.literal("stale"), observedMainRevision: revision, candidateRevision: revision, producingImplementationTicketId: z.string().regex(sequenceIdPattern) }).strict();
+const resolutionSchema = z.union([returnedResolutionSchema, staleResolutionWithoutCandidateSchema, staleResolutionWithCandidateSchema]);
 export type Application = { metadata: z.infer<typeof identity>; body: string };
 export type ApplicationDecision = { metadata: z.infer<typeof decisionSchema>; body: string };
+export type ApplicationResolution = { metadata: z.infer<typeof resolutionSchema>; body: string };
 export type QueuedApplication = Application & { decision?: ApplicationDecision; invalidDecision?: true };
 
 function rootPath(root: string, goalId: string) { return join(projectRoot(root), "goals", goalId, "applications"); }
 export function applicationPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "application.md"); }
 export function applicationDecisionPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "decision.md"); }
+export function applicationResolutionPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "resolution.md"); }
 /** Allocated IDs include abandoned pre-publication directories and only burn IDs. */
 export async function listApplicationIds(root: string, goalId: string): Promise<string[]> { return (await listDirectoryNames(root, rootPath(root, goalId))).filter((id) => sequenceIdPattern.test(id)).sort(); }
 /** Only a published Application document is workflow evidence. */
@@ -43,6 +52,16 @@ export async function loadApplicationDecisionIfPresent(root: string, goalId: str
   const doc = await readDocument(root, applicationDecisionPath(root, goalId, applicationId)); const metadata = decisionSchema.parse(doc.metadata);
   if (metadata.goalId !== goalId || metadata.applicationId !== applicationId) throw new Error("Application decision belongs to a different Application");
   return { metadata, body: doc.body };
+}
+/** Resolution parsing is deliberately lazy: unrelated later evidence cannot
+ * obstruct an earlier valid FIFO head. */
+export async function loadApplicationResolutionIfPresent(root: string, goalId: string, applicationId: string): Promise<ApplicationResolution | undefined> {
+  if (!(await documentExists(root, applicationResolutionPath(root, goalId, applicationId)))) return undefined;
+  const doc = await readDocument(root, applicationResolutionPath(root, goalId, applicationId)); const metadata = resolutionSchema.parse(doc.metadata);
+  if (metadata.goalId !== goalId || metadata.applicationId !== applicationId) throw new Error("Application resolution belongs to a different Application");
+  const resolution = { metadata, body: doc.body };
+  await validateApplicationResolution(root, goalId, applicationId, resolution);
+  return resolution;
 }
 function next(ids: string[]) { const high = ids.reduce((n, id) => Math.max(n, Number(id)), 0); if (high >= 999) throw new Error("Application ID sequence is exhausted"); return String(high + 1).padStart(3, "0"); }
 async function checkedOutMain(root: string) { const branch = await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); if (branch !== "main") throw new Error("apply refused: main must be the currently checked-out local branch"); }
@@ -83,12 +102,48 @@ export async function applicationState(root: string, application: QueuedApplicat
  * target advancement or is invalid. Callers must never skip it. */
 export async function queuedApplicationHead(root: string): Promise<QueuedApplication | undefined> {
   for (const application of await listProjectApplications(root)) {
+    let resolution: ApplicationResolution | undefined;
+    try { resolution = await loadApplicationResolutionIfPresent(root, application.metadata.goalId, application.metadata.applicationId); }
+    catch { throw new Error(`Application ${application.metadata.goalId}/${application.metadata.applicationId} has malformed resolution evidence`); }
+    // A valid terminal resolution removes precisely this attempt from FIFO.
+    if (resolution !== undefined) continue;
     if ((await applicationState(root, application)) !== "applied") return application;
   }
   return undefined;
 }
+
+/** Return releases Goal planning immediately but only becomes requeue-eligible
+ * after G advances. Stale and unresolved attempts always freeze. */
+export async function goalApplicationFreeze(root: string, goalId: string): Promise<{ frozen: boolean; returnedRequeueEligible: boolean; stale: boolean }> {
+  let latest: ApplicationResolution | undefined;
+  for (const applicationId of await listPublishedApplicationIds(root, goalId)) {
+    // Validate each reached historical boundary, but stop at an unresolved
+    // owner exactly as FIFO selection does. A valid older stale result is
+    // retained as history and is superseded by a later returned attempt.
+    let resolution: ApplicationResolution | undefined;
+    try { resolution = await loadApplicationResolutionIfPresent(root, goalId, applicationId); }
+    catch { throw new Error(`Application ${goalId}/${applicationId} has malformed resolution evidence`); }
+    if (resolution === undefined) return { frozen: true, returnedRequeueEligible: false, stale: false };
+    latest = resolution;
+  }
+  if (latest === undefined) return { frozen: false, returnedRequeueEligible: false, stale: false };
+  if (latest.metadata.disposition === "stale") return { frozen: true, returnedRequeueEligible: false, stale: true };
+  const currentG = await git(root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
+  return { frozen: false, returnedRequeueEligible: currentG !== latest.metadata.goalRevision, stale: false };
+}
+export async function applicationRequeueEligibility(root: string, goalId: string): Promise<"none" | "returned" | "stale"> {
+  const ids = await listPublishedApplicationIds(root, goalId);
+  if (ids.length === 0) return "none";
+  const applicationId = ids.at(-1)!;
+  const application = await loadApplication(root, goalId, applicationId);
+  const resolution = await loadApplicationResolutionIfPresent(root, goalId, applicationId);
+  if (resolution === undefined) return "none";
+  const currentG = await git(root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
+  if (resolution.metadata.disposition === "return") return currentG !== resolution.metadata.goalRevision ? "returned" : "none";
+  return currentG === application.metadata.integratedRevision ? "stale" : "none";
+}
 export async function assertGoalNotFrozen(root: string, goalId: string): Promise<void> {
-  if ((await listPublishedApplicationIds(root, goalId)).length !== 0) throw new Error(`Goal ${goalId} is frozen by immutable Application evidence`);
+  if ((await goalApplicationFreeze(root, goalId)).frozen) throw new Error(`Goal ${goalId} is frozen by immutable Application evidence`);
 }
 
 /** Create the immutable squash object without changing any ref or worktree. */
@@ -110,6 +165,94 @@ export async function publishApplication(input: PublishApplicationInput): Promis
   await installImmutable(input.root, applicationPath(input.root, input.goalId, applicationId), serializeDocument(metadata, body), commitCrashHooks(input.crash, "application-publication"));
   return { metadata, body };
 }
+async function validateApplicationResolution(root: string, goalId: string, applicationId: string, resolution: ApplicationResolution): Promise<void> {
+  const tickets = await import("./application-ticket.ts");
+  const reviews = await import("./application-review.ts");
+  const application = await loadApplication(root, goalId, applicationId);
+  const implementationIds = await tickets.listApplicationTicketIds(root, goalId, applicationId);
+  if (implementationIds.length === 0) throw new Error("Application resolution has no pinned first implementation Ticket");
+  const first = await tickets.loadApplicationTicket(root, goalId, applicationId, implementationIds[0]!);
+  if (resolution.metadata.expectedMainRevision !== first.metadata.targetRevision || resolution.metadata.goalRevision !== first.metadata.goalRevision || first.metadata.goalRevision !== application.metadata.integratedRevision) {
+    throw new Error("Application resolution does not preserve pinned M/G facts");
+  }
+  let currentCandidate: { revision: string; ticketId: string } | undefined;
+  for (let index = implementationIds.length - 1; index >= 0; index--) {
+    const report = await tickets.loadApplicationReportIfPresent(root, goalId, applicationId, implementationIds[index]!);
+    if (report?.metadata.outcome === "completed" && report.metadata.candidateRevision) {
+      currentCandidate = { revision: report.metadata.candidateRevision, ticketId: implementationIds[index]! };
+      break;
+    }
+  }
+  if (resolution.metadata.disposition === "stale") {
+    if (resolution.metadata.observedMainRevision === resolution.metadata.expectedMainRevision) throw new Error("Stale Application resolution must record a moved main");
+    if (currentCandidate === undefined) {
+      if ("candidateRevision" in resolution.metadata || "producingImplementationTicketId" in resolution.metadata) throw new Error("Stale Application resolution has unexpected Candidate provenance");
+    } else if (!("candidateRevision" in resolution.metadata) || resolution.metadata.candidateRevision !== currentCandidate.revision || resolution.metadata.producingImplementationTicketId !== currentCandidate.ticketId) {
+      throw new Error("Stale Application resolution Candidate provenance does not match pinned facts");
+    }
+    return;
+  }
+  if (currentCandidate === undefined || resolution.metadata.candidateRevision !== currentCandidate.revision || resolution.metadata.producingImplementationTicketId !== currentCandidate.ticketId) throw new Error("Return Application resolution Candidate provenance does not match pinned facts");
+  const reviewIds = await reviews.listApplicationReviewTicketIds(root, goalId, applicationId);
+  const highestReviewId = reviewIds.at(-1);
+  if (highestReviewId === undefined || resolution.metadata.highestReviewTicketId !== highestReviewId) throw new Error("Return Application resolution does not identify the highest review Ticket");
+  const review = await reviews.loadApplicationReviewReportIfPresent(root, goalId, applicationId, highestReviewId);
+  if (!review || review.metadata.outcome !== "completed" || review.metadata.candidateRevision !== currentCandidate.revision || review.metadata.producingImplementationTicketId !== currentCandidate.ticketId) throw new Error("Return Application resolution review provenance does not match pinned facts");
+}
+
+async function resolutionPrerequisites(root: string, goalId: string, applicationId: string) {
+  const tickets = await import("./application-ticket.ts");
+  const reviews = await import("./application-review.ts");
+  const implementationIds = await tickets.listApplicationTicketIds(root, goalId, applicationId);
+  if (implementationIds.length === 0) throw new Error("Application resolution requires a pinned first implementation Ticket");
+  const reports = await Promise.all(implementationIds.map(id => tickets.loadApplicationReportIfPresent(root, goalId, applicationId, id)));
+  if (reports.some(report => report === undefined)) throw new Error("Application resolution requires every implementation Ticket to be reported");
+  const reviewIds = await reviews.listApplicationReviewTicketIds(root, goalId, applicationId);
+  const reviewReports = await Promise.all(reviewIds.map(id => reviews.loadApplicationReviewReportIfPresent(root, goalId, applicationId, id)));
+  if (reviewReports.some(report => report === undefined)) throw new Error("Application resolution requires every review Ticket to be reported");
+  const cleanup = await tickets.applicationCleanupWarnings(root, goalId, applicationId);
+  if (cleanup.length) throw new Error(`Application resolution requires healthy cleanup: ${cleanup.join("; ")}`);
+  let currentCandidate: { revision: string; ticketId: string } | undefined;
+  for (let index = implementationIds.length - 1; index >= 0; index--) {
+    const report = reports[index]!;
+    if (report?.metadata.outcome === "completed" && report.metadata.candidateRevision) { currentCandidate = { revision: report.metadata.candidateRevision, ticketId: implementationIds[index]! }; break; }
+  }
+  return { first: await tickets.loadApplicationTicket(root, goalId, applicationId, implementationIds[0]!), currentCandidate, highestReviewId: reviewIds.at(-1), highestReview: reviewReports.at(-1) };
+}
+
+export type ResolveApplicationInput = { cwd: string; goalId: string; applicationId: string; statement?: string; now?: Date };
+/** Supervisor-only terminal return. Every check precedes immutable publication. */
+export async function returnApplication(input: ResolveApplicationInput): Promise<{ root: string; resolution: ApplicationResolution }> {
+  const statement = input.statement?.trim(); if (!statement) throw new Error("Application return statement must not be blank");
+  const repository = await (await import("./git.ts")).discoverRepository(input.cwd);
+  const head = await queuedApplicationHead(repository.root);
+  if (!head || head.metadata.goalId !== input.goalId || head.metadata.applicationId !== input.applicationId) throw new Error("Application return requires the exact unresolved FIFO head");
+  if (await documentExists(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
+  const facts = await resolutionPrerequisites(repository.root, input.goalId, input.applicationId);
+  const review = facts.highestReview;
+  if (!review || review.metadata.outcome !== "completed" || !facts.currentCandidate || review.metadata.candidateRevision !== facts.currentCandidate.revision || review.metadata.producingImplementationTicketId !== facts.currentCandidate.ticketId || facts.highestReviewId === undefined) throw new Error("Application return requires the completed highest review for the exact current Candidate and producer");
+  const observed = await main(repository.root);
+  if (observed !== facts.first.metadata.targetRevision) throw new Error(`Application return requires main ${facts.first.metadata.targetRevision}`);
+  const metadata = resolutionSchema.parse({ kind: "application-resolution", disposition: "return", goalId: input.goalId, applicationId: input.applicationId, expectedMainRevision: facts.first.metadata.targetRevision, goalRevision: facts.first.metadata.goalRevision, candidateRevision: facts.currentCandidate.revision, producingImplementationTicketId: facts.currentCandidate.ticketId, highestReviewTicketId: facts.highestReviewId, decidedAt: (input.now ?? new Date()).toISOString(), statement });
+  const body = `# Return Application\n\n${statement}\n`;
+  await installImmutable(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId), serializeDocument(metadata, body));
+  return { root: repository.root, resolution: { metadata, body } };
+}
+/** Supervisor-only terminal stale resolution. It records target movement, never repairs it. */
+export async function staleApplication(input: ResolveApplicationInput): Promise<{ root: string; resolution: ApplicationResolution }> {
+  const repository = await (await import("./git.ts")).discoverRepository(input.cwd);
+  const head = await queuedApplicationHead(repository.root);
+  if (!head || head.metadata.goalId !== input.goalId || head.metadata.applicationId !== input.applicationId) throw new Error("Application stale requires the exact unresolved FIFO head");
+  if (await documentExists(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
+  const facts = await resolutionPrerequisites(repository.root, input.goalId, input.applicationId);
+  const observed = await main(repository.root);
+  if (observed === facts.first.metadata.targetRevision) throw new Error("Application stale requires main to differ from pinned M");
+  const metadata = resolutionSchema.parse({ kind: "application-resolution", disposition: "stale", goalId: input.goalId, applicationId: input.applicationId, expectedMainRevision: facts.first.metadata.targetRevision, observedMainRevision: observed, goalRevision: facts.first.metadata.goalRevision, ...(facts.currentCandidate === undefined ? {} : { candidateRevision: facts.currentCandidate.revision, producingImplementationTicketId: facts.currentCandidate.ticketId }), decidedAt: (input.now ?? new Date()).toISOString() });
+  const body = `# Stale Application\n\nPinned main \`${facts.first.metadata.targetRevision}\` moved to \`${observed}\`.\n`;
+  await installImmutable(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId), serializeDocument(metadata, body));
+  return { root: repository.root, resolution: { metadata, body } };
+}
+
 export async function publishApplyDecision(root: string, application: Application, candidateRevision: string, expectedPreviousMainRevision: string, now?: Date, crash?: CrashInjector): Promise<ApplicationDecision> {
   const metadata = decisionSchema.parse({ kind: "application-decision", goalId: application.metadata.goalId, applicationId: application.metadata.applicationId, candidateRevision, expectedPreviousMainRevision, resultingMainRevision: candidateRevision, decidedAt: (now ?? new Date()).toISOString() });
   const body = `# Apply decision\n\nAdvance main from \`${expectedPreviousMainRevision}\` to \`${candidateRevision}\`.\n`;
@@ -141,6 +284,12 @@ export async function validDecision(root: string, application: Application, deci
 /** Recovery is supervisor-owned and advances only decisions already in FIFO evidence. */
 export async function recoverApplications(root: string, _goalId?: string): Promise<void> {
   for (const queued of await listProjectApplications(root)) {
+    let resolution: ApplicationResolution | undefined;
+    try { resolution = await loadApplicationResolutionIfPresent(root, queued.metadata.goalId, queued.metadata.applicationId); }
+    catch { throw new Error(`apply recovery refused: Application ${queued.metadata.goalId}/${queued.metadata.applicationId} has malformed resolution evidence`); }
+    // A valid terminal attempt has relinquished target ownership. Skip it
+    // lazily, so later malformed evidence is reached only after it matters.
+    if (resolution !== undefined) continue;
     if (queued.invalidDecision === true) throw new Error(`apply recovery refused: Application ${queued.metadata.goalId}/${queued.metadata.applicationId} has invalid decision evidence or an unexpected main projection`);
     if (queued.decision === undefined) break;
     const state = await applicationState(root, queued);
