@@ -185,7 +185,7 @@ async function runWorkerSubmission(
 ): Promise<CompletionData> {
   const actionLabel = action === "complete" ? "completion" : "block";
   if (input.signal?.aborted) throw new Error(`Spike worker ${actionLabel} was cancelled`);
-  const command = input.command ?? input.environment?.["SPIKE_BIN"] ?? process.env["SPIKE_BIN"] ?? "spike";
+  const command = input.command ?? input.environment?.["SPIKE_BIN"] ?? "spike";
 
   return new Promise<CompletionData>((resolve, reject) => {
     const child = spawn(command, ["worker", action, "--json"], {
@@ -369,15 +369,23 @@ function blockedToolForRole(
   };
 }
 
+export function workerExtensionOptions(environment: NodeJS.ProcessEnv): RegisterWorkerExtensionOptions {
+  return {
+    role: requiredRole(environment["SPIKE_TICKET_ROLE"]),
+    command: environment["SPIKE_BIN"] ?? "spike",
+    environment,
+  };
+}
+
 export function registerWorkerExtension(
   pi: WorkerExtensionApi,
-  options: RegisterWorkerExtensionOptions = {},
+  options: RegisterWorkerExtensionOptions,
 ): void {
-  const role = requiredRole(options.role ?? process.env["SPIKE_TICKET_ROLE"]);
+  const role = requiredRole(options.role);
   pi.registerTool(completionToolForRole(role, options.complete ?? runWorkerCompletion, options));
   pi.registerTool(blockedToolForRole(role, options.block ?? runWorkerBlocked, options));
 }
 
 export default function spikeWorkerExtension(pi: WorkerExtensionApi): void {
-  registerWorkerExtension(pi);
+  registerWorkerExtension(pi, workerExtensionOptions(process.env));
 }

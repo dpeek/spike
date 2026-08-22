@@ -73,11 +73,43 @@ export type WorkerExecution = TicketIdentity & {
 };
 
 
+export type WorkerHostOptions = {
+  dockerImage: string;
+  spikeExecutable: string;
+  piExecutable: string;
+  herdrAvailable: boolean;
+  piAuthFile?: string;
+  piAgentDirectory?: string;
+  homeDirectory?: string;
+};
+
+export function resolveWorkerHostOptions(environment: NodeJS.ProcessEnv): WorkerHostOptions {
+  return {
+    dockerImage: environment["SPIKE_DOCKER_IMAGE"] ?? "spike-worker:local",
+    spikeExecutable: environment["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike"),
+    piExecutable: environment["SPIKE_PI_BIN"] ?? "pi",
+    herdrAvailable: environment["HERDR_ENV"] === "1",
+    ...(environment["SPIKE_PI_AUTH_FILE"]?.trim() ? { piAuthFile: environment["SPIKE_PI_AUTH_FILE"]!.trim() } : {}),
+    ...(environment["PI_CODING_AGENT_DIR"]?.trim() ? { piAgentDirectory: environment["PI_CODING_AGENT_DIR"]!.trim() } : {}),
+    ...(environment["HOME"]?.trim() ? { homeDirectory: environment["HOME"]!.trim() } : {}),
+  };
+}
+
+const defaultWorkerHostOptions: WorkerHostOptions = {
+  dockerImage: "spike-worker:local",
+  spikeExecutable: resolve(import.meta.dir, "..", "bin", "spike"),
+  piExecutable: "pi",
+  herdrAvailable: false,
+};
+
 export type DispatchWorkerTicketInput = TicketIdentity & {
   cwd: string;
   hostPaths: HostPaths;
   command: string[];
   worker: string;
+  hostOptions?: WorkerHostOptions;
+  /** Deliberate inherited subprocess environment; protocol values override it. */
+  environment?: NodeJS.ProcessEnv;
   environmentDigest?: string;
   clock?: () => Date;
   /** Deterministic adapter-test seam, invoked after immutable image inspection. */
@@ -100,7 +132,9 @@ export type DispatchPiTicketInput = TicketIdentity & {
   hostPaths: HostPaths;
   worker: string;
   host?: "herdr" | "direct";
+  hostOptions?: WorkerHostOptions;
   piExecutable?: string;
+  environment?: NodeJS.ProcessEnv;
   clock?: () => Date;
   herdr?: HerdrOperations;
 };
@@ -118,7 +152,7 @@ export type PiDispatchClassification =
 export function selectPiHost(
   _policy: { isolation: "workspace" | "container" },
   requested?: "herdr" | "direct",
-  herdrAvailable = process.env["HERDR_ENV"] === "1",
+  herdrAvailable = false,
 ): "herdr" | "direct" {
   if (requested !== undefined) return requested;
   return herdrAvailable ? "herdr" : "direct";
@@ -979,6 +1013,7 @@ function workerEnvironment(
   exchange: TicketExchange,
   checkoutRevision: string,
   ticket: Awaited<ReturnType<typeof loadTicket>>,
+  spikeExecutable: string,
 ): Record<string, string> {
   return {
     SPIKE_INPUT_DIR: exchange.inputDirectory,
@@ -990,7 +1025,7 @@ function workerEnvironment(
     SPIKE_TICKET_ROLE: ticket.metadata.role,
     SPIKE_MODEL: ticket.metadata.model,
     SPIKE_THINKING: ticket.metadata.thinking,
-    SPIKE_BIN: resolve(import.meta.dir, "..", "bin", "spike"),
+    SPIKE_BIN: spikeExecutable,
   };
 }
 
@@ -1036,7 +1071,10 @@ const dockerPiProvider = "openai-codex";
  * deliberately never mounted: only a newly serialized one-provider document
  * crosses the Docker boundary, and it exists there only on tmpfs.
  */
-export async function resolveDockerCredential(ticket: Awaited<ReturnType<typeof loadTicket>>): Promise<DockerCredential | undefined> {
+export async function resolveDockerCredential(
+  ticket: Awaited<ReturnType<typeof loadTicket>>,
+  hostOptions: WorkerHostOptions = defaultWorkerHostOptions,
+): Promise<DockerCredential | undefined> {
   const grants = ticket.metadata.executionPolicy.credentialGrants;
   if (grants.length === 0) return undefined;
   if (grants.length !== 1) throw new Error("docker adapter supports exactly one declared credential grant");
@@ -1047,13 +1085,12 @@ export async function resolveDockerCredential(ticket: Awaited<ReturnType<typeof 
   }
   // An explicit source is an override, not a hint: a bad override must fail
   // before Docker/exchange side effects rather than silently using another login.
-  const override = process.env["SPIKE_PI_AUTH_FILE"]?.trim() || undefined;
-  const configuredDirectory = process.env["PI_CODING_AGENT_DIR"]?.trim();
+  const override = hostOptions.piAuthFile;
   const candidates = override !== undefined
     ? [override]
     : [
-      ...(configuredDirectory === undefined || configuredDirectory === "" ? [] : [join(configuredDirectory, "auth.json")]),
-      ...(process.env["HOME"]?.trim() ? [join(process.env["HOME"]!, ".pi", "agent", "auth.json")] : []),
+      ...(hostOptions.piAgentDirectory === undefined ? [] : [join(hostOptions.piAgentDirectory, "auth.json")]),
+      ...(hostOptions.homeDirectory === undefined ? [] : [join(hostOptions.homeDirectory, ".pi", "agent", "auth.json")]),
     ];
   let raw: string | undefined;
   for (const source of candidates) {
@@ -1147,13 +1184,9 @@ async function dockerRemove(containerId: string): Promise<void> {
   await dockerRequired(["rm", "--force", containerId]);
 }
 
-function dockerImage(): string {
-  return process.env["SPIKE_DOCKER_IMAGE"] ?? "spike-worker:local";
-}
-
 function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: Awaited<ReturnType<typeof loadTicket>>, credential?: DockerCredential): string[] {
   const values = {
-    ...workerEnvironment(exchange, revision, ticket),
+    ...workerEnvironment(exchange, revision, ticket, "/opt/spike/bin/spike"),
     SPIKE_INPUT_DIR: "/exchange/input",
     SPIKE_OUTPUT_DIR: "/exchange/output",
     SPIKE_BIN: "/opt/spike/bin/spike",
@@ -1217,9 +1250,10 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
   // Validate and resolve before preparing an exchange or invoking Docker create.
   validateDockerPolicy(ticket);
-  const credential = await resolveDockerCredential(ticket);
+  const hostOptions = input.hostOptions ?? defaultWorkerHostOptions;
+  const credential = await resolveDockerCredential(ticket, hostOptions);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const image = dockerImage();
+  const image = hostOptions.dockerImage;
   const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", image]);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${image}`);
   await input.afterDockerImageInspection?.(imageDigest);
@@ -1286,10 +1320,11 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
   const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
   validateDockerPolicy(ticket);
-  const credential = await resolveDockerCredential(ticket);
+  const hostOptions = input.hostOptions ?? defaultWorkerHostOptions;
+  const credential = await resolveDockerCredential(ticket, hostOptions);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", dockerImage()]);
-  if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${dockerImage()}`);
+  const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", hostOptions.dockerImage]);
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${hostOptions.dockerImage}`);
   const exchange = await prepareTicketExchange(repository, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const host = input.herdr ?? herdrOperations;
@@ -1372,7 +1407,7 @@ export async function dispatchHerdrTicket(
     handles = await host.createTab({
       cwd: checkout,
       label: `${input.goalId}-${input.changeId}-${input.ticketId}`,
-      environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket),
+      environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket, (input.hostOptions ?? defaultWorkerHostOptions).spikeExecutable),
     });
     workerRecord = await recordLocalCloneWorker(repository, {
       ...identity,
@@ -1454,7 +1489,7 @@ export async function dispatchLocalTicket(
     if (liveWorker.stopRequested) throw new Error("direct worker was stopped before launch");
     const child = Bun.spawn(input.command, {
       cwd: checkout,
-      env: { ...process.env, ...workerEnvironment(exchange, ticket.metadata.inputRevision, ticket) },
+      env: { ...(input.environment ?? process.env), ...workerEnvironment(exchange, ticket.metadata.inputRevision, ticket, (input.hostOptions ?? defaultWorkerHostOptions).spikeExecutable) },
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -1552,7 +1587,8 @@ export async function dispatchPiTicket(
   await assertGoalNotFrozen(repository, input.goalId);
   const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const host = selectPiHost(ticket.metadata.executionPolicy, input.host);
+  const hostOptions = input.hostOptions ?? defaultWorkerHostOptions;
+  const host = selectPiHost(ticket.metadata.executionPolicy, input.host, hostOptions.herdrAvailable);
   const container = selectWorkerAdapter(ticket.metadata.executionPolicy) === dockerWorkerAdapter;
   // Docker receives no host checkout paths. The pinned image contains both Pi
   // and this extension, while its entrypoint clones the immutable input bundle.
@@ -1560,7 +1596,7 @@ export async function dispatchPiTicket(
   const terminalTools = piTerminalTools(ticket.metadata.role);
   const extension = container ? "/opt/spike/src/pi-worker-extension.ts" : resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
-    container ? "/usr/local/bin/pi" : input.piExecutable ?? "pi",
+    container ? "/usr/local/bin/pi" : input.piExecutable ?? hostOptions.piExecutable,
     ...(host === "direct" ? ["--print"] : []),
     "--no-session",
     // Never prompt for project trust: the immutable checkout is established
@@ -1592,6 +1628,8 @@ export async function dispatchPiTicket(
       worker: input.worker,
       command,
       ...(input.clock === undefined ? {} : { clock: input.clock }),
+      hostOptions,
+      ...(input.environment === undefined ? {} : { environment: input.environment }),
       ...(input.herdr === undefined ? {} : { herdr: input.herdr }),
     });
     return { ...attended, hosting: "herdr" as const };
@@ -1603,6 +1641,8 @@ export async function dispatchPiTicket(
     hostPaths: input.hostPaths,
     worker: input.worker,
     command,
+    hostOptions,
+    ...(input.environment === undefined ? {} : { environment: input.environment }),
     ...(input.clock === undefined ? {} : { clock: input.clock }),
   });
   const classification: PiDispatchClassification = dispatched.execution.exitCode !== 0

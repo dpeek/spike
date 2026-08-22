@@ -37,8 +37,9 @@ function barrier(parties: number) {
  */
 const worker = String.raw`
 import { writeFile } from "node:fs/promises";
-import { completeWorker } from ${JSON.stringify(completionUrl)};
+import { completeWorker, parseWorkerProtocolContext } from ${JSON.stringify(completionUrl)};
 
+const protocol = parseWorkerProtocolContext(process.env);
 const goalId = process.env.SPIKE_GOAL_ID;
 if (!goalId) throw new Error("missing Goal identity");
 if (process.env.SPIKE_TICKET_ROLE === "implement") {
@@ -51,7 +52,7 @@ if (process.env.SPIKE_TICKET_ROLE === "implement") {
     risks: "None observed.",
     followUp: "Review the exact normalized Candidate.",
     artifacts: [],
-  }));
+  }), protocol);
 } else {
   await completeWorker(process.cwd(), JSON.stringify({
     reviewStatement: "Candidate for " + goalId + " is isolated and approved.",
@@ -63,7 +64,7 @@ if (process.env.SPIKE_TICKET_ROLE === "implement") {
     }],
     verdict: "approve",
     artifacts: [],
-  }));
+  }), protocol);
 }
 `;
 

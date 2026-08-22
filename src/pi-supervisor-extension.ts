@@ -505,8 +505,8 @@ function parseResponse(stdout: string, expectedCommand: string): SpikeJsonSucces
 
 export async function runSpikeJson(input: RunSpikeJsonInput): Promise<SpikeJsonSuccess> {
   if (input.signal?.aborted) throw new Error("Spike operation was cancelled");
-  const environment = input.environment ?? process.env;
-  const command = input.command ?? environment["SPIKE_BIN"] ?? process.env["SPIKE_BIN"] ?? "spike";
+  const environment = input.environment;
+  const command = input.command ?? environment?.["SPIKE_BIN"] ?? "spike";
 
   return new Promise<SpikeJsonSuccess>((resolve, reject) => {
     const child = spawn(command, [...input.args, "--json"], {
@@ -1431,6 +1431,14 @@ export function registerGoalPlannerExtension(
   registerSupervisorExtension(pi, { ...options, goalId, projectIdentity });
 }
 
+export function supervisorExtensionOptions(environment: NodeJS.ProcessEnv): RegisterSupervisorExtensionOptions {
+  return {
+    command: environment["SPIKE_BIN"] ?? "spike",
+    environment,
+    applications: environment["SPIKE_APPLICATION_TOOLS"] === "1",
+  };
+}
+
 export default function spikeSupervisorExtension(pi: SupervisorExtensionApi): void {
-  registerSupervisorExtension(pi, { applications: process.env["SPIKE_APPLICATION_TOOLS"] === "1" });
+  registerSupervisorExtension(pi, supervisorExtensionOptions(process.env));
 }

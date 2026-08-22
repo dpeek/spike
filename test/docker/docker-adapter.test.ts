@@ -1,14 +1,22 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, onTestFinished, test } from "bun:test";
 import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { issueTicket, type ExecutionPolicy } from "../../src/ticket.ts";
-import { dispatchHerdrDockerTicket, dispatchPiTicket, dockerWorkerAdapter, exchangePath, loadRecordedWorkerIfPresent, observeWorker, waitForWorkerDone } from "../../src/worker.ts";
+import { dispatchHerdrDockerTicket, dispatchPiTicket, dockerWorkerAdapter, exchangePath, loadRecordedWorkerIfPresent, observeWorker, waitForWorkerDone, type WorkerHostOptions } from "../../src/worker.ts";
 import type { HerdrOperations } from "../../src/herdr.ts";
 import { publishImplementationReport } from "../../src/report.ts";
 import { temporaryRepository } from "../support/repository.ts";
 import { workerAdapterContract } from "../contract/worker-adapter.ts";
+
+const host = (values: Partial<WorkerHostOptions> = {}): WorkerHostOptions => ({
+  dockerImage: "spike-worker:local",
+  spikeExecutable: join(import.meta.dir, "../../bin/spike"),
+  piExecutable: "pi",
+  herdrAvailable: false,
+  ...values,
+});
 
 beforeAll(async () => {
   const build = Bun.spawn(["docker", "build", "--quiet", "-t", "spike-worker:local", "-f", "docker/Dockerfile", "."], { stdout: "pipe", stderr: "pipe" });
@@ -164,12 +172,11 @@ process.stdout.write(resolved + "\\n");
 
   test("resolves only the declared Pi credential before creation without mounting its source", async () => {
     const auth = `/tmp/spike-docker-auth-${crypto.randomUUID()}.json`;
-    const prior = process.env["SPIKE_PI_AUTH_FILE"];
     await Bun.write(auth, JSON.stringify({ "openai-codex": { type: "oauth", access: "test-secret", refresh: "test-refresh", expires: 4_102_444_800_000 }, other: { type: "api_key", key: "other-secret" } }));
-    process.env["SPIKE_PI_AUTH_FILE"] = auth;
+    onTestFinished(() => rm(auth, { force: true }));
     const active = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
     try {
-      await dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "credential-worker", command: ["true"] });
+      await dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "credential-worker", command: ["true"], hostOptions: host({ piAuthFile: auth }) });
       const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string };
       const inspected = await Bun.$`docker inspect ${runtime.containerId}`.json();
@@ -177,36 +184,22 @@ process.stdout.write(resolved + "\\n");
       expect(JSON.stringify(record)).not.toContain("test-secret");
       await dockerWorkerAdapter.finalize(active.project, active.identity, new Date());
     } finally {
-      if (prior === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
-      else process.env["SPIKE_PI_AUTH_FILE"] = prior;
-      await Bun.file(auth).delete();
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
     }
 
     const absent = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
-    const sourceForLater = process.env["SPIKE_PI_AUTH_FILE"];
-    const configuredForLater = process.env["PI_CODING_AGENT_DIR"];
-    const homeForLater = process.env["HOME"];
-    delete process.env["SPIKE_PI_AUTH_FILE"];
-    process.env["PI_CODING_AGENT_DIR"] = `/tmp/spike-missing-auth-${crypto.randomUUID()}`;
-    process.env["HOME"] = `/tmp/spike-missing-home-${crypto.randomUUID()}`;
     try {
       let inspected = false;
       await expect(dockerWorkerAdapter.dispatch({
         cwd: absent.root, hostPaths: absent.hostPaths, ...absent.identity, worker: "missing-credential", command: ["true"],
+        hostOptions: host({ piAgentDirectory: `/tmp/spike-missing-auth-${crypto.randomUUID()}`, homeDirectory: `/tmp/spike-missing-home-${crypto.randomUUID()}` }),
         afterDockerImageInspection: async () => { inspected = true; },
       })).rejects.toThrow("unavailable or invalid");
       expect(inspected).toBe(false);
       expect(await loadRecordedWorkerIfPresent(absent.project, absent.identity)).toBeUndefined();
       expect(await Bun.file(`${exchangePath(absent.project, absent.identity)}/input/ticket.md`).exists()).toBe(false);
     } finally {
-      if (sourceForLater === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
-      else process.env["SPIKE_PI_AUTH_FILE"] = sourceForLater;
-      if (configuredForLater === undefined) delete process.env["PI_CODING_AGENT_DIR"];
-      else process.env["PI_CODING_AGENT_DIR"] = configuredForLater;
-      if (homeForLater === undefined) delete process.env["HOME"];
-      else process.env["HOME"] = homeForLater;
       await Bun.spawn(["chmod", "-R", "u+w", absent.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await absent.remove();
     }
@@ -214,8 +207,7 @@ process.stdout.write(resolved + "\\n");
 
   test("refuses unsupported or malformed credential grants before any Docker or exchange side effect", async () => {
     const auth = `/tmp/spike-docker-auth-${crypto.randomUUID()}.json`;
-    const prior = process.env["SPIKE_PI_AUTH_FILE"];
-    process.env["SPIKE_PI_AUTH_FILE"] = auth;
+    onTestFinished(() => rm(auth, { force: true }));
     const valid = { "openai-codex": { type: "oauth", access: "test-secret", refresh: "test-refresh", expires: 4_102_444_800_000 } };
     const cases: Array<{ name: string; policy: ExecutionPolicy; model?: string; document: unknown; error: string; secrets?: string[] }> = [
       { name: "absent provider", policy: { isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] }, document: {}, error: "absent or malformed" },
@@ -237,6 +229,7 @@ process.stdout.write(resolved + "\\n");
           try {
             await dockerWorkerAdapter.dispatch({
               cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: `refusal-${refusal.name}`, command: ["true"],
+              hostOptions: host({ piAuthFile: auth }),
               afterDockerImageInspection: async () => { inspected = true; },
             });
           } catch (error) {
@@ -255,22 +248,19 @@ process.stdout.write(resolved + "\\n");
         }
       }
     } finally {
-      if (prior === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
-      else process.env["SPIKE_PI_AUTH_FILE"] = prior;
       await Bun.file(auth).delete();
     }
   }, 30_000);
 
   test("creates from the inspected digest when its mutable tag changes", async () => {
     const active = await fixture();
-    const previousImage = process.env["SPIKE_DOCKER_IMAGE"];
     const original = (await Bun.$`docker image inspect --format {{.Id}} spike-worker:local`.text()).trim();
     const source = (await Bun.$`docker create spike-worker:local`.text()).trim();
     try {
       await Bun.$`docker commit ${source} spike-worker:retag-regression`.quiet();
-      process.env["SPIKE_DOCKER_IMAGE"] = "spike-worker:local";
       const dispatched = await dockerWorkerAdapter.dispatch({
         cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "provenance-worker", command: ["true"],
+        hostOptions: host({ dockerImage: "spike-worker:local" }),
         afterDockerImageInspection: async () => { await Bun.$`docker tag spike-worker:retag-regression spike-worker:local`.quiet(); },
       });
       const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
@@ -280,8 +270,6 @@ process.stdout.write(resolved + "\\n");
     } finally {
       await Bun.$`docker tag ${original} spike-worker:local`.quiet();
       await Bun.$`docker rm --force ${source}`.quiet();
-      if (previousImage === undefined) delete process.env["SPIKE_DOCKER_IMAGE"];
-      else process.env["SPIKE_DOCKER_IMAGE"] = previousImage;
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
     }
@@ -455,7 +443,7 @@ process.stdout.write(resolved + "\\n");
     try {
       // The environment-selected model is frozen into the issued Ticket, then
       // passed back to the pinned Pi process by the Docker dispatcher.
-      const dispatched = await dispatchPiTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "real-pi-smoke", host: "direct" });
+      const dispatched = await dispatchPiTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "real-pi-smoke", host: "direct", hostOptions: host({ piAuthFile: auth }) });
       if (dispatched.hosting !== "direct" || dispatched.classification !== "accepted-submission") {
         throw new Error(`real Pi did not submit successfully: ${dispatched.hosting === "direct" ? dispatched.classification : dispatched.status}`);
       }

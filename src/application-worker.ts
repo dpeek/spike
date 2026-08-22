@@ -104,13 +104,26 @@ export async function cleanupApplicationWorker(root: ProjectPaths, identity: App
 }
 
 /** Local test/automation dispatcher. It has a distinct Application identity and never touches Change runtime paths. */
-export async function dispatchApplicationPiTicket(input: ApplicationTicketIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date }) {
+export type ApplicationWorkerHostInput = {
+  environment?: NodeJS.ProcessEnv;
+  spikeExecutable?: string;
+};
+
+function applicationProtocolEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  spikeExecutable: string,
+  values: Record<string, string>,
+): NodeJS.ProcessEnv {
+  return { ...inherited, ...values, SPIKE_BIN: spikeExecutable };
+}
+
+export async function dispatchApplicationPiTicket(input: ApplicationTicketIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date } & ApplicationWorkerHostInput) {
   const repository = await discoverRepository(input.cwd, input.hostPaths), ticket = await loadApplicationTicket(repository, input.goalId, input.applicationId, input.ticketId);
   const extension = join(import.meta.dir, "pi-worker-extension.ts");
   return dispatchApplicationWorker({ ...input, command: [input.piExecutable ?? "pi", "--print", "--no-session", "--no-approve", "--model", ticket.metadata.model, "--thinking", ticket.metadata.thinking, "--no-extensions", "--extension", extension, "--no-skills", "--no-prompt-templates", "--no-context-files", "--tools", "read,bash,edit,write,spike_complete_implementation,spike_block_implementation", "Execute the attached immutable Application implementation Ticket in this exact checkout. Finish with spike_complete_implementation, or use spike_block_implementation only when blocked." ] });
 }
 
-export async function dispatchApplicationWorker(input: ApplicationTicketIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date }): Promise<{ root: string; exchange: Awaited<ReturnType<typeof prepareApplicationTicketExchange>>; execution: ApplicationWorkerExecution }> {
+export async function dispatchApplicationWorker(input: ApplicationTicketIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date } & ApplicationWorkerHostInput): Promise<{ root: string; exchange: Awaited<ReturnType<typeof prepareApplicationTicketExchange>>; execution: ApplicationWorkerExecution }> {
   if (input.command.length === 0) throw new Error("Application Worker command must not be empty");
   const repository = await discoverRepository(input.cwd, input.hostPaths), ticket = await loadApplicationTicket(repository, input.goalId, input.applicationId, input.ticketId);
   // local-clone is the configured adapter contract in this runtime. Isolation
@@ -135,7 +148,7 @@ export async function dispatchApplicationWorker(input: ApplicationTicketIdentity
     if (!heads.some(([hash]) => hash === ticket.metadata.inputRevision)) throw new Error("Application input bundle does not expose the pinned input revision");
     await git(checkout, ["checkout", "--quiet", "--detach", ticket.metadata.inputRevision]);
     if (active.cancelled) throw new Error("Application Worker dispatch was interrupted");
-    const child = Bun.spawn(input.command, { cwd: checkout, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { ...process.env, SPIKE_INPUT_DIR: exchange.inputDirectory, SPIKE_OUTPUT_DIR: exchange.outputDirectory, SPIKE_INPUT_REVISION: ticket.metadata.inputRevision, SPIKE_GOAL_ID: input.goalId, SPIKE_APPLICATION_ID: input.applicationId, SPIKE_TICKET_ID: input.ticketId, SPIKE_TICKET_ROLE: "implement", SPIKE_MODEL: ticket.metadata.model, SPIKE_THINKING: ticket.metadata.thinking } });
+    const child = Bun.spawn(input.command, { cwd: checkout, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: applicationProtocolEnvironment(input.environment ?? process.env, input.spikeExecutable ?? join(import.meta.dir, "..", "bin", "spike"), { SPIKE_INPUT_DIR: exchange.inputDirectory, SPIKE_OUTPUT_DIR: exchange.outputDirectory, SPIKE_INPUT_REVISION: ticket.metadata.inputRevision, SPIKE_GOAL_ID: input.goalId, SPIKE_APPLICATION_ID: input.applicationId, SPIKE_TICKET_ID: input.ticketId, SPIKE_TICKET_ROLE: "implement", SPIKE_MODEL: ticket.metadata.model, SPIKE_THINKING: ticket.metadata.thinking }) });
     active.child = child;
     record = { ...record, metadata: recordSchema.parse({ ...record.metadata, runtime: { workspace, pid: child.pid } }) };
     await replaceRecord(repository, record);
@@ -230,7 +243,7 @@ export async function cleanupApplicationReviewWorker(root: ProjectPaths, identit
   await finalizeApplicationReviewWorker(root, identity);
   await forgetFinalizedApplicationReviewWorker(root, identity);
 }
-export async function dispatchApplicationReviewWorker(input: ApplicationReviewWorkerIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date }): Promise<{ root: string; exchange: { inputDirectory: string; outputDirectory: string }; execution: ApplicationReviewWorkerExecution }> {
+export async function dispatchApplicationReviewWorker(input: ApplicationReviewWorkerIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date } & ApplicationWorkerHostInput): Promise<{ root: string; exchange: { inputDirectory: string; outputDirectory: string }; execution: ApplicationReviewWorkerExecution }> {
   if (!input.command.length) throw new Error("Application review Worker command must not be empty");
   const repository = await discoverRepository(input.cwd, input.hostPaths), ticket = await reviewTicket(repository, input);
   const review = await import("./application-review.ts");
@@ -245,7 +258,7 @@ export async function dispatchApplicationReviewWorker(input: ApplicationReviewWo
     if (heads.length !== 1 || !heads[0]![1]?.startsWith(prefix) || heads[0]![0] !== ticket.metadata.candidateRevision) throw new Error("Application review input bundle does not expose exact Candidate");
     await git(checkout, ["fetch", "--quiet", "--no-tags", join(exchange.inputDirectory, "repository.bundle"), `${heads[0]![1]}:${heads[0]![1]}`]);
     await git(checkout, ["checkout", "--quiet", "--detach", ticket.metadata.candidateRevision]);
-    const child = Bun.spawn(input.command, { cwd: checkout, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { ...process.env, SPIKE_INPUT_DIR: exchange.inputDirectory, SPIKE_OUTPUT_DIR: exchange.outputDirectory, SPIKE_INPUT_REVISION: ticket.metadata.candidateRevision, SPIKE_GOAL_ID: input.goalId, SPIKE_APPLICATION_ID: input.applicationId, SPIKE_TICKET_ID: input.ticketId, SPIKE_TICKET_ROLE: "review", SPIKE_MODEL: ticket.metadata.model, SPIKE_THINKING: ticket.metadata.thinking } });
+    const child = Bun.spawn(input.command, { cwd: checkout, stdin: "ignore", stdout: "pipe", stderr: "pipe", env: applicationProtocolEnvironment(input.environment ?? process.env, input.spikeExecutable ?? join(import.meta.dir, "..", "bin", "spike"), { SPIKE_INPUT_DIR: exchange.inputDirectory, SPIKE_OUTPUT_DIR: exchange.outputDirectory, SPIKE_INPUT_REVISION: ticket.metadata.candidateRevision, SPIKE_GOAL_ID: input.goalId, SPIKE_APPLICATION_ID: input.applicationId, SPIKE_TICKET_ID: input.ticketId, SPIKE_TICKET_ROLE: "review", SPIKE_MODEL: ticket.metadata.model, SPIKE_THINKING: ticket.metadata.thinking }) });
     record = { ...record, metadata: reviewRecordSchema.parse({ ...record.metadata, runtime: { workspace, pid: child.pid } }) }; await replaceReviewRecord(repository, record);
     const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     record = { metadata: reviewRecordSchema.parse({ ...record.metadata, finishedAt: (input.clock ?? (() => new Date()))().toISOString(), exitCode }), body: `# Application review Worker runtime\n\n## stdout\n\n${stdout}\n\n## stderr\n\n${stderr}\n` };
@@ -253,7 +266,7 @@ export async function dispatchApplicationReviewWorker(input: ApplicationReviewWo
     return { root: repository.root, exchange, execution: { ...reviewExecution(record), stdout, stderr } };
   } catch (error) { await cleanupApplicationReviewWorker(repository, input).catch(() => undefined); throw error; }
 }
-export async function dispatchApplicationReviewPiTicket(input: ApplicationReviewWorkerIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date }) {
+export async function dispatchApplicationReviewPiTicket(input: ApplicationReviewWorkerIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date } & ApplicationWorkerHostInput) {
   const repository = await discoverRepository(input.cwd, input.hostPaths), ticket = await reviewTicket(repository, input), extension = join(import.meta.dir, "pi-worker-extension.ts");
   return dispatchApplicationReviewWorker({ ...input, command: [input.piExecutable ?? "pi", "--print", "--no-session", "--no-approve", "--model", ticket.metadata.model, "--thinking", ticket.metadata.thinking, "--no-extensions", "--extension", extension, "--no-skills", "--no-prompt-templates", "--no-context-files", "--tools", "read,bash,edit,write,spike_complete_review,spike_block_review", "Execute the attached immutable Application review Ticket in this exact checkout. Finish with spike_complete_review, or use spike_block_review only when blocked."] });
 }

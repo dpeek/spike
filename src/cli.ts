@@ -44,7 +44,7 @@ import {
   type DerivedRepositoryStatus,
 } from "./status.ts";
 import { issueTicket, loadTicket, reportPath, ticketPath, type ExecutionPolicy } from "./ticket.ts";
-import { blockWorker, completeWorker, readWorkerPayload } from "./worker-completion.ts";
+import { blockWorker, completeWorker, parseWorkerProtocolContext, readWorkerPayload } from "./worker-completion.ts";
 import {
   attachWorkerTerminal,
   dispatchWorkerTicket,
@@ -53,7 +53,9 @@ import {
   observeWorker,
   readWorkerTerminal,
   waitForWorkerDone,
+  resolveWorkerHostOptions,
 } from "./worker.ts";
+import { createHerdrOperations } from "./herdr.ts";
 
 export const version = "2.0.0-dev";
 
@@ -865,7 +867,13 @@ function humanReconciliation(goals: ReconciledGoal[], ignored = 0): string {
   return `${lines.join("\n")}\n`;
 }
 
-export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths): Promise<number> {
+export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths, environment: NodeJS.ProcessEnv): Promise<number> {
+  const workerHostOptions = resolveWorkerHostOptions(environment);
+  const herdr = createHerdrOperations({
+    executable: environment["SPIKE_HERDR_BIN"] ?? "herdr",
+    managed: environment["HERDR_ENV"] === "1",
+    ...(environment["HERDR_WORKSPACE_ID"]?.trim() ? { workspaceId: environment["HERDR_WORKSPACE_ID"] } : {}),
+  });
   let args = rawArgs.filter((arg) => arg !== "--json");
   let json = rawArgs.includes("--json");
   let command = commandName(args);
@@ -913,7 +921,9 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
         return launchPlanner({
           cwd,
           hostPaths,
-          ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
+          piExecutable: workerHostOptions.piExecutable,
+          spikeExecutable: workerHostOptions.spikeExecutable,
+          environment,
         });
       }
       const action = args[1];
@@ -921,7 +931,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
         throw new UsageError(`unknown planner option: ${action}`);
       }
       if (action === "attach" && json) throw new UsageError("planner attach does not support --json");
-      const input = { cwd, hostPaths, ...parseGoalPlanner(args.slice(2)) };
+      const input = { cwd, hostPaths, ...parseGoalPlanner(args.slice(2)), herdr, piExecutable: workerHostOptions.piExecutable, spikeExecutable: workerHostOptions.spikeExecutable };
       if (action === "attach") return goalPlannerOperations.attach(input);
       const result = action === "observe"
         ? await goalPlannerOperations.observe(input)
@@ -938,7 +948,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
         return success(json, "status", status, humanGoalStatus(status));
       }
       if (input.operational) {
-        const status = await deriveSupervisorPlannerStatus(cwd, hostPaths);
+        const status = await deriveSupervisorPlannerStatus(cwd, hostPaths, herdr);
         const plannerLines = `${status.planners.map((planner) => `  Planner ${planner.goalId} ${planner.state}`).join("\n")}${status.planners.length === 0 ? "" : "\n"}`;
         return success(json, "status", status, `${humanRepositoryStatus(status.durable)}${plannerLines}`);
       }
@@ -982,11 +992,11 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
       return success(json, "application review prepare", exchange, `Prepared Application review Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-pi") {
-      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewPiTicket({ cwd, hostPaths, ...input });
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewPiTicket({ cwd, hostPaths, ...input, piExecutable: workerHostOptions.piExecutable, spikeExecutable: workerHostOptions.spikeExecutable, environment });
       return success(json, "application review dispatch-pi", { ticket: input, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-test") {
-      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewWorker({ cwd, hostPaths, ...input });
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewWorker({ cwd, hostPaths, ...input, spikeExecutable: workerHostOptions.spikeExecutable, environment });
       return success(json, "application review dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "worker" && args[3] === "status") {
@@ -1019,11 +1029,11 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
     }
 
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-pi") {
-      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationPiTicket({ cwd, hostPaths, ...input });
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationPiTicket({ cwd, hostPaths, ...input, piExecutable: workerHostOptions.piExecutable, spikeExecutable: workerHostOptions.spikeExecutable, environment });
       return success(json, "application ticket dispatch-pi", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application Pi Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-test") {
-      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationWorker({ cwd, hostPaths, ...input });
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationWorker({ cwd, hostPaths, ...input, spikeExecutable: workerHostOptions.spikeExecutable, environment });
       return success(json, "application ticket dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution, paths: { input: relative(dispatched.root, dispatched.exchange.inputDirectory), output: relative(dispatched.root, dispatched.exchange.outputDirectory) } }, `Dispatched Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "worker" && args[2] === "status") {
@@ -1178,12 +1188,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
 
     if (args[0] === "ticket" && args[1] === "dispatch-pi") {
       const input = parsePiDispatch(args.slice(2));
-      const dispatched = await dispatchPiTicket({
-        cwd,
-        hostPaths,
-        ...input,
-        ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
-      });
+      const dispatched = await dispatchPiTicket({ cwd, hostPaths, ...input, hostOptions: workerHostOptions, environment, herdr });
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       const paths = {
         input: relative(dispatched.root, dispatched.exchange.inputDirectory),
@@ -1206,7 +1211,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
 
     if (args[0] === "ticket" && args[1] === "dispatch-test") {
       const input = parseTestDispatch(args.slice(2));
-      const dispatched = await dispatchWorkerTicket({ cwd, hostPaths, ...input });
+      const dispatched = await dispatchWorkerTicket({ cwd, hostPaths, ...input, hostOptions: workerHostOptions, environment });
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       return success(
         json,
@@ -1227,7 +1232,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
     if (args[0] === "worker" && args[1] === "status") {
       const identity = parseWorkerIdentity(args.slice(2));
       const repository = await discoverRepository(cwd, hostPaths);
-      const observation = await observeWorker(repository, identity);
+      const observation = await observeWorker(repository, identity, herdr);
       return success(
         json,
         "worker status",
@@ -1254,7 +1259,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
       const terminal = await readWorkerTerminal(repository, input, {
         ...(input.lines === undefined ? {} : { lines: input.lines }),
         ...(input.ansi === undefined ? {} : { ansi: input.ansi }),
-      });
+      }, herdr);
       return success(json, "worker read", { ticket: { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId }, terminal }, terminal);
     }
 
@@ -1262,14 +1267,15 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
       if (json) throw new UsageError("worker attach does not support --json");
       const identity = parseWorkerIdentity(args.slice(2));
       const repository = await discoverRepository(cwd, hostPaths);
-      return attachWorkerTerminal(repository, identity);
+      return attachWorkerTerminal(repository, identity, herdr);
     }
 
     if (args[0] === "worker" && (args[1] === "complete" || args[1] === "block")) {
       const action = args[1];
       const input = parseWorkerSubmission(args.slice(2), action);
       const payload = await readWorkerPayload(cwd, input.file, stdinText);
-      const submission = action === "complete" ? await completeWorker(cwd, payload) : await blockWorker(cwd, payload);
+      const protocol = parseWorkerProtocolContext(environment);
+      const submission = action === "complete" ? await completeWorker(cwd, payload, protocol) : await blockWorker(cwd, payload, protocol);
       return success(
         json,
         `worker ${action}`,
@@ -1360,4 +1366,4 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths):
   }
 }
 
-if (import.meta.main) process.exit(await run(process.argv.slice(2), process.cwd(), resolveHostPaths(process.env)));
+if (import.meta.main) process.exit(await run(process.argv.slice(2), process.cwd(), resolveHostPaths(process.env), process.env));

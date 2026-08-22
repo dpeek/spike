@@ -32,7 +32,7 @@ function reviewExecution(run: Awaited<ReturnType<typeof dispatchApplicationRevie
 }
 /** Exercise the worker's production completion boundary inside its dispatched checkout. */
 function reviewCompletionCommand(payload: Record<string, unknown>): string[] {
-  return ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))});`];
+  return ["bun", "-e", `const completion = await import(${JSON.stringify(workerCompletionModule)}); await completion.completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))}, completion.parseWorkerProtocolContext(process.env));`];
 }
 
 async function report(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string, changeId: string, ticketId: string, metadata: { role: "implement" | "review" } & Record<string, unknown>) {
@@ -242,7 +242,7 @@ test("scenario: remediation partial and blocked Reports stay terminal and derive
   expect(status.churnWarnings.map((warning) => warning.kind).sort()).toEqual(["non-progress", "remediation-rounds", "reopened-finding"]);
   expect(status.candidate?.revision).toBe(firstPublished.report.metadata.candidateRevision);
   const beforeStatus = { main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") };
-  expect(await runCli(["--json", "application", "status", "--goal", goalId, "--application", queued.applicationId], repository.root, repository.hostPaths)).toBe(0);
+  expect(await runCli(["--json", "application", "status", "--goal", goalId, "--application", queued.applicationId], repository.root, repository.hostPaths, process.env)).toBe(0);
   expect({ main: await repository.git("rev-parse", "main"), refs: await repository.git("for-each-ref", "--format=%(refname) %(objectname)", "refs/spike/goals"), worktree: await repository.git("status", "--porcelain") }).toEqual(beforeStatus);
   // Target movement is refused before a remediation Ticket, exchange, or
   // runtime record can be created.
@@ -268,7 +268,7 @@ test("scenario: Application review approves only the exact current Candidate and
   const assessment = "Recover a squash Application.";
   const dispatchedReview = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId, worker: "reviewer", command: reviewCompletionCommand({ reviewStatement: "Approved exact Candidate.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: assessment, assessment: "met", evidence: "Real Git candidate reviewed." }], artifacts: [] }) });
   const reviewExecution = dispatchedReview.execution;
-  expect(await runCli(["--json", "application", "review", "publish", "--goal", goalId, "--application", queued.applicationId, "--ticket", review.ticket.metadata.ticketId, "--worker", reviewExecution.worker], repository.root, repository.hostPaths)).toBe(0);
+  expect(await runCli(["--json", "application", "review", "publish", "--goal", goalId, "--application", queued.applicationId, "--ticket", review.ticket.metadata.ticketId, "--worker", reviewExecution.worker], repository.root, repository.hostPaths, process.env)).toBe(0);
   expect(await Bun.file(applicationReviewWorkerRecordPath(repository.project, { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId })).exists()).toBe(false);
   expect((await deriveApplicationReviewStatus(repository.root, repository.hostPaths, goalId, queued.applicationId)).approvalUsable).toBe(true);
   // Retained operational cleanup immediately gates otherwise-valid approval.
@@ -277,7 +277,7 @@ test("scenario: Application review approves only the exact current Candidate and
   await Bun.$`rm -rf ${applicationReviewExchangePath(repository.project, { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId })}`;
   const later = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, instruction: "Reconsider exact candidate.", executionPolicy: policy });
   const piArguments = join(repository.root, ".review-pi-arguments.json"), fakePi = join(repository.root, ".review-pi");
-  await writeFile(fakePi, `#!/usr/bin/env bun\nawait Bun.write(${JSON.stringify(piArguments)}, JSON.stringify(process.argv.slice(2)));\nawait (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reviewStatement: "Pause.", verdict: "ask-operator", findings: [], acceptanceAssessment: [{ criterion: assessment, assessment: "unclear", evidence: "Operator decision needed." }], artifacts: [] }))});\n`);
+  await writeFile(fakePi, `#!/usr/bin/env bun\nawait Bun.write(${JSON.stringify(piArguments)}, JSON.stringify(process.argv.slice(2)));\nconst completion = await import(${JSON.stringify(workerCompletionModule)}); await completion.completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reviewStatement: "Pause.", verdict: "ask-operator", findings: [], acceptanceAssessment: [{ criterion: assessment, assessment: "unclear", evidence: "Operator decision needed." }], artifacts: [] }))}, completion.parseWorkerProtocolContext(process.env));\n`);
   await chmod(fakePi, 0o755);
   const laterDispatched = await dispatchApplicationReviewPiTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, ticketId: later.ticket.metadata.ticketId, worker: "reviewer", piExecutable: fakePi });
   const productionPiArguments = JSON.parse(await Bun.file(piArguments).text()) as string[];
@@ -339,7 +339,7 @@ test("scenario: Application review retains remediate and reject as durable non-a
   const digest = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, instruction: "Reject changed artifact.", executionPolicy: policy });
   const digestIdentity = { goalId, applicationId: queued.applicationId, ticketId: digest.ticket.metadata.ticketId };
   const digestPayload = { reviewStatement: "Artifact declared.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion: "Recover a squash Application.", assessment: "met", evidence: "Exact." }], artifacts: ["artifacts/evidence.txt"] };
-  const digestRun = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...digestIdentity, worker: "digest-worker", command: ["bun", "-e", `const { mkdir } = await import("node:fs/promises"); await mkdir(process.env.SPIKE_OUTPUT_DIR + "/artifacts", { recursive: true }); await Bun.write(process.env.SPIKE_OUTPUT_DIR + "/artifacts/evidence.txt", "before"); await (await import(${JSON.stringify(workerCompletionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(digestPayload))});`] });
+  const digestRun = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...digestIdentity, worker: "digest-worker", command: ["bun", "-e", `const { mkdir } = await import("node:fs/promises"); await mkdir(process.env.SPIKE_OUTPUT_DIR + "/artifacts", { recursive: true }); await Bun.write(process.env.SPIKE_OUTPUT_DIR + "/artifacts/evidence.txt", "before"); const completion = await import(${JSON.stringify(workerCompletionModule)}); await completion.completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(digestPayload))}, completion.parseWorkerProtocolContext(process.env));`] });
   await writeFile(join(digestRun.exchange.outputDirectory, "artifacts", "evidence.txt"), "after");
   await expect(publishApplicationReviewReport({ cwd: repository.root, hostPaths: repository.hostPaths, ...digestIdentity, execution: { adapter: digestRun.execution.adapter, isolation: digestRun.execution.isolation, worker: digestRun.execution.worker, model: digestRun.execution.model, thinking: digestRun.execution.thinking, startedAt: digestRun.execution.startedAt, finishedAt: digestRun.execution.finishedAt } })).rejects.toThrow("digest");
   expect(await Bun.file(applicationReviewReportPath(repository.project, goalId, queued.applicationId, digestIdentity.ticketId)).exists()).toBe(false);
@@ -358,7 +358,7 @@ test("scenario: Application review retains remediate and reject as durable non-a
   // completed review Report; recovery records the identity-preserving result.
   const blocked = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, instruction: "Block exact review.", executionPolicy: policy });
   const blockedIdentity = { goalId, applicationId: queued.applicationId, ticketId: blocked.ticket.metadata.ticketId };
-  const blockedRun = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...blockedIdentity, worker: "blocked-worker", command: ["bun", "-e", `await (await import(${JSON.stringify(workerCompletionModule)})).blockWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reason: "External review service unavailable.", evidence: "Scenario block.", artifacts: [] }))});`] });
+  const blockedRun = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...blockedIdentity, worker: "blocked-worker", command: ["bun", "-e", `const completion = await import(${JSON.stringify(workerCompletionModule)}); await completion.blockWorker(process.cwd(), ${JSON.stringify(JSON.stringify({ reason: "External review service unavailable.", evidence: "Scenario block.", artifacts: [] }))}, completion.parseWorkerProtocolContext(process.env));`] });
   expect(blockedRun.execution.exitCode).toBe(0);
   await expect(publishApplicationReviewReport({ cwd: repository.root, hostPaths: repository.hostPaths, ...blockedIdentity, execution: { adapter: blockedRun.execution.adapter, isolation: blockedRun.execution.isolation, worker: blockedRun.execution.worker, model: blockedRun.execution.model, thinking: blockedRun.execution.thinking, startedAt: blockedRun.execution.startedAt, finishedAt: blockedRun.execution.finishedAt } })).rejects.toThrow();
   expect(await Bun.file(applicationReviewReportPath(repository.project, goalId, queued.applicationId, blockedIdentity.ticketId)).exists()).toBe(false);

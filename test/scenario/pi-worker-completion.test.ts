@@ -13,9 +13,9 @@ import { temporaryRepository } from "../support/repository.ts";
 const extensionUrl = pathToFileURL(`${import.meta.dir}/../../src/pi-worker-extension.ts`).href;
 const spikePath = `${import.meta.dir}/../../bin/spike`;
 const blockedWorker = `
-import { registerWorkerExtension } from ${JSON.stringify(extensionUrl)};
+import { registerWorkerExtension, workerExtensionOptions } from ${JSON.stringify(extensionUrl)};
 const tools = [];
-registerWorkerExtension({ registerTool: (tool) => tools.push(tool) });
+registerWorkerExtension({ registerTool: (tool) => tools.push(tool) }, workerExtensionOptions(process.env));
 const blocked = tools.find((tool) => tool.name === "spike_block_implementation");
 if (!blocked) throw new Error("implementation blocked tool was not selected");
 let shutdowns = 0;
@@ -34,9 +34,9 @@ if (result.terminate !== true || shutdowns !== 1) throw new Error("accepted bloc
 
 const worker = `
 import { writeFile } from "node:fs/promises";
-import { registerWorkerExtension } from ${JSON.stringify(extensionUrl)};
+import { registerWorkerExtension, workerExtensionOptions } from ${JSON.stringify(extensionUrl)};
 const tools = [];
-registerWorkerExtension({ registerTool: (tool) => tools.push(tool) });
+registerWorkerExtension({ registerTool: (tool) => tools.push(tool) }, workerExtensionOptions(process.env));
 if (tools.length !== 2 || tools[0].name !== "spike_complete_implementation" || tools[1].name !== "spike_block_implementation") {
   throw new Error("implementation terminal tools were not selected");
 }

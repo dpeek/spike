@@ -7,6 +7,7 @@ import {
   loadApplicationReviewWorkerIfPresent,
   type ApplicationReviewWorkerExecution,
   type ApplicationReviewWorkerRecord,
+  type ApplicationWorkerHostInput,
 } from "./application-worker.ts";
 import type { ApplicationReviewIdentity } from "./application-review.ts";
 import type { HostPaths } from "./data-root.ts";
@@ -26,5 +27,5 @@ export async function cleanupApplicationReviewWorker(root: ProjectPaths, identit
   await finalizeApplicationReviewWorker(root, identity);
   await forgetFinalizedApplicationReviewWorker(root, identity);
 }
-export const dispatchApplicationReviewWorker = (input: ApplicationReviewIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date }) => configuredApplicationAdapter.review.dispatch(input);
-export const dispatchApplicationReviewPiTicket = (input: ApplicationReviewIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date }) => configuredApplicationAdapter.review.dispatchPi(input);
+export const dispatchApplicationReviewWorker = (input: ApplicationReviewIdentity & { cwd: string; hostPaths: HostPaths; command: string[]; worker: string; clock?: () => Date } & ApplicationWorkerHostInput) => configuredApplicationAdapter.review.dispatch(input);
+export const dispatchApplicationReviewPiTicket = (input: ApplicationReviewIdentity & { cwd: string; hostPaths: HostPaths; worker: string; piExecutable?: string; clock?: () => Date } & ApplicationWorkerHostInput) => configuredApplicationAdapter.review.dispatchPi(input);

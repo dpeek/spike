@@ -138,12 +138,12 @@ async function launch(selectedGoal: { project: ProjectPaths; identity: GoalPlann
       SPIKE_GOAL_ID: selectedGoal.identity.goalId,
       SPIKE_PROJECT_IDENTITY: selectedGoal.identity.projectIdentity,
       SPIKE_PLANNER_NAME: selectedGoal.identity.name,
-      SPIKE_BIN: input.spikeExecutable ?? process.env["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike"),
+      SPIKE_BIN: input.spikeExecutable ?? resolve(import.meta.dir, "..", "bin", "spike"),
     },
   });
   const handles = { tab: opaque(tab.tab, "tab"), pane: opaque(tab.pane, "pane") };
   const extension = resolve(import.meta.dir, "pi-goal-planner-extension.ts");
-  const pi = input.piExecutable ?? process.env["SPIKE_PI_BIN"] ?? "pi";
+  const pi = input.piExecutable ?? "pi";
   const command = [
     pi, "--name", selectedGoal.identity.name, "--model", selection.model, "--thinking", selection.thinking,
     "--no-approve", "--no-extensions", "--extension", extension,

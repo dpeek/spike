@@ -27,14 +27,15 @@ function implementationCommand(file: string, value: string) {
     await Bun.$\`git config user.name Scenario\`; await Bun.$\`git config user.email scenario@example.test\`;
     await Bun.write(${JSON.stringify(file)}, ${JSON.stringify(value)});
     await Bun.$\`git add ${file}\`; await Bun.$\`git commit --quiet -m worker-change\`;
-    await (await import(${JSON.stringify(completionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))});
+    const completion = await import(${JSON.stringify(completionModule)});
+    await completion.completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))}, completion.parseWorkerProtocolContext(process.env));
   `;
   return ["bun", "-e", source];
 }
 
 function reviewCommand(criterion: string) {
   const payload = { reviewStatement: "Production review approved the exact Candidate.", verdict: "approve", findings: [], acceptanceAssessment: [{ criterion, assessment: "met", evidence: "Production worker reviewed the exact Candidate." }], artifacts: [] };
-  return ["bun", "-e", `await (await import(${JSON.stringify(completionModule)})).completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))});`];
+  return ["bun", "-e", `const completion = await import(${JSON.stringify(completionModule)}); await completion.completeWorker(process.cwd(), ${JSON.stringify(JSON.stringify(payload))}, completion.parseWorkerProtocolContext(process.env));`];
 }
 
 function appExecution(run: Awaited<ReturnType<typeof dispatchApplicationWorker>>) {

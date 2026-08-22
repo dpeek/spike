@@ -27,6 +27,12 @@ export type HerdrOperations = {
   findTabsByLabel?: (label: string) => Promise<HerdrHandles[]>;
 };
 
+export type HerdrContext = {
+  executable: string;
+  managed: boolean;
+  workspaceId?: string;
+};
+
 type HerdrEnvelope = {
   result?: Record<string, any>;
   error?: { code?: unknown; message?: unknown };
@@ -40,15 +46,12 @@ class HerdrCommandError extends Error {
   }
 }
 
-function executable(): string {
-  return process.env["SPIKE_HERDR_BIN"] ?? "herdr";
-}
-
 async function command(
+  context: HerdrContext,
   args: string[],
   options: { raw?: boolean; inherit?: boolean } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn([executable(), ...args], {
+  const child = Bun.spawn([context.executable, ...args], {
     stdin: options.inherit ? "inherit" : "ignore",
     stdout: options.inherit ? "inherit" : "pipe",
     stderr: options.inherit ? "inherit" : "pipe",
@@ -93,85 +96,86 @@ function requireHandle(value: unknown, label: string): string {
   return value;
 }
 
-export const herdrOperations: HerdrOperations = {
-  async createTab(input) {
-    if (process.env["HERDR_ENV"] !== "1") throw new Error("Herdr worker hosting requires a Herdr-managed planner pane");
-    const workspace = process.env["HERDR_WORKSPACE_ID"];
-    if (!workspace) throw new Error("Herdr worker hosting cannot identify the planner workspace");
-    const args = ["tab", "create", "--workspace", workspace, "--cwd", input.cwd, "--label", input.label, "--no-focus"];
-    for (const [key, value] of Object.entries(input.environment)) args.push("--env", `${key}=${value}`);
-    const response = envelope((await command(args)).stdout);
-    return {
-      tab: requireHandle(response.result?.["tab"]?.tab_id, "tab"),
-      pane: requireHandle(response.result?.["root_pane"]?.pane_id, "pane"),
-    };
-  },
+function workspace(context: HerdrContext, operation: string): string {
+  if (!context.managed) throw new Error(`Herdr ${operation} requires a Herdr-managed planner pane`);
+  if (!context.workspaceId) throw new Error(`Herdr ${operation} cannot identify the planner workspace`);
+  return context.workspaceId;
+}
 
-  async run(pane, launchedCommand) {
-    await command(["pane", "run", pane, launchedCommand]);
-  },
+/** Bind host configuration once at the process composition boundary. */
+export function createHerdrOperations(context: HerdrContext): HerdrOperations {
+  return {
+    async createTab(input) {
+      const args = ["tab", "create", "--workspace", workspace(context, "worker hosting"), "--cwd", input.cwd, "--label", input.label, "--no-focus"];
+      for (const [key, value] of Object.entries(input.environment)) args.push("--env", `${key}=${value}`);
+      const response = envelope((await command(context, args)).stdout);
+      return {
+        tab: requireHandle(response.result?.["tab"]?.tab_id, "tab"),
+        pane: requireHandle(response.result?.["root_pane"]?.pane_id, "pane"),
+      };
+    },
 
-  async status(pane) {
-    try {
-      const response = envelope((await command(["agent", "get", pane])).stdout);
-      const status = response.result?.["agent"]?.agent_status;
-      return ["idle", "working", "blocked", "done", "unknown"].includes(status) ? status : "unavailable";
-    } catch {
-      return "unavailable";
-    }
-  },
+    async run(pane, launchedCommand) {
+      await command(context, ["pane", "run", pane, launchedCommand]);
+    },
 
-  async read(pane, input = {}) {
-    const args = ["pane", "read", pane, "--source", "recent-unwrapped", "--lines", String(input.lines ?? 120), "--raw"];
-    if (input.ansi) args.push("--ansi");
-    const result = await command(args, { raw: true });
-    if (result.code !== 0) throw new Error(result.stderr.trim() || `Herdr terminal read exited with code ${result.code}`);
-    return input.ansi ? result.stdout : Bun.stripANSI(result.stdout);
-  },
-
-  async attach(pane) {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      throw new Error("Herdr terminal attachment requires an interactive TTY");
-    }
-    return (await command(["agent", "attach", pane], { inherit: true })).code;
-  },
-
-  async closeTab(tab) {
-    try {
-      await command(["tab", "close", tab]);
-    } catch (error) {
-      if (error instanceof HerdrCommandError && error.code === "tab_not_found") return;
-      throw error;
-    }
-  },
-
-  async findTabsByLabel(label) {
-    if (typeof label !== "string" || !label.trim()) throw new Error("Herdr label must not be blank");
-    if (process.env["HERDR_ENV"] !== "1") throw new Error("Herdr planner discovery requires a Herdr-managed planner pane");
-    const workspace = process.env["HERDR_WORKSPACE_ID"];
-    if (!workspace) throw new Error("Herdr planner discovery cannot identify the planner workspace");
-    const response = envelope((await command(["tab", "list", "--workspace", workspace])).stdout);
-    const tabs = response.result?.["tabs"];
-    if (!Array.isArray(tabs)) throw new Error("Herdr did not return tab listings");
-    // Herdr 0.8.2's tab.list deliberately returns TabInfo, not a root pane.
-    // A newly created planner tab has one pane; reconstruct that opaque pane
-    // through the public pane.list envelope rather than assuming a hidden tab
-    // list field exists.
-    const matchingTabs = tabs.filter((entry): entry is Record<string, unknown> =>
-      typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["label"] === label,
-    ).map((tab) => requireHandle(tab["tab_id"], "tab"));
-    if (matchingTabs.length === 0) return [];
-    const paneResponse = envelope((await command(["pane", "list", "--workspace", workspace])).stdout);
-    const panes = paneResponse.result?.["panes"];
-    if (!Array.isArray(panes)) throw new Error("Herdr did not return pane listings");
-    return matchingTabs.map((tab) => {
-      const matchingPanes = panes.filter((entry): entry is Record<string, unknown> =>
-        typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["tab_id"] === tab,
-      );
-      if (matchingPanes.length !== 1) {
-        throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
+    async status(pane) {
+      try {
+        const response = envelope((await command(context, ["agent", "get", pane])).stdout);
+        const status = response.result?.["agent"]?.agent_status;
+        return ["idle", "working", "blocked", "done", "unknown"].includes(status) ? status : "unavailable";
+      } catch {
+        return "unavailable";
       }
-      return { tab, pane: requireHandle(matchingPanes[0]!["pane_id"], "pane") };
-    });
-  },
-};
+    },
+
+    async read(pane, input = {}) {
+      const args = ["pane", "read", pane, "--source", "recent-unwrapped", "--lines", String(input.lines ?? 120), "--raw"];
+      if (input.ansi) args.push("--ansi");
+      const result = await command(context, args, { raw: true });
+      if (result.code !== 0) throw new Error(result.stderr.trim() || `Herdr terminal read exited with code ${result.code}`);
+      return input.ansi ? result.stdout : Bun.stripANSI(result.stdout);
+    },
+
+    async attach(pane) {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error("Herdr terminal attachment requires an interactive TTY");
+      }
+      return (await command(context, ["agent", "attach", pane], { inherit: true })).code;
+    },
+
+    async closeTab(tab) {
+      try {
+        await command(context, ["tab", "close", tab]);
+      } catch (error) {
+        if (error instanceof HerdrCommandError && error.code === "tab_not_found") return;
+        throw error;
+      }
+    },
+
+    async findTabsByLabel(label) {
+      if (typeof label !== "string" || !label.trim()) throw new Error("Herdr label must not be blank");
+      const workspaceId = workspace(context, "planner discovery");
+      const response = envelope((await command(context, ["tab", "list", "--workspace", workspaceId])).stdout);
+      const tabs = response.result?.["tabs"];
+      if (!Array.isArray(tabs)) throw new Error("Herdr did not return tab listings");
+      const matchingTabs = tabs.filter((entry): entry is Record<string, unknown> =>
+        typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["label"] === label,
+      ).map((tab) => requireHandle(tab["tab_id"], "tab"));
+      if (matchingTabs.length === 0) return [];
+      const paneResponse = envelope((await command(context, ["pane", "list", "--workspace", workspaceId])).stdout);
+      const panes = paneResponse.result?.["panes"];
+      if (!Array.isArray(panes)) throw new Error("Herdr did not return pane listings");
+      return matchingTabs.map((tab) => {
+        const matchingPanes = panes.filter((entry): entry is Record<string, unknown> =>
+          typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["tab_id"] === tab,
+        );
+        if (matchingPanes.length !== 1) throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
+        return { tab, pane: requireHandle(matchingPanes[0]!["pane_id"], "pane") };
+      });
+    },
+  };
+}
+
+/** Default executable for callers that do not need workspace operations. */
+export const herdrOperations = createHerdrOperations({ executable: "herdr", managed: false });

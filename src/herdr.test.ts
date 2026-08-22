@@ -13,14 +13,15 @@ describe("Herdr terminal operations", () => {
       await chmod(fakeHerdr, 0o755);
       const moduleUrl = pathToFileURL(`${import.meta.dir}/herdr.ts`).href;
       const script = `
-import { herdrOperations } from ${JSON.stringify(moduleUrl)};
+import { createHerdrOperations } from ${JSON.stringify(moduleUrl)};
+const herdr = createHerdrOperations({ executable: ${JSON.stringify(fakeHerdr)}, managed: false });
 console.log(JSON.stringify([
-  await herdrOperations.read("opaque-pane"),
-  await herdrOperations.read("opaque-pane", { ansi: true }),
+  await herdr.read("opaque-pane"),
+  await herdr.read("opaque-pane", { ansi: true }),
 ]));
 `;
       const child = Bun.spawn(["bun", "-e", script], {
-        env: { ...process.env, SPIKE_HERDR_BIN: fakeHerdr },
+        env: { ...process.env },
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
@@ -50,11 +51,12 @@ esac
       await chmod(fakeHerdr, 0o755);
       const moduleUrl = pathToFileURL(`${import.meta.dir}/herdr.ts`).href;
       const script = `
-import { herdrOperations } from ${JSON.stringify(moduleUrl)};
-console.log(JSON.stringify(await herdrOperations.findTabsByLabel("spike-goal-goal-1-identity")));
+import { createHerdrOperations } from ${JSON.stringify(moduleUrl)};
+const herdr = createHerdrOperations({ executable: ${JSON.stringify(fakeHerdr)}, managed: true, workspaceId: "workspace" });
+console.log(JSON.stringify(await herdr.findTabsByLabel("spike-goal-goal-1-identity")));
 `;
       const child = Bun.spawn(["bun", "-e", script], {
-        env: { ...process.env, SPIKE_HERDR_BIN: fakeHerdr, HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace", HERDR_CALLS: calls },
+        env: { ...process.env, HERDR_CALLS: calls },
         stdin: "ignore", stdout: "pipe", stderr: "pipe",
       });
       const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
@@ -71,16 +73,17 @@ console.log(JSON.stringify(await herdrOperations.findTabsByLabel("spike-goal-goa
   test("rejects a non-interactive caller before invoking Herdr", async () => {
     const moduleUrl = pathToFileURL(`${import.meta.dir}/herdr.ts`).href;
     const script = `
-import { herdrOperations } from ${JSON.stringify(moduleUrl)};
+import { createHerdrOperations } from ${JSON.stringify(moduleUrl)};
+const herdr = createHerdrOperations({ executable: "false", managed: false });
 try {
-  await herdrOperations.attach("opaque-pane");
+  await herdr.attach("opaque-pane");
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
 `;
     const child = Bun.spawn(["bun", "-e", script], {
-      env: { ...process.env, SPIKE_HERDR_BIN: "false" },
+      env: { ...process.env },
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
