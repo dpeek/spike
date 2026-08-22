@@ -6,12 +6,12 @@ import { loadProjectConfig } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { listGoalIds, loadGoal } from "./goal.ts";
 import { assertGoalNotFrozen } from "./application.ts";
-import { type HerdrAgentStatus, herdrOperations, type HerdrHandles, type HerdrOperations } from "./herdr.ts";
+import { type HerdrAgentStatus, herdrOperations, type HerdrOperations, type HerdrTabMatch } from "./herdr.ts";
 import { goalPlannerToolNames } from "./pi-supervisor-extension.ts";
 
 export type GoalPlannerIdentity = { projectIdentity: string; goalId: string; name: string };
 export type GoalPlannerObservation = GoalPlannerIdentity & {
-  resources: Array<HerdrHandles & { status: HerdrAgentStatus }>;
+  resources: Array<HerdrTabMatch & { status: HerdrAgentStatus }>;
   state: "live" | "stale" | "absent" | "duplicate" | "unavailable";
 };
 
@@ -66,7 +66,7 @@ async function observation(identity: GoalPlannerIdentity, herdr: HerdrOperations
     const pane = opaque(resource.pane, "pane");
     let status: HerdrAgentStatus;
     try { status = await herdr.status(pane); } catch { status = "unavailable"; }
-    return { tab, pane, status };
+    return { tab, pane, paneCount: resource.paneCount, status };
   }));
   const live = resources.filter((resource) => liveStatuses.has(resource.status));
   return {
@@ -118,6 +118,12 @@ function assertAdmissionCapacity(
   }
 }
 
+function assertNoSiblingPanes(current: GoalPlannerObservation): void {
+  if (current.resources.some((resource) => resource.paneCount > 1)) {
+    throw new Error(`Goal planner ${current.name} has an active sibling pane; settle its Ticket before replacing the planner`);
+  }
+}
+
 async function close(resources: GoalPlannerObservation["resources"], herdr: HerdrOperations): Promise<void> {
   // Herdr closeTab is idempotent. Sequential closing makes an operator-visible
   // replacement deterministic and never closes an unrelated label.
@@ -159,7 +165,7 @@ async function launch(selectedGoal: { project: ProjectPaths; identity: GoalPlann
   // text, Pi session data, or process exit is consulted.
   let status: HerdrAgentStatus;
   try { status = await herdr.status(handles.pane); } catch { status = "unavailable"; }
-  return { ...selectedGoal.identity, resources: [{ ...handles, status }], state: liveStatuses.has(status) ? "live" : "stale" };
+  return { ...selectedGoal.identity, resources: [{ ...handles, paneCount: 1, status }], state: liveStatuses.has(status) ? "live" : "stale" };
 }
 
 export const goalPlannerOperations: GoalPlannerOperations = {
@@ -178,7 +184,10 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     // launched, or any workflow path/ref is touched.
     assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
     if (current.state === "live") return current;
-    if (current.state === "stale" || current.state === "unavailable") await close(current.resources, herdr);
+    if (current.state === "stale" || current.state === "unavailable") {
+      assertNoSiblingPanes(current);
+      await close(current.resources, herdr);
+    }
     return launch(target, input, herdr);
   },
   async attach(input) {
@@ -203,6 +212,7 @@ export const goalPlannerOperations: GoalPlannerOperations = {
     // owner counts as the selected slot, so closing it then launching its
     // replacement is permitted without touching the other Goal's resources.
     assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
+    assertNoSiblingPanes(current);
     await close(current.resources, herdr);
     return launch(target, input, herdr);
   },

@@ -3,11 +3,24 @@ export type HerdrHandles = {
   pane: string;
 };
 
+export type HerdrTabMatch = HerdrHandles & {
+  paneCount: number;
+};
+
+export type HerdrPaneHandle = {
+  pane: string;
+};
+
 export type HerdrAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown" | "unavailable";
 
 export type CreateHerdrTabInput = {
   cwd: string;
   label: string;
+  environment: Record<string, string>;
+};
+
+export type SplitHerdrPaneInput = {
+  cwd: string;
   environment: Record<string, string>;
 };
 
@@ -18,19 +31,22 @@ export type ReadHerdrTerminalInput = {
 
 export type HerdrOperations = {
   createTab: (input: CreateHerdrTabInput) => Promise<HerdrHandles>;
+  splitPane: (input: SplitHerdrPaneInput) => Promise<HerdrPaneHandle>;
   run: (pane: string, command: string) => Promise<void>;
   status: (pane: string) => Promise<HerdrAgentStatus>;
   read: (pane: string, input?: ReadHerdrTerminalInput) => Promise<string>;
   attach: (pane: string) => Promise<number>;
+  closePane: (pane: string) => Promise<void>;
   closeTab: (tab: string) => Promise<void>;
   /** Exact label discovery is operational only; callers must not infer state from terminal text. */
-  findTabsByLabel?: (label: string) => Promise<HerdrHandles[]>;
+  findTabsByLabel?: (label: string) => Promise<HerdrTabMatch[]>;
 };
 
 export type HerdrContext = {
   executable: string;
   managed: boolean;
   workspaceId?: string;
+  paneId?: string;
 };
 
 type HerdrEnvelope = {
@@ -102,6 +118,21 @@ function workspace(context: HerdrContext, operation: string): string {
   return context.workspaceId;
 }
 
+function callerPane(context: HerdrContext, operation: string): string {
+  if (!context.managed) throw new Error(`Herdr ${operation} requires a Herdr-managed planner pane`);
+  if (!context.paneId) throw new Error(`Herdr ${operation} cannot identify the planner pane`);
+  return context.paneId;
+}
+
+function layoutRect(value: unknown): { x: number; y: number; height: number } {
+  if (typeof value !== "object" || value === null) throw new Error("Herdr returned an invalid pane layout");
+  const rect = value as Record<string, unknown>;
+  if (![rect["x"], rect["y"], rect["height"]].every((entry) => typeof entry === "number")) {
+    throw new Error("Herdr returned an invalid pane layout");
+  }
+  return { x: rect["x"] as number, y: rect["y"] as number, height: rect["height"] as number };
+}
+
 /** Bind host configuration once at the process composition boundary. */
 export function createHerdrOperations(context: HerdrContext): HerdrOperations {
   return {
@@ -113,6 +144,16 @@ export function createHerdrOperations(context: HerdrContext): HerdrOperations {
         tab: requireHandle(response.result?.["tab"]?.tab_id, "tab"),
         pane: requireHandle(response.result?.["root_pane"]?.pane_id, "pane"),
       };
+    },
+
+    async splitPane(input) {
+      const args = [
+        "pane", "split", "--pane", callerPane(context, "worker hosting"),
+        "--direction", "right", "--ratio", "0.5", "--cwd", input.cwd, "--no-focus",
+      ];
+      for (const [key, value] of Object.entries(input.environment)) args.push("--env", `${key}=${value}`);
+      const response = envelope((await command(context, args)).stdout);
+      return { pane: requireHandle(response.result?.["pane"]?.pane_id, "pane") };
     },
 
     async run(pane, launchedCommand) {
@@ -144,6 +185,15 @@ export function createHerdrOperations(context: HerdrContext): HerdrOperations {
       return (await command(context, ["agent", "attach", pane], { inherit: true })).code;
     },
 
+    async closePane(pane) {
+      try {
+        await command(context, ["pane", "close", pane]);
+      } catch (error) {
+        if (error instanceof HerdrCommandError && error.code === "pane_not_found") return;
+        throw error;
+      }
+    },
+
     async closeTab(tab) {
       try {
         await command(context, ["tab", "close", tab]);
@@ -166,13 +216,34 @@ export function createHerdrOperations(context: HerdrContext): HerdrOperations {
       const paneResponse = envelope((await command(context, ["pane", "list", "--workspace", workspaceId])).stdout);
       const panes = paneResponse.result?.["panes"];
       if (!Array.isArray(panes)) throw new Error("Herdr did not return pane listings");
-      return matchingTabs.map((tab) => {
+      return Promise.all(matchingTabs.map(async (tab) => {
         const matchingPanes = panes.filter((entry): entry is Record<string, unknown> =>
           typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["tab_id"] === tab,
         );
-        if (matchingPanes.length !== 1) throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
-        return { tab, pane: requireHandle(matchingPanes[0]!["pane_id"], "pane") };
-      });
+        if (matchingPanes.length === 0 || matchingPanes.length > 2) {
+          throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
+        }
+        if (matchingPanes.length === 1) {
+          return { tab, pane: requireHandle(matchingPanes[0]!["pane_id"], "pane"), paneCount: 1 };
+        }
+
+        const paneIds = matchingPanes.map((pane) => requireHandle(pane["pane_id"], "pane"));
+        const layoutResponse = envelope((await command(context, ["pane", "layout", "--pane", paneIds[0]!])).stdout);
+        const layoutPanes = layoutResponse.result?.["layout"]?.panes;
+        if (!Array.isArray(layoutPanes)) throw new Error("Herdr returned an invalid pane layout");
+        const positioned = paneIds.map((pane) => {
+          const entry = layoutPanes.find((candidate) =>
+            typeof candidate === "object" && candidate !== null && (candidate as Record<string, unknown>)["pane_id"] === pane,
+          ) as Record<string, unknown> | undefined;
+          if (entry === undefined) throw new Error("Herdr returned an invalid pane layout");
+          return { pane, rect: layoutRect(entry["rect"]) };
+        }).sort((left, right) => left.rect.x - right.rect.x);
+        const [planner, worker] = positioned;
+        if (planner === undefined || worker === undefined || planner.rect.x >= worker.rect.x || planner.rect.y !== worker.rect.y || planner.rect.height !== worker.rect.height) {
+          throw new Error(`Herdr could not reconstruct one planner pane for tab ${tab}`);
+        }
+        return { tab, pane: planner.pane, paneCount: 2 };
+      }));
     },
   };
 }

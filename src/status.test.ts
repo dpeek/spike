@@ -13,9 +13,9 @@ describe("supervisor planner status", () => {
     const second = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Second", outcome: "Second outcome.", approval: "Approved." });
     const firstIdentity = goalPlannerIdentity(`file://${repository.root}/.git`, first.goal.metadata.goalId);
     const herdr: HerdrOperations = {
-      async findTabsByLabel(label) { return label === firstIdentity.name ? [{ tab: "tab-1", pane: "pane-1" }] : []; },
-      async status() { return "working"; }, async createTab() { throw new Error("not called"); },
-      async run() { throw new Error("not called"); }, async read() { return ""; }, async attach() { return 0; }, async closeTab() {},
+      async findTabsByLabel(label) { return label === firstIdentity.name ? [{ tab: "tab-1", pane: "pane-1", paneCount: 1 }] : []; },
+      async status() { return "working"; }, async createTab() { throw new Error("not called"); }, async splitPane() { throw new Error("not called"); },
+      async run() { throw new Error("not called"); }, async read() { return ""; }, async attach() { return 0; }, async closePane() {}, async closeTab() {},
     };
     const status = await deriveSupervisorPlannerStatus(repository.root, repository.hostPaths, herdr);
     expect(status.durable.goals.map((goal) => goal.goalId)).toEqual([first.goal.metadata.goalId, second.goal.metadata.goalId]);
@@ -31,8 +31,8 @@ describe("supervisor planner status", () => {
     const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Only", outcome: "Preserve durable state.", approval: "Approved." });
     const herdr: HerdrOperations = {
       async findTabsByLabel() { throw new Error("Herdr unavailable"); }, async status() { return "unavailable"; },
-      async createTab() { throw new Error("not called"); }, async run() { throw new Error("not called"); },
-      async read() { return ""; }, async attach() { return 0; }, async closeTab() {},
+      async createTab() { throw new Error("not called"); }, async splitPane() { throw new Error("not called"); }, async run() { throw new Error("not called"); },
+      async read() { return ""; }, async attach() { return 0; }, async closePane() {}, async closeTab() {},
     };
     const status = await deriveSupervisorPlannerStatus(repository.root, repository.hostPaths, herdr);
     expect(status.planners[0]).toMatchObject({ goalId: goal.goal.metadata.goalId, state: "unavailable", resources: [] });

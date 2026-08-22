@@ -76,8 +76,8 @@ function fakePlanner(calls: string[]): HerdrOperations {
   const resources: Array<{ tab: string; pane: string; label: string }> = [];
   return {
     async createTab(input) { calls.push(`create:${input.label}`); const resource = { tab: "planner-tab", pane: "planner-pane", label: input.label }; resources.push(resource); return resource; },
-    async run(pane) { calls.push(`run:${pane}`); }, async status() { return "working"; }, async read() { return ""; }, async attach() { return 0; },
-    async closeTab(tab) { calls.push(`close:${tab}`); }, async findTabsByLabel(label) { calls.push(`find:${label}`); return resources.filter((resource) => resource.label === label); },
+    async splitPane() { throw new Error("not called"); }, async run(pane) { calls.push(`run:${pane}`); }, async status() { return "working"; }, async read() { return ""; }, async attach() { return 0; },
+    async closePane() { throw new Error("not called"); }, async closeTab(tab) { calls.push(`close:${tab}`); }, async findTabsByLabel(label) { calls.push(`find:${label}`); return resources.filter((resource) => resource.label === label).map((resource) => ({ ...resource, paneCount: 1 })); },
   };
 }
 

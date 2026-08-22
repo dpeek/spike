@@ -37,7 +37,7 @@ From a Herdr-managed planner pane. The shell commands below remain valid raw ope
    spike ticket dispatch-pi --goal <goal> --change 001 --ticket 001 \
      --worker pi-implementer --json
    ```
-   Confirm the fresh Herdr tab runs headed Pi in a Docker TTY, uses the immutable Ticket/context prompt and role completion extension, and does not reread changed project defaults. The launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
+   Confirm a fresh pane immediately to the planner's right runs headed Pi in a Docker TTY, uses the immutable Ticket/context prompt and role completion extension, and does not reread changed project defaults. The launcher disables extension, skill, prompt-template, and context-file discovery and explicitly loads only the role completion extension.
 6. The attended container lifecycle returns `working`: observe it with `spike worker status` and `spike worker read`, then exercise `spike worker attach` from a real TTY and detach without ending the container. Treat terminal interaction as operational only. Confirm the adapter-owned restartable Docker observer creates the actual-exit marker only after `docker wait` exits; the Herdr wrapper owns attachment only. Then the supervisor's one-shot full-identity waiter wakes for an operational recheck. A rejected completion remains in the same Ticket for retry; Report publication validates exchange output, not terminal, wake message, Herdr state, or process exit. Repeat with `--host direct` to confirm synchronous headless fallback and its returned classification.
 7. Publish the implementation Report and normalized Candidate:
    ```sh
@@ -56,12 +56,12 @@ From a Herdr-managed planner pane. The shell commands below remain valid raw ope
    spike ticket dispatch-pi --goal <goal> --change 001 --ticket 002 \
      --worker pi-reviewer --json
    ```
-   Under `HERDR_ENV=1`, this default container review dispatch is attended: observe and attach through the ephemeral Herdr tab, then wait for the adapter-owned actual-exit marker and perform the `spike_status` recheck from step 6. Inspect staging `submission.md` and confirm that it assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket. Use `--host direct` only to exercise the explicit synchronous headless fallback.
+   Under `HERDR_ENV=1`, this default container review dispatch is attended: observe and attach through the ephemeral right-side Herdr pane, then wait for the adapter-owned actual-exit marker and perform the `spike_status` recheck from step 6. Inspect staging `submission.md` and confirm that it assesses every canonical criterion exactly once and selects the exact Candidate and implementation Ticket. Use `--host direct` only to exercise the explicit synchronous headless fallback.
 10. Publish the review Report:
     ```sh
     spike report publish --goal <goal> --change 001 --ticket 002 --json
     ```
-    Confirm the verdict is `approve` and cleanup is finalized. For attended container (or workspace) Herdr hosting, also confirm finalization closes the ephemeral tab; direct dispatch has no Herdr tab.
+    Confirm the verdict is `approve` and cleanup is finalized. For attended container (or workspace) Herdr hosting, also confirm finalization closes only the ephemeral worker pane and restores the planner's full tab; direct dispatch has no Herdr pane.
 11. Land the approved Candidate:
     ```sh
     spike change land --goal <goal> --change 001 --statement "..." --json

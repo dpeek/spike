@@ -315,14 +315,15 @@ process.stdout.write(resolved + "\\n");
     }
   }, 30_000);
 
-  test("attends a TTY container, wakes only after docker exit, and retires tab resources", async () => {
+  test("attends a TTY container, wakes only after docker exit, and retires its worker pane", async () => {
     const active = await fixture();
     const closed: string[] = [];
     const host: HerdrOperations = {
-      async createTab() { return { tab: "docker-tab", pane: "docker-pane" }; },
+      async createTab() { throw new Error("not called"); },
+      async splitPane() { return { pane: "docker-pane" }; },
       async run(_pane, command) { Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" }); },
       async status() { return "done"; }, async read() { return "operational terminal"; }, async attach() { return 0; },
-      async closeTab(tab) { closed.push(tab); },
+      async closePane(pane) { closed.push(pane); }, async closeTab() { throw new Error("not called"); },
     };
     try {
       const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "attended-worker", command: ["bun", "-e", `${executeGeneratedTmpfsFiles}\nawait Bun.sleep(500);`], herdr: host });
@@ -339,18 +340,18 @@ process.stdout.write(resolved + "\\n");
       expect((await observeWorker(active.project, active.identity, host)).status).toBe("done");
       expect((await Bun.$`docker logs ${runtime.containerId}`.text()).replaceAll("\r\n", "\n")).toBe("generated /tmp file executed\ngenerated /work file executed\n");
       expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), {
-        async stop(runtime) { await Bun.$`docker stop --time 1 ${(runtime as { containerId: string }).containerId}`.quiet(); await host.closeTab("docker-tab"); },
+        async stop(runtime) { await Bun.$`docker stop --time 1 ${(runtime as { containerId: string }).containerId}`.quiet(); await host.closePane("docker-pane"); },
         async cleanup(runtime) {
           await Bun.$`docker rm --force ${(runtime as { containerId: string }).containerId}`.quiet();
           await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true });
         },
       })).status).toBe("finalized");
-      expect(closed).toEqual(["docker-tab"]);
+      expect(closed).toEqual(["docker-pane"]);
       expect(await Bun.file(runtime.workspace).exists()).toBe(false);
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
       expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
       expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
-      expect(closed).toEqual(["docker-tab"]);
+      expect(closed).toEqual(["docker-pane"]);
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
@@ -361,10 +362,11 @@ process.stdout.write(resolved + "\\n");
     const active = await fixture();
     const closed: string[] = [];
     const host: HerdrOperations = {
-      async createTab() { return { tab: "cleanup-race-tab", pane: "cleanup-race-pane" }; },
+      async createTab() { throw new Error("not called"); },
+      async splitPane() { return { pane: "cleanup-race-pane" }; },
       async run(_pane, command) { Bun.spawn(["sh", "-c", command], { stdout: "ignore", stderr: "ignore" }); },
       async status() { return "done"; }, async read() { return "attachment is operational"; }, async attach() { return 0; },
-      async closeTab(tab) { closed.push(tab); },
+      async closePane(pane) { closed.push(pane); }, async closeTab() { throw new Error("not called"); },
     };
     try {
       await dispatchHerdrDockerTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "cleanup-race", command: ["true"], herdr: host });
@@ -378,12 +380,12 @@ process.stdout.write(resolved + "\\n");
       let removed = false;
       const operations = {
         async stop(resource: unknown) {
-          events.push("stop/tab-close");
+          events.push("stop/pane-close");
           const id = (resource as { containerId: string }).containerId;
           if ((await Bun.spawn(["docker", "container", "inspect", id], { stdout: "ignore", stderr: "ignore" }).exited) === 0) {
             await Bun.$`docker stop --time 1 ${id}`.quiet();
           }
-          await host.closeTab("cleanup-race-tab");
+          await host.closePane("cleanup-race-pane");
         },
         async terminalExitCode(resource: unknown) {
           events.push("terminal-inspect");
@@ -401,10 +403,10 @@ process.stdout.write(resolved + "\\n");
       await expect(dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
       expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(true);
       await expect(dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
-      expect(events).toEqual(["stop/tab-close", "docker-remove", "workspace-remove", "stop/tab-close", "workspace-remove"]);
+      expect(events).toEqual(["stop/pane-close", "docker-remove", "workspace-remove", "stop/pane-close", "workspace-remove"]);
       expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(false);
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
-      expect(closed).toEqual(["cleanup-race-tab", "cleanup-race-tab"]);
+      expect(closed).toEqual(["cleanup-race-pane", "cleanup-race-pane"]);
       expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;

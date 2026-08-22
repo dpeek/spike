@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createChange } from "./change.ts";
 import { createGoal } from "./goal.ts";
-import type { CreateHerdrTabInput, HerdrOperations } from "./herdr.ts";
+import type { HerdrOperations, SplitHerdrPaneInput } from "./herdr.ts";
 import { publishFailedReport } from "./report.ts";
 import { issueTicket } from "./ticket.ts";
 import {
@@ -101,17 +101,19 @@ describe("frozen worker setup", () => {
     await writeFile(pi, `#!/usr/bin/env bun\nif (!(await Bun.file('setup-ready').exists())) process.exit(42); await Bun.write(${JSON.stringify(marker)}, 'started');\n`);
     await chmod(pi, 0o700);
 
-    let tab: CreateHerdrTabInput | undefined;
+    let pane: SplitHerdrPaneInput | undefined;
     const herdr: HerdrOperations = {
-      async createTab(input) { tab = input; return { tab: "setup-tab", pane: "setup-pane" }; },
+      async createTab() { throw new Error("not called"); },
+      async splitPane(input) { pane = input; return { pane: "setup-pane" }; },
       async run(_pane, command) {
-        const child = Bun.spawn([command], { cwd: tab!.cwd, env: { ...process.env, ...tab!.environment }, stdout: "pipe", stderr: "pipe" });
+        const child = Bun.spawn([command], { cwd: pane!.cwd, env: { ...process.env, ...pane!.environment }, stdout: "pipe", stderr: "pipe" });
         const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
         if (code !== 0) throw new Error(stderr || `attended wrapper exited ${code}`);
       },
       async status() { return "done"; },
       async read() { return ""; },
       async attach() { return 0; },
+      async closePane() {},
       async closeTab() {},
     };
     const dispatched = await dispatchPiTicket({

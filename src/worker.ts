@@ -16,8 +16,8 @@ import { assertGoalNotFrozen } from "./application.ts";
 import { discoverRepository, git } from "./git.ts";
 import {
   herdrOperations,
-  type HerdrHandles,
   type HerdrOperations,
+  type HerdrPaneHandle,
   type ReadHerdrTerminalInput,
 } from "./herdr.ts";
 import { loadTicket, ticketStatus } from "./ticket.ts";
@@ -231,8 +231,8 @@ export async function stopDirectProcess(
 export type WorkerRuntimeEnvelope = NonNullable<RecordedWorker["metadata"]["runtime"]>;
 /** Opaque adapter-owned data. Shared workflow code must only pass it back to the selected adapter. */
 export type WorkerRuntimeResource = unknown;
-type LocalCloneRuntime = { host: "direct"; workspace: string; pid?: number } | { host: "herdr"; workspace: string; tab: string; pane: string };
-type DockerRuntime = { containerId: string; imageDigest: string; host?: "herdr"; workspace?: string; tab?: string; pane?: string }; 
+type LocalCloneRuntime = { host: "direct"; workspace: string; pid?: number } | { host: "herdr"; workspace: string; pane: string };
+type DockerRuntime = { containerId: string; imageDigest: string; host?: "herdr"; workspace?: string; pane?: string };
 
 /** Adapter-owned operations over its canonical runtime resource. */
 export type WorkerRuntimeOperations = {
@@ -302,9 +302,9 @@ export const dockerWorkerAdapter: WorkerAdapter = {
   runtimeOperations: {
     async stop(runtime) {
       const dockerRuntime = runtime as DockerRuntime;
-      // Stop the actual container first; closing an attach tab is not a stop.
+      // Stop the actual container first; closing its attach pane is not a stop.
       await dockerStop(dockerRuntime.containerId);
-      if (dockerRuntime.host === "herdr" && dockerRuntime.tab !== undefined) await herdrOperations.closeTab(dockerRuntime.tab);
+      if (dockerRuntime.host === "herdr" && dockerRuntime.pane !== undefined) await herdrOperations.closePane(dockerRuntime.pane);
     },
     async cleanup(runtime) {
       const dockerRuntime = runtime as DockerRuntime;
@@ -408,7 +408,7 @@ function validateWorkspace(workspace: string): void {
 function validateLocalCloneRuntime(resource: unknown): asserts resource is LocalCloneRuntime {
   const runtime = z.discriminatedUnion("host", [
     z.object({ host: z.literal("direct"), workspace: nonBlankString, pid: z.number().int().positive().optional() }).strict(),
-    z.object({ host: z.literal("herdr"), workspace: nonBlankString, tab: nonBlankString, pane: nonBlankString }).strict(),
+    z.object({ host: z.literal("herdr"), workspace: nonBlankString, pane: nonBlankString }).strict(),
   ]).parse(resource);
   validateWorkspace(runtime.workspace);
 }
@@ -481,26 +481,26 @@ export async function recordWorker(
 /** Docker lifecycle tests may record opaque attended resources without a daemon. */
 export function recordDockerWorker(
   root: ProjectPaths,
-  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; containerId: string; imageDigest: string; workspace?: string; herdr?: HerdrHandles; environmentDigest?: string },
+  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; containerId: string; imageDigest: string; workspace?: string; herdr?: HerdrPaneHandle; environmentDigest?: string },
 ): Promise<RecordedWorker> {
   return recordWorker(root, {
     ...input,
     runtime: input.herdr === undefined
       ? { containerId: input.containerId, imageDigest: input.imageDigest }
-      : { containerId: input.containerId, imageDigest: input.imageDigest, host: "herdr", workspace: input.workspace!, tab: input.herdr.tab, pane: input.herdr.pane },
+      : { containerId: input.containerId, imageDigest: input.imageDigest, host: "herdr", workspace: input.workspace!, pane: input.herdr.pane },
   });
 }
 
 /** Local adapter's resource constructor; generic recording retains it opaquely. */
 export function recordLocalCloneWorker(
   root: ProjectPaths,
-  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; workspace: string; pid?: number; herdr?: HerdrHandles; environmentDigest?: string },
+  input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; workspace: string; pid?: number; herdr?: HerdrPaneHandle; environmentDigest?: string },
 ): Promise<RecordedWorker> {
   return recordWorker(root, {
     ...input,
     runtime: input.herdr === undefined
       ? { host: "direct", workspace: input.workspace, ...(input.pid === undefined ? {} : { pid: input.pid }) }
-      : { host: "herdr", workspace: input.workspace, tab: input.herdr.tab, pane: input.herdr.pane },
+      : { host: "herdr", workspace: input.workspace, pane: input.herdr.pane },
   });
 }
 
@@ -519,12 +519,12 @@ const herdrExecutionSchema = z.object({
 
 type HerdrExecutionMarker = z.infer<typeof herdrExecutionSchema>;
 
-type AttendedRuntime = { host: "herdr"; workspace: string; tab: string; pane: string };
+type AttendedRuntime = { host: "herdr"; workspace: string; pane: string };
 
 function attendedRuntime(resource: unknown): AttendedRuntime | undefined {
   if (typeof resource !== "object" || resource === null) return undefined;
   const value = resource as Record<string, unknown>;
-  return value["host"] === "herdr" && typeof value["workspace"] === "string" && typeof value["tab"] === "string" && typeof value["pane"] === "string"
+  return value["host"] === "herdr" && typeof value["workspace"] === "string" && typeof value["pane"] === "string"
     ? value as AttendedRuntime : undefined;
 }
 
@@ -613,7 +613,7 @@ const localCloneRuntimeOperations: WorkerRuntimeOperations = {
   async stop(runtime, identity) {
     const resource = runtime as LocalCloneRuntime;
     if (resource.host === "herdr") {
-      await herdrOperations.closeTab(resource.tab);
+      await herdrOperations.closePane(resource.pane);
       return;
     }
     if (resource.pid === undefined) return;
@@ -1045,12 +1045,12 @@ function validateDockerRuntime(resource: unknown): asserts resource is DockerRun
   const runtime = z.object({
     containerId: z.string().regex(/^[0-9a-f]{64}$/),
     imageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-    host: z.literal("herdr").optional(), workspace: nonBlankString.optional(), tab: nonBlankString.optional(), pane: nonBlankString.optional(),
+    host: z.literal("herdr").optional(), workspace: nonBlankString.optional(), pane: nonBlankString.optional(),
   }).strict().parse(resource);
   if (runtime.host !== undefined) {
-    if (runtime.workspace === undefined || runtime.tab === undefined || runtime.pane === undefined) throw new Error("attended Docker runtime is incomplete");
+    if (runtime.workspace === undefined || runtime.pane === undefined) throw new Error("attended Docker runtime is incomplete");
     validateWorkspace(runtime.workspace);
-  } else if (runtime.workspace !== undefined || runtime.tab !== undefined || runtime.pane !== undefined) throw new Error("Docker runtime hosting fields are inconsistent");
+  } else if (runtime.workspace !== undefined || runtime.pane !== undefined) throw new Error("Docker runtime hosting fields are inconsistent");
 }
 
 type DockerCredential = { encodedAuth: string };
@@ -1311,7 +1311,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   }
 }
 
-/** Launch an interactive Docker container through one fresh Herdr tab. The
+/** Launch an interactive Docker container beside its planner in one fresh Herdr pane. The
  * adapter-owned restartable exact-container observer waits after attachment;
  * attachment loss is never completion evidence. */
 export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
@@ -1333,7 +1333,7 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
   const host = input.herdr ?? herdrOperations;
   const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
   let containerId: string | undefined;
-  let handles: HerdrHandles | undefined;
+  let handles: HerdrPaneHandle | undefined;
   let recorded = false;
   try {
     containerId = await dockerRequired([
@@ -1344,8 +1344,8 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
     ]);
     const createdImageDigest = await dockerRequired(["inspect", "--format", "{{.Image}}", containerId]);
     if (createdImageDigest !== imageDigest) throw new Error("Docker container image does not match inspected provenance");
-    handles = await host.createTab({ cwd: workspace, label: `${input.goalId}-${input.changeId}-${input.ticketId}`, environment: {} });
-    await recordWorker(repository, { ...identity, role: ticket.metadata.role, worker, startedAt: (input.clock ?? (() => new Date()))().toISOString(), environmentDigest: imageDigest, runtime: { containerId, imageDigest, host: "herdr", workspace, tab: handles.tab, pane: handles.pane } });
+    handles = await host.splitPane({ cwd: workspace, environment: {} });
+    await recordWorker(repository, { ...identity, role: ticket.metadata.role, worker, startedAt: (input.clock ?? (() => new Date()))().toISOString(), environmentDigest: imageDigest, runtime: { containerId, imageDigest, host: "herdr", workspace, pane: handles.pane } });
     recorded = true;
     // Start is adapter-owned. Herdr owns only this interactive attachment;
     // losing its shell cannot prevent a later supervisor from observing exit.
@@ -1354,7 +1354,7 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
     return { root: repository.root, exchange, hosting: "herdr", status: "working" };
   } catch (error) {
     if (!recorded) {
-      if (handles !== undefined) await host.closeTab(handles.tab).catch(() => undefined);
+      if (handles !== undefined) await host.closePane(handles.pane).catch(() => undefined);
       if (containerId !== undefined) await dockerRemove(containerId).catch(() => undefined);
       await rm(workspace, { recursive: true, force: true });
     }
@@ -1405,12 +1405,11 @@ export async function dispatchHerdrTicket(
 
   const clock = input.clock ?? (() => new Date());
   const startedAt = clock().toISOString();
-  let handles: HerdrHandles | undefined;
+  let handles: HerdrPaneHandle | undefined;
   let workerRecord: RecordedWorker | undefined;
   try {
-    handles = await host.createTab({
+    handles = await host.splitPane({
       cwd: checkout,
-      label: `${input.goalId}-${input.changeId}-${input.ticketId}`,
       environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket, (input.hostOptions ?? defaultWorkerHostOptions).spikeExecutable),
     });
     workerRecord = await recordLocalCloneWorker(repository, {
@@ -1425,7 +1424,7 @@ export async function dispatchHerdrTicket(
     await host.run(handles.pane, script);
   } catch (error) {
     if (workerRecord === undefined) {
-      if (handles !== undefined) await host.closeTab(handles.tab).catch(() => undefined);
+      if (handles !== undefined) await host.closePane(handles.pane).catch(() => undefined);
       await rm(workspace, { recursive: true, force: true });
     }
     throw error;

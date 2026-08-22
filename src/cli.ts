@@ -873,6 +873,7 @@ export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths, 
     executable: environment["SPIKE_HERDR_BIN"] ?? "herdr",
     managed: environment["HERDR_ENV"] === "1",
     ...(environment["HERDR_WORKSPACE_ID"]?.trim() ? { workspaceId: environment["HERDR_WORKSPACE_ID"] } : {}),
+    ...(environment["HERDR_PANE_ID"]?.trim() ? { paneId: environment["HERDR_PANE_ID"] } : {}),
   });
   let args = rawArgs.filter((arg) => arg !== "--json");
   let json = rawArgs.includes("--json");

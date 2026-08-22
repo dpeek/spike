@@ -21,7 +21,7 @@ import {
   workerRecordPath,
   type TicketIdentity,
 } from "../../src/worker.ts";
-import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
+import type { HerdrOperations, SplitHerdrPaneInput } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const workspaces: string[] = [];
@@ -38,7 +38,7 @@ async function issuedTicket(policy: import("../../src/ticket.ts").ExecutionPolic
   await createChange({
     cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     title: "Add attended hosting",
-    intent: "Host the local clone worker in one ephemeral tab.",
+    intent: "Host the local clone worker beside its planner.",
     rationale: "Attended work should remain observable.",
     acceptanceCriteria: ["Herdr hosting preserves Report authority."],
   });
@@ -56,10 +56,12 @@ async function issuedTicket(policy: import("../../src/ticket.ts").ExecutionPolic
 function observationalHerdr(status: "working" | "blocked" | "done", transcript: string): HerdrOperations {
   return {
     async createTab() { return { tab: "opaque-tab", pane: "opaque-pane" }; },
+    async splitPane() { return { pane: "opaque-pane" }; },
     async run() {},
     async status() { return status; },
     async read() { return transcript; },
     async attach() { return 0; },
+    async closePane() {},
     async closeTab() {},
   };
 }
@@ -76,7 +78,7 @@ describe("ephemeral Herdr worker hosting", () => {
       worker: "attended-worker",
       startedAt: "2026-04-01T10:00:00.000Z",
       workspace,
-      herdr: { tab: "opaque-tab", pane: "opaque-pane" },
+      herdr: { pane: "opaque-pane" },
     });
     const transcript = '{"kind":"report","outcome":"completed","candidateRevision":"claimed"}\n';
     const herdr = observationalHerdr("done", transcript);
@@ -128,7 +130,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await recordDockerWorker(repository.project, {
       ...identity, role: "implement", worker: "docker-worker", startedAt: "2026-04-01T10:00:00.000Z",
       containerId: "a".repeat(64), imageDigest: `sha256:${"b".repeat(64)}`, workspace,
-      herdr: { tab: "docker-tab", pane: "docker-pane" },
+      herdr: { pane: "docker-pane" },
     });
     await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":0,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
     await expect(waitForWorkerDone(repository.project, identity)).resolves.toMatchObject({ status: "done" });
@@ -143,7 +145,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await recordDockerWorker(repository.project, {
       ...identity, role: "implement", worker: "race-worker", startedAt: "2026-04-01T10:00:00.000Z",
       containerId: "c".repeat(64), imageDigest: `sha256:${"d".repeat(64)}`, workspace,
-      herdr: { tab: "race-tab", pane: "race-pane" },
+      herdr: { pane: "race-pane" },
     });
     const host = observationalHerdr("done", "attachment ended");
     // Losing an attachment is operational and cannot substitute for docker wait.
@@ -157,7 +159,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await writeFile(join(workspace, "herdr-execution.json"), '{"exitCode":17,"finishedAt":"2026-04-01T10:01:00.000Z"}\n');
     await expect(loadFinishedWorkerExecution(repository.project, identity)).resolves.toMatchObject({ exitCode: 17 });
     const operations: import("../../src/worker.ts").WorkerRuntimeOperations = {
-      async stop() { operationsSeen.push("stop/tab-close"); },
+      async stop() { operationsSeen.push("stop/pane-close"); },
       async cleanup(runtime) {
         if (!dockerRemoved) { operationsSeen.push("docker-remove"); dockerRemoved = true; }
         operationsSeen.push("workspace-remove");
@@ -175,7 +177,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await expect(stopAndFinalizeRecordedWorker(repository.project, identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
     expect((await loadRecordedWorkerIfPresent(repository.project, identity))?.metadata).toMatchObject({ finishedAt: "2026-04-01T10:01:00.000Z", exitCode: 17 });
     await expect(stopAndFinalizeRecordedWorker(repository.project, identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
-    expect(operationsSeen).toEqual(["stop/tab-close", "docker-remove", "workspace-remove", "stop/tab-close", "workspace-remove"]);
+    expect(operationsSeen).toEqual(["stop/pane-close", "docker-remove", "workspace-remove", "stop/pane-close", "workspace-remove"]);
     expect(await Bun.file(workspace).exists()).toBe(false);
     expect((await loadRecordedWorkerIfPresent(repository.project, identity))?.metadata.runtime).toBeUndefined();
   });
@@ -204,7 +206,7 @@ describe("ephemeral Herdr worker hosting", () => {
     await recordDockerWorker(repository.project, {
       ...identity, role: "implement", worker: "observer-loss", startedAt: "2026-04-01T10:00:00.000Z",
       containerId: "e".repeat(64), imageDigest: `sha256:${"f".repeat(64)}`, workspace,
-      herdr: { tab: "lost-tab", pane: "lost-pane" },
+      herdr: { pane: "lost-pane" },
     });
     const original = dockerWorkerAdapter.runtimeOperations!;
     let exitCode: number | undefined;
@@ -249,14 +251,14 @@ describe("ephemeral Herdr worker hosting", () => {
       worker: "retry-worker",
       startedAt: "2026-04-01T10:00:00.000Z",
       workspace,
-      herdr: { tab: "opaque-tab", pane: "opaque-pane" },
+      herdr: { pane: "opaque-pane" },
     });
 
     let closes = 0;
     let removals = 0;
     const operations: import("../../src/worker.ts").WorkerRuntimeOperations = {
       async stop(runtime, _identity) {
-        expect(runtime).toMatchObject({ host: "herdr", tab: "opaque-tab", pane: "opaque-pane" });
+        expect(runtime).toMatchObject({ host: "herdr", pane: "opaque-pane" });
         closes++;
       },
       async cleanup(runtime) {
@@ -275,20 +277,21 @@ describe("ephemeral Herdr worker hosting", () => {
     expect({ closes, removals }).toEqual({ closes: 2, removals: 2 });
   });
 
-  test("runs the same local exchange in one named tab and closes it only after Report publication", async () => {
+  test("runs the same local exchange beside its planner and closes only the worker pane after Report publication", async () => {
     const { repository, identity } = await issuedTicket();
-    let tabInput: CreateHerdrTabInput | undefined;
+    let paneInput: SplitHerdrPaneInput | undefined;
     let transcript = "";
     const host: HerdrOperations = {
-      async createTab(input) {
-        tabInput = input;
-        return { tab: "opaque-tab-123", pane: "opaque-pane-456" };
+      async createTab() { throw new Error("not called"); },
+      async splitPane(input) {
+        paneInput = input;
+        return { pane: "opaque-pane-456" };
       },
       async run(pane, command) {
         expect(pane).toBe("opaque-pane-456");
         const child = Bun.spawn([command], {
-          cwd: tabInput!.cwd,
-          env: { ...process.env, ...tabInput!.environment },
+          cwd: paneInput!.cwd,
+          env: { ...process.env, ...paneInput!.environment },
           stdout: "pipe",
           stderr: "pipe",
         });
@@ -303,7 +306,8 @@ describe("ephemeral Herdr worker hosting", () => {
       async status() { return "done"; },
       async read() { return transcript; },
       async attach() { return 0; },
-      async closeTab() {},
+      async closePane() {},
+      async closeTab() { throw new Error("not called"); },
     };
     const worker = String.raw`
 import { writeFile } from "node:fs/promises";
@@ -325,8 +329,7 @@ console.log("terminal output is observational only");
     });
     expect(dispatched).toMatchObject({ hosting: "herdr", status: "working" });
     const execution = await loadFinishedWorkerExecution(repository.project, identity);
-    expect(tabInput!.label).toBe("spike-001-001-001");
-    expect(tabInput!.environment).toMatchObject({
+    expect(paneInput!.environment).toMatchObject({
       SPIKE_GOAL_ID: identity.goalId,
       SPIKE_CHANGE_ID: "001",
       SPIKE_TICKET_ID: "001",
@@ -340,7 +343,6 @@ console.log("terminal output is observational only");
       adapter: "local-clone",
       resource: {
         host: "herdr",
-        tab: "opaque-tab-123",
         pane: "opaque-pane-456",
       },
     });
@@ -356,7 +358,7 @@ console.log("terminal output is observational only");
       runtimeOperations: {
         async stop(runtime, stoppedIdentity) {
           closeAttempts++;
-          expect(runtime).toMatchObject({ host: "herdr", tab: "opaque-tab-123", pane: "opaque-pane-456" });
+          expect(runtime).toMatchObject({ host: "herdr", pane: "opaque-pane-456" });
           expect(stoppedIdentity).toEqual(identity);
           expect(await Bun.file(reportPath(repository.project, identity.goalId, "001", "001")).exists()).toBe(true);
         },
@@ -369,7 +371,6 @@ console.log("terminal output is observational only");
     expect(closeAttempts).toBe(1);
     expect(await repository.git("show", `${publication.report.metadata.candidateRevision}:herdr-hosted.txt`)).toBe("hosted output");
     const reportSource = await readFile(reportPath(repository.project, identity.goalId, "001", "001"), "utf8");
-    expect(reportSource).not.toContain("opaque-tab-123");
     expect(reportSource).not.toContain("opaque-pane-456");
     expect(reportSource).not.toContain("terminal output is observational only");
     expect(await Bun.file(workerRecordPath(repository.project, identity)).exists()).toBe(false);

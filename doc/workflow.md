@@ -58,7 +58,9 @@ workflow mutation. Multiple live exact matches are surfaced and refused without
 closing any of them. `spike planner replace --goal <goal>` is the only explicit
 replacement: at capacity it closes only the selected Goal's exact matching tabs,
 including stale done/unavailable resources, then launches one fresh persistent
-interactive named Pi. `observe` and
+interactive named Pi. A matching tab with an active sibling worker pane must be
+settled before replacement, so planner replacement cannot retire a Ticket's
+observational surface implicitly. `observe` and
 `attach` are read/terminal operations and never mutate durable workflow state.
 
 The Goal planner receives only its exact Goal ID and a thin Goal-scoped extension.
@@ -75,7 +77,7 @@ and Herdr lifecycle are never workflow evidence and are not Spike recovery.
 
 ## Attended Docker execution
 
-Container Tickets retain Docker isolation. If the dispatching planner is Herdr-managed, Spike creates a new Herdr tab and starts headed Pi in an interactive Docker TTY; otherwise Docker dispatch is headless, and direct hosting can always be selected explicitly. Status, bounded terminal reads, and attachment are keyed by immutable Ticket identity. They are operational projections only. The adapter-owned, restartable Docker observer emits its actual-exit wake-up marker only after `docker wait`; the Herdr wrapper owns attachment only, so an attach disconnect or Herdr tab state cannot complete work. On recovery the marker-backed waiter is re-armed; Report publication still validates only declared exchange output. Stop and cleanup stop the container before retiring the tab and temporary wrapper directory, and are idempotent.
+Container Tickets retain Docker isolation. If the dispatching planner is Herdr-managed, Spike splits one fresh pane immediately to the planner's right and starts headed Pi there in an interactive Docker TTY; otherwise Docker dispatch is headless, and direct hosting can always be selected explicitly. Each Goal tab therefore contains its named planner on the left and at most one active implementer or reviewer on the right. Status, bounded terminal reads, and attachment are keyed by immutable Ticket identity. They are operational projections only. The adapter-owned, restartable Docker observer emits its actual-exit wake-up marker only after `docker wait`; the Herdr wrapper owns attachment only, so an attach disconnect or Herdr pane state cannot complete work. On recovery the marker-backed waiter is re-armed; Report publication still validates only declared exchange output. Stop and cleanup stop the container before retiring only the worker pane and temporary wrapper directory, and are idempotent. Publishing an Application freezes the Goal and releases its whole planner tab; Application work remains supervisor-owned.
 
 ## Motivation
 
@@ -167,7 +169,7 @@ This makes context packaging an explicit part of the product and avoids:
 - hidden assumptions retained only by one worker;
 - review anchored to implementation reasoning;
 - recovery depending on a live worker conversation;
-- accumulating inactive worker tabs and resources.
+- accumulating inactive worker panes and resources.
 
 A worker may remain alive briefly while its Submission is validated or corrected administratively. Once Spike publishes the corresponding Report into Change history, the worker is stopped and finalized.
 
@@ -663,9 +665,9 @@ If concurrent planner mutation becomes a demonstrated requirement, design it lat
 
 ## Worker execution and lifecycle
 
-The initial adapter creates an ephemeral private clone from the Ticket input bundle. For attended host-local execution, Herdr is the default process host and launches Pi in headed interactive TUI mode in one ephemeral tab. Spike passes the immutable Ticket and context as Pi's initial prompt, disables extension, skill, prompt-template, and context-file discovery, explicitly loads only the role-specific completion extension, and keeps the Pi session ephemeral. An accepted completion both terminates the active turn and requests Pi's supported graceful session shutdown; a rejected completion leaves the same Ticket process alive for correction and retry. The wrapper records Pi's eventual exit, and only that execution marker—not Herdr idle, done, or terminal state—projects the worker as `done`.
+The initial adapter creates an ephemeral private clone from the Ticket input bundle. For attended host-local execution, Herdr is the default process host and launches Pi in headed interactive TUI mode in one fresh pane split immediately to the right of the dispatching planner. Spike passes the immutable Ticket and context as Pi's initial prompt, disables extension, skill, prompt-template, and context-file discovery, explicitly loads only the role-specific completion extension, and keeps the Pi session ephemeral. An accepted completion both terminates the active turn and requests Pi's supported graceful session shutdown; a rejected completion leaves the same Ticket process alive for correction and retry. The wrapper records Pi's eventual exit, and only that execution marker—not Herdr idle, done, or terminal state—projects the worker as `done`.
 
-Direct host-local Pi execution remains a separately selected, headless `--print --no-session` controlled-test fallback with the same exchange and Report semantics. The Phase 3 Docker adapter runs the same exchange contract inside one container per Ticket. When the planner has `HERDR_ENV=1`, it is automatically hosted in an ephemeral interactive Herdr tab; outside Herdr, or with explicit `--host direct`, it uses the headless direct fallback.
+Direct host-local Pi execution remains a separately selected, headless `--print --no-session` controlled-test fallback with the same exchange and Report semantics. The Phase 3 Docker adapter runs the same exchange contract inside one container per Ticket. When the planner has `HERDR_ENV=1`, it is automatically hosted in a fresh interactive Herdr pane to that planner's right; outside Herdr, or with explicit `--host direct`, it uses the headless direct fallback.
 
 For each Ticket, the Worker module:
 
@@ -815,7 +817,7 @@ Owns input bundle creation, quarantine import and verification, Candidate normal
 
 ### Worker module
 
-Owns the runtime-independent exchange contract, fresh worker launch at the exact revision, opaque operational handles, terminal outcome observation, stop, and idempotent cleanup. Its first adapter uses ephemeral private clones. Controlled tests may launch the worker process directly; attended use may host the same process in one ephemeral Herdr tab for observation. Herdr is a process host and observer within the local adapter, not another workflow backend. The production adapter uses Docker. Do not create a general adapter registry or expose adapter-specific types to callers.
+Owns the runtime-independent exchange contract, fresh worker launch at the exact revision, opaque operational handles, terminal outcome observation, stop, and idempotent cleanup. Its first adapter uses ephemeral private clones. Controlled tests may launch the worker process directly; attended use may host the same process in one fresh right-side Herdr pane for observation. Herdr is a process host and observer within the local adapter, not another workflow backend. The production adapter uses Docker. Do not create a general adapter registry or expose adapter-specific types to callers.
 
 ### Durable-state module
 
@@ -877,15 +879,15 @@ Turn the core workflow foundation into one attended, dogfood-ready vertical work
 planner starts or reattaches in Herdr
   -> change create 001
   -> ticket issue 001
-  -> fresh implementation worker starts in an ephemeral Herdr tab
+  -> fresh implementation worker starts to the planner's right in an ephemeral Herdr pane
   -> worker writes a structured Submission through a completion or blocked tool
   -> submission import
   -> candidate normalize
   -> report publish
-  -> worker finalizes and its Herdr tab closes
-  -> review ticket 002 starts in a fresh Herdr tab
+  -> worker finalizes and only its Herdr pane closes
+  -> review ticket 002 starts in a fresh pane at the same right-side position
   -> review report approve
-  -> reviewer finalizes and its Herdr tab closes
+  -> reviewer finalizes and only its Herdr pane closes
   -> change decision land
 ```
 
@@ -894,10 +896,10 @@ Implement the phase as a small sequence of vertical additions:
 1. **Host CLI and configuration** — expose JSON-capable status, Plan revision, Change decision, Ticket dispatch, Report publication, and recovery commands. Add project defaults for planner, `implement`, and `review` model and thinking configuration. Ticket issuance accepts explicit one-Ticket model and thinking overrides, resolves and freezes the effective selection into `ticket.md`, and dispatch uses only that immutable selection. A Ticket worker never inherits the planner model or a later configuration change.
 2. **Structured worker outcomes** — add a thin, Node-compatible Pi worker extension with role-specific terminating tools for completion and blocked outcomes. The extension delegates to worker-facing Spike CLI/process commands that validate the structured payload and verify Pi's observed effective model and thinking selection against the immutable Ticket assignment. Completed implementation snapshots create an exact worker revision and output bundle. A blocked Submission records concrete reason and evidence but creates no bundle, Candidate, or review verdict. Host tooling atomically writes the declared Submission; workers do not format JSON frontmatter or run Git-bundle commands themselves. Spike still treats and revalidates all worker output as untrusted. A worker that exits without an accepted Submission cannot produce a completed or blocked Report; it receives an appropriate host terminal Report and later work uses a fresh Ticket.
 3. **Direct tracer-bullet verification** — run the complete CLI workflow with deterministic scripted workers and direct process launch. This remains the fast reference path for tests and proves that Herdr is not part of workflow authority.
-4. **Supervisor and Herdr integration** — add a thin, Node-compatible Pi supervisor extension and planner launcher. The extension invokes Spike only through structured CLI/process output and exposes unguided Request capture and Inbox inspection, committed guidance selection, explicitly approved Goal creation with optional source-Request citation, status, Plan update, Change creation, focused Implement/Review/Remediate Ticket issuance, dispatch, recovery, and Change decision operations. Request capture and selection are unapproved intake only; they neither consume guided-step selection nor start work, and an approved Goal may remain queued without an active Change. For attended execution, the local adapter defaults to headed interactive Pi in one named ephemeral Herdr tab, automatically submits the immutable Ticket/context prompt, records opaque Herdr handles only in staging runtime state, surfaces live `working`, `blocked`, marker-backed `done`, or unavailable status, and supports terminal read or attachment. The completion extension requests graceful Pi shutdown only after Spike accepts structured completion. For workspace hosting, the attended wrapper then writes its local-Pi execution marker. For Docker hosting, the Herdr pane owns attachment only and the adapter-owned, restartable exact-container observer records actual container exit and installs the operational marker. A cancellable one-shot Spike waiter observes that marker without mutating Worker records, and the supervisor extension queues one operational planner recheck keyed by full Ticket identity. An unexpected attended-waiter failure queues a distinct operational failure recheck instead of silently disabling wake-up. The planner calls `spike_status` and explicitly publishes the Report; markers, waiter failures, and wake messages are never workflow evidence. A Herdr state or terminal transcript is never a Submission, Report, approval, or recovery fact. Direct Pi remains the separately selected headless controlled-test fallback.
-5. **Attended smoke loop** — manually complete one real-Pi Goal in a temporary test repository through implement, review, approve, and land. Verify supervisor restart, marker-backed planner wake-up without model polling, worker observation, blocked-state visibility, exact Report publication, prompt closure of worker tabs, and idempotent cleanup.
+4. **Supervisor and Herdr integration** — add a thin, Node-compatible Pi supervisor extension and planner launcher. The extension invokes Spike only through structured CLI/process output and exposes unguided Request capture and Inbox inspection, committed guidance selection, explicitly approved Goal creation with optional source-Request citation, status, Plan update, Change creation, focused Implement/Review/Remediate Ticket issuance, dispatch, recovery, and Change decision operations. Request capture and selection are unapproved intake only; they neither consume guided-step selection nor start work, and an approved Goal may remain queued without an active Change. For attended execution, the local adapter defaults to headed interactive Pi in one fresh right-side Herdr pane beside the dispatching planner, automatically submits the immutable Ticket/context prompt, records its opaque pane handle only in staging runtime state, surfaces live `working`, `blocked`, marker-backed `done`, or unavailable status, and supports terminal read or attachment. The completion extension requests graceful Pi shutdown only after Spike accepts structured completion. For workspace hosting, the attended wrapper then writes its local-Pi execution marker. For Docker hosting, the Herdr pane owns attachment only and the adapter-owned, restartable exact-container observer records actual container exit and installs the operational marker. A cancellable one-shot Spike waiter observes that marker without mutating Worker records, and the supervisor extension queues one operational planner recheck keyed by full Ticket identity. An unexpected attended-waiter failure queues a distinct operational failure recheck instead of silently disabling wake-up. The planner calls `spike_status` and explicitly publishes the Report; markers, waiter failures, and wake messages are never workflow evidence. A Herdr state or terminal transcript is never a Submission, Report, approval, or recovery fact. Direct Pi remains the separately selected headless controlled-test fallback.
+5. **Attended smoke loop** — manually complete one real-Pi Goal in a temporary test repository through implement, review, approve, and land. Verify supervisor restart, marker-backed planner wake-up without model polling, worker observation, blocked-state visibility, exact Report publication, prompt closure of worker panes, and idempotent cleanup.
 
-Herdr integration in this phase is deliberately ephemeral and observational. Do not implement session reuse, remediation in the original implementation session, arbitrary free-form agents, planner-to-worker follow-up, concurrent Changes, semantic churn analysis, persistent worker tabs after Report publication, or a general runtime plugin system. Direct process launch remains available for controlled tests and as an explicit fallback.
+Herdr integration in this phase is deliberately ephemeral and observational. Do not implement session reuse, remediation in the original implementation session, arbitrary free-form agents, planner-to-worker follow-up, concurrent Changes, semantic churn analysis, persistent worker panes after Report publication, or a general runtime plugin system. Direct process launch remains available for controlled tests and as an explicit fallback.
 
 The local-clone adapter provides workspace separation, not security isolation. Use it only for controlled tests and trusted, attended dogfooding with explicit unrestricted-network acknowledgement. Do not use it to run unattended autonomous workers against valuable repositories or provide valuable credentials. Docker isolation remains required for production use.
 
@@ -984,7 +986,7 @@ The implementation succeeds when:
 - review and remediation require no same-session continuation;
 - planner can detect and surface obvious churn;
 - interruption rewinds to the latest committed Candidate, abandons in-progress sessions, and cleans their resources without PID-based workflow locks;
-- terminal workers are finalized promptly, including closure of ephemeral Herdr tabs after Report publication;
+- terminal workers are finalized promptly, including closure of their ephemeral Herdr panes after Report publication without retiring planner tabs;
 - Herdr makes attended planner and worker progress observable without becoming workflow authority or enabling session reuse;
 - structured worker completion and blocked tools make a valid accepted Submission the only path to a worker-authored completed or blocked Report;
 - Docker isolation is required before unattended autonomous workers run against valuable repositories;

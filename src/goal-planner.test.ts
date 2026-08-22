@@ -17,16 +17,21 @@ function fakeHerdr(resources: Array<HerdrHandles & { label: string; status: Herd
       resources.push(resource);
       return resource;
     },
+    async splitPane() { throw new Error("not called"); },
     async run(pane, command) { calls.push(`run:${pane}:${command}`); },
     async status(pane) { return resources.find((resource) => resource.pane === pane)?.status ?? "unavailable"; },
     async read() { return ""; },
     async attach(pane) { calls.push(`attach:${pane}`); return 0; },
+    async closePane() { throw new Error("not called"); },
     async closeTab(tab) {
       calls.push(`close:${tab}`);
       const index = resources.findIndex((resource) => resource.tab === tab);
       if (index >= 0) resources.splice(index, 1);
     },
-    async findTabsByLabel(label) { calls.push(`find:${label}`); return resources.filter((resource) => resource.label === label); },
+    async findTabsByLabel(label) {
+      calls.push(`find:${label}`);
+      return resources.filter((resource) => resource.label === label).map((resource) => ({ ...resource, paneCount: 1 }));
+    },
   };
   return { herdr, calls };
 }
@@ -148,13 +153,29 @@ describe("Goal planner ownership", () => {
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(3);
   });
 
+  test("does not replace a planner while its Goal tab owns a worker pane", async () => {
+    const { repository, goalId } = await fixture();
+    const identity = goalPlannerIdentity(`file://${repository.root}/.git`, goalId);
+    const { herdr, calls } = fakeHerdr([{ tab: "goal-tab", pane: "planner-pane", label: identity.name, status: "working" }]);
+    const withWorker: HerdrOperations = {
+      ...herdr,
+      async findTabsByLabel(label) {
+        return label === identity.name ? [{ tab: "goal-tab", pane: "planner-pane", paneCount: 2 }] : [];
+      },
+    };
+
+    await expect(goalPlannerOperations.replace({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr: withWorker }))
+      .rejects.toThrow("active sibling pane");
+    expect(calls.some((call) => call.startsWith("close:") || call.startsWith("create:") || call.startsWith("run:"))).toBe(false);
+  });
+
   test("refuses unknown Goals before Herdr side effects and malformed handles", async () => {
     const { repository } = await fixture();
     const { herdr, calls } = fakeHerdr([]);
     await expect(goalPlannerOperations.observe({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: "spike-999", herdr })).rejects.toThrow();
     expect(calls).toEqual([]);
     const goalId = "spike-001";
-    const bad: HerdrOperations = { ...herdr, findTabsByLabel: async () => [{ tab: "bad tab", pane: "pane" }] };
+    const bad: HerdrOperations = { ...herdr, findTabsByLabel: async () => [{ tab: "bad tab", pane: "pane", paneCount: 1 }] };
     await expect(goalPlannerOperations.observe({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, herdr: bad })).rejects.toThrow("invalid tab handle");
   });
 });

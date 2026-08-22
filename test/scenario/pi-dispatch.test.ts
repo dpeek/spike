@@ -7,7 +7,7 @@ import { createGoal } from "../../src/goal.ts";
 import { publishImplementationReport } from "../../src/report.ts";
 import { reportPath } from "../../src/ticket.ts";
 import { dispatchPiTicket, loadFinishedWorkerExecution, observeWorker } from "../../src/worker.ts";
-import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
+import type { HerdrOperations, SplitHerdrPaneInput } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
@@ -118,20 +118,21 @@ describe("controlled Pi dispatch", () => {
       '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
-    let tabInput: CreateHerdrTabInput | undefined;
+    let paneInput: SplitHerdrPaneInput | undefined;
     let closes = 0;
     const herdr: HerdrOperations = {
-      async createTab(input) {
-        tabInput = input;
-        return { tab: "headed-tab", pane: "headed-pane" };
+      async createTab() { throw new Error("not called"); },
+      async splitPane(input) {
+        paneInput = input;
+        return { pane: "headed-pane" };
       },
       async run(pane, command) {
         expect(pane).toBe("headed-pane");
         const child = Bun.spawn([command], {
-          cwd: tabInput!.cwd,
+          cwd: paneInput!.cwd,
           env: {
             ...process.env,
-            ...tabInput!.environment,
+            ...paneInput!.environment,
             FAKE_PI_ARGS: argsPath,
             FAKE_PI_HOST: "herdr",
           },
@@ -146,7 +147,8 @@ describe("controlled Pi dispatch", () => {
       async status() { return "done"; },
       async read() { return "headed Pi transcript"; },
       async attach() { return 0; },
-      async closeTab() { closes++; },
+      async closePane() { closes++; },
+      async closeTab() { throw new Error("not called"); },
     };
 
     const dispatched = await dispatchPiTicket({
@@ -186,10 +188,10 @@ describe("controlled Pi dispatch", () => {
       commitMessage: { summary: "Complete headed Pi dispatch" },
       runtimeOperations: {
         async stop(runtime, _identity) {
-          expect(runtime).toMatchObject({ host: "herdr", tab: "headed-tab", pane: "headed-pane" });
+          expect(runtime).toMatchObject({ host: "herdr", pane: "headed-pane" });
           expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(true);
           if ((runtime as { host: string }).host !== "herdr") throw new Error("expected Herdr runtime");
-          await herdr.closeTab((runtime as { tab: string }).tab);
+          await herdr.closePane((runtime as { pane: string }).pane);
         },
         async cleanup(runtime) { await rm((runtime as { workspace: string }).workspace, { recursive: true, force: true }); },
       },

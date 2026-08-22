@@ -75,7 +75,7 @@ spike ticket issue \
 
 ## Attended container workers
 
-When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in one ephemeral Herdr tab. The tab can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary. Their bounded `/tmp` and `/work` tmpfs locations are writable and executable for generated coding tools while remaining `nosuid`.
+When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in a pane split immediately to the right of that planner. The worker pane can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary. Their bounded `/tmp` and `/work` tmpfs locations are writable and executable for generated coding tools while remaining `nosuid`.
 
 ## Request inbox
 
@@ -116,12 +116,12 @@ isolation in configuration resolves to `container`. When the planner has
 `HERDR_ENV=1`, both workspace and container dispatch are attended; otherwise both
 use direct execution. Use `--host direct` as the explicit container fallback.
 Pi dispatch accepts no model, thinking, role, prompt, or extension overrides.
-Attended dispatch defaults to one headed interactive Pi TUI in a named ephemeral
-Herdr tab. It uses the immutable selection from `ticket.md`, automatically
+Attended dispatch defaults to one headed interactive Pi TUI in a fresh right-side
+Herdr pane beside the dispatching planner. It uses the immutable selection from `ticket.md`, automatically
 submits the Ticket/context prompt, disables extension, skill, prompt-template,
 and context-file discovery, explicitly loads only the role-specific completion
 extension, and starts at the exact Ticket
-input revision. Spike persists only opaque tab and pane handles as Herdr state;
+input revision. Spike persists only the opaque worker pane handle as Herdr state;
 status and terminal text remain observational. Dispatch returns after launch so
 the planner can observe `working` or `blocked` workers. Exchange output remains
 staging until a separate publication command:
@@ -157,7 +157,7 @@ message that wakes an idle planner. If an attended waiter fails unexpectedly, it
 queues a distinct operational failure recheck instead of silently disabling wake-up.
 The planner must call `spike_status` and then explicitly publish the Report; either
 notification remains non-authoritative. Report
-publication validates only the standard exchange and then closes the tab; stop
+publication validates only the standard exchange and then closes the worker pane; stop
 and cleanup can be retried.
 
 Direct Pi launch is an explicit headless `--print --no-session` controlled-test fallback:
@@ -228,7 +228,8 @@ are admitted; a third is refused before stale cleanup, tab creation, Pi launch, 
 workflow mutation. Duplicate live labels are refused without closing either pane;
 `replace` is the explicit operation that idempotently closes only the selected Goal's
 exact matching tabs and starts a fresh named Pi session, including at two-Goal
-capacity. Done or unavailable matching resources are stale operational projections
+capacity. Replacement refuses a matching tab while its right-side worker pane is
+still present, preserving the active Ticket's observational surface. Done or unavailable matching resources are stale operational projections
 and are cleaned only after admission. Reattachment preserves the live Pi
 conversation; replacement begins only from durable Goal, Plan, Ticket, Report,
 decision, and Git evidence. Neither operation reads Pi JSONL, terminal text, process
