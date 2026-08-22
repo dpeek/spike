@@ -298,18 +298,26 @@ export async function publishApplicationPartialReport(input: ApplicationTicketId
   return { root: repository.root, report: { metadata, body: `# Application Ticket partial\n\n## Reason\n\n${reason}\n` } };
 }
 export type ApplicationChurnWarning = { kind: "remediation-rounds" | "reopened-finding" | "non-progress"; message: string };
-export async function deriveApplicationChurn(root: string, goalId: string, applicationId: string): Promise<ApplicationChurnWarning[]> {
-  const review = await import("./application-review.ts");
-  const reviewReports = await Promise.all((await review.listApplicationReviewTicketIds(root, goalId, applicationId)).map(id => review.loadApplicationReviewReportIfPresent(root, goalId, applicationId, id)));
-  const remediate = reviewReports.filter((report): report is NonNullable<typeof report> => report?.metadata.outcome === "completed" && report.metadata.verdict === "remediate");
+type ChurnReview = { outcome: string; verdict: string | undefined; findings: Array<{ id: string }> } | undefined;
+type ChurnReport = { outcome: string } | undefined;
+export function detectApplicationChurn(reviewReports: ChurnReview[], reports: ChurnReport[]): ApplicationChurnWarning[] {
+  const remediate = reviewReports.filter((report): report is NonNullable<typeof report> => report?.outcome === "completed" && report.verdict === "remediate");
   const warnings: ApplicationChurnWarning[] = [];
   if (remediate.length >= 2) warnings.push({ kind: "remediation-rounds", message: "two or more remediate review verdicts are recorded" });
   const seen = new Set<string>(); let reopened = false;
-  for (const report of remediate) { for (const finding of report.metadata.findings) { if (seen.has(finding.id)) reopened = true; seen.add(finding.id); } }
+  for (const report of remediate) { for (const finding of report.findings) { if (seen.has(finding.id)) reopened = true; seen.add(finding.id); } }
   if (reopened) warnings.push({ kind: "reopened-finding", message: "a stable finding ID recurred in a later remediation review" });
-  const reports = await Promise.all((await listApplicationTicketIds(root, goalId, applicationId)).map(id => loadApplicationReportIfPresent(root, goalId, applicationId, id)));
-  for (let index = 1; index < reports.length; index++) if (["partial", "blocked"].includes(reports[index - 1]?.metadata.outcome ?? "") && ["partial", "blocked"].includes(reports[index]?.metadata.outcome ?? "")) { warnings.push({ kind: "non-progress", message: "two consecutive partial or blocked implementation Reports are recorded" }); break; }
+  for (let index = 1; index < reports.length; index++) if (["partial", "blocked"].includes(reports[index - 1]?.outcome ?? "") && ["partial", "blocked"].includes(reports[index]?.outcome ?? "")) { warnings.push({ kind: "non-progress", message: "two consecutive partial or blocked implementation Reports are recorded" }); break; }
   return warnings;
+}
+export async function deriveApplicationChurn(root: string, goalId: string, applicationId: string): Promise<ApplicationChurnWarning[]> {
+  const review = await import("./application-review.ts");
+  const reviewReports = await Promise.all((await review.listApplicationReviewTicketIds(root, goalId, applicationId)).map(id => review.loadApplicationReviewReportIfPresent(root, goalId, applicationId, id)));
+  const reports = await Promise.all((await listApplicationTicketIds(root, goalId, applicationId)).map(id => loadApplicationReportIfPresent(root, goalId, applicationId, id)));
+  return detectApplicationChurn(
+    reviewReports.map(report => report === undefined ? undefined : { outcome: report.metadata.outcome, verdict: report.metadata.verdict, findings: report.metadata.findings }),
+    reports.map(report => report === undefined ? undefined : { outcome: report.metadata.outcome }),
+  );
 }
 export async function deriveApplicationStatus(cwd: string, goalId: string, applicationId: string) {
   const repository = await discoverRepository(cwd);

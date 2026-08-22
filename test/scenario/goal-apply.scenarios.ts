@@ -1,18 +1,18 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { abandonChange, createChange, landChange, rejectChange } from "./change.ts";
-import { applicationEvidence, applicationPath, createSquashCandidate, listApplicationIds, listProjectApplications, loadApplicationDecisionIfPresent, publishApplyDecision, queuedApplicationHead } from "./application.ts";
-import { reconcileGoal, reconcileRepository, recoverInterruptedTicket, stopTicket } from "./recovery.ts";
-import { refreshChangeChurn, revisePlan } from "./plan.ts";
-import { publishBlockedReport } from "./report.ts";
-import { deriveRepositoryStatus } from "./status.ts";
-import { serializeDocument } from "./durable-state.ts";
-import { applyQueueHead, queueGoalIntegration } from "./goal-apply.ts";
-import { createGoal, integratedRef } from "./goal.ts";
-import { reportPath } from "./ticket.ts";
-import { issueReplacementTicket, issueTicket } from "./ticket.ts";
-import { temporaryRepository } from "../test/support/repository.ts";
+import { abandonChange, createChange, landChange, rejectChange } from "../../src/change.ts";
+import { applicationEvidence, applicationPath, createSquashCandidate, listApplicationIds, listProjectApplications, loadApplicationDecisionIfPresent, publishApplyDecision, queuedApplicationHead } from "../../src/application.ts";
+import { reconcileGoal, reconcileRepository, recoverInterruptedTicket, stopTicket } from "../../src/recovery.ts";
+import { refreshChangeChurn, revisePlan } from "../../src/plan.ts";
+import { publishBlockedReport } from "../../src/report.ts";
+import { deriveRepositoryStatus } from "../../src/status.ts";
+import { serializeDocument } from "../../src/durable-state.ts";
+import { applyQueueHead, queueGoalIntegration } from "../../src/goal-apply.ts";
+import { createGoal, integratedRef } from "../../src/goal.ts";
+import { reportPath } from "../../src/ticket.ts";
+import { issueReplacementTicket, issueTicket } from "../../src/ticket.ts";
+import { temporaryRepository } from "../support/repository.ts";
 
 setDefaultTimeout(15_000);
 
@@ -82,7 +82,7 @@ async function completedGoal(existing?: Awaited<ReturnType<typeof temporaryRepos
 }
 
 async function cli(cwd: string, args: string[]) {
-  const child = Bun.spawn([join(import.meta.dir, "..", "bin", "spike"), ...args], {
+  const child = Bun.spawn([join(import.meta.dir, "..", "..", "bin", "spike"), ...args], {
     cwd, env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   return { exitCode: await child.exited, stdout: await new Response(child.stdout).text(), stderr: await new Response(child.stderr).text() };
@@ -99,6 +99,7 @@ async function expectMainWorktree(repository: Awaited<ReturnType<typeof temporar
   if (integrated) expect(await Bun.file(join(repository.root, "integrated.txt")).text()).toBe("reviewed\n");
 }
 
+export function registerGoalApplyCoreScenarios() {
 describe("Goal integration apply", () => {
   test("squashes the integrated tree onto checked-out clean-base main", async () => {
     const { repository, goalId, base, integrated } = await completedGoal();
@@ -185,6 +186,11 @@ describe("Goal integration apply", () => {
     expect(afterRecovery.queueHead).toMatchObject({ goalId: first.goalId, applicationId: one.applicationId, queuePosition: 1 });
   });
 
+});
+}
+
+export function registerGoalApplyRecoveryScenarios() {
+describe("Goal integration apply", () => {
   test("covers every queue and apply crash commit point with exact target projection recovery", async () => {
     const cases: Array<{ point: "application-publication" | "application-decision-publication" | "application-target-advance"; moment: "before" | "after" }> = [
       { point: "application-publication", moment: "before" }, { point: "application-publication", moment: "after" },
@@ -272,6 +278,11 @@ describe("Goal integration apply", () => {
     await expect(applyGoalIntegration({ cwd: repository.root, goalId, approval: "Again." })).rejects.toThrow("immutable Application evidence");
   });
 
+});
+}
+
+export function registerGoalApplyQueueScenarios() {
+describe("Goal integration apply", () => {
   test("freezes every Goal-local Plan, Change, Ticket, Report, decision, and recovery mutation surface", async () => {
     const { repository, goalId } = await completedGoal();
     await queueGoalIntegration({ cwd: repository.root, goalId, approval: "Freeze.", planners: { ...({} as any), release: async () => undefined } });
@@ -358,3 +369,4 @@ describe("Goal integration apply", () => {
     expect(await repository.git("rev-parse", "main")).toBe(base);
   });
 });
+}

@@ -1,20 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applicationCandidateRef, applicationExchangePath, applicationReportPath, applicationTicketPath } from "./application-ticket.ts";
-import { applicationReviewReportPath, applicationReviewTicketPath, issueApplicationReviewTicket, recoverApplicationReviewTicket } from "./application-review.ts";
-import { applicationRequeueEligibility, applicationResolutionPath, createSquashCandidate, loadApplicationResolutionIfPresent, publishApplication, publishApplyDecision, queuedApplicationHead, recoverApplications, returnApplication, staleApplication } from "./application.ts";
-import { createChange, landChange } from "./change.ts";
-import { goalPlannerOperations } from "./goal-planner.ts";
-import type { HerdrOperations } from "./herdr.ts";
-import { registerGoalPlannerExtension, registerSupervisorExtension, type SupervisorExtensionApi } from "./pi-supervisor-extension.ts";
-import { issueTicket, reportPath } from "./ticket.ts";
-import { serializeDocument } from "./durable-state.ts";
-import { createGoal } from "./goal.ts";
-import { queueGoalIntegration } from "./goal-apply.ts";
-import { reconcileGoal } from "./recovery.ts";
-import { deriveGoalStatus } from "./status.ts";
-import { temporaryRepository } from "../test/support/repository.ts";
+import { applicationCandidateRef, applicationExchangePath, applicationReportPath, applicationTicketPath } from "../../src/application-ticket.ts";
+import { applicationReviewReportPath, applicationReviewTicketPath, issueApplicationReviewTicket, recoverApplicationReviewTicket } from "../../src/application-review.ts";
+import { applicationRequeueEligibility, applicationResolutionPath, createSquashCandidate, loadApplicationResolutionIfPresent, publishApplication, publishApplyDecision, queuedApplicationHead, recoverApplications, returnApplication, staleApplication } from "../../src/application.ts";
+import { createChange, landChange } from "../../src/change.ts";
+import { goalPlannerOperations } from "../../src/goal-planner.ts";
+import type { HerdrOperations } from "../../src/herdr.ts";
+import { registerGoalPlannerExtension, registerSupervisorExtension, type SupervisorExtensionApi } from "../../src/pi-supervisor-extension.ts";
+import { issueTicket, reportPath } from "../../src/ticket.ts";
+import { serializeDocument } from "../../src/durable-state.ts";
+import { createGoal } from "../../src/goal.ts";
+import { queueGoalIntegration } from "../../src/goal-apply.ts";
+import { reconcileGoal } from "../../src/recovery.ts";
+import { deriveGoalStatus } from "../../src/status.ts";
+import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<{ remove(): Promise<void> }> = [];
 afterEach(async () => { await Promise.all(repositories.splice(0).map(repository => repository.remove())); });
@@ -84,7 +84,7 @@ function fakePlanner(calls: string[]): HerdrOperations {
 }
 
 async function cli(cwd: string, args: string[], env: NodeJS.ProcessEnv) {
-  const child = Bun.spawn([join(import.meta.dir, "..", "bin", "spike"), ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn([join(import.meta.dir, "..", "..", "bin", "spike"), ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   return { exitCode: await child.exited, stdout: await new Response(child.stdout).text(), stderr: await new Response(child.stderr).text() };
 }
 
@@ -98,6 +98,7 @@ async function fixture(completed: boolean, reported = true) {
   return { repository, goalId, base };
 }
 
+export function registerApplicationResolutionEvidenceScenarios() {
 describe("Application terminal resolution", () => {
   test("records immutable stale evidence, advances FIFO, and permits same-G requeue without touching refs", async () => {
     const { repository, goalId, base } = await fixture(false);
@@ -159,6 +160,11 @@ describe("Application terminal resolution", () => {
     await expect(queuedApplicationHead(provenance.repository.root)).rejects.toThrow("malformed resolution evidence");
   });
 
+});
+}
+
+export function registerApplicationResolutionWorkflowScenarios() {
+describe("Application terminal resolution", () => {
   test("recovery skips a resolved attempt and advances the earliest later decision owner", async () => {
     const { repository, goalId } = await fixture(false);
     await writeFile(join(repository.root, "moved.txt"), "moved\n"); await repository.git("add", "moved.txt"); await repository.git("commit", "--quiet", "-m", "move main");
@@ -253,6 +259,11 @@ describe("Application terminal resolution", () => {
     expect(await gitSnapshot(reviewed.repository)).toEqual(beforeMovedReturn);
   });
 
+});
+}
+
+export function registerApplicationResolutionBoundaryScenarios() {
+describe("Application terminal resolution", () => {
   test("return admits a real planner, stale refuses it before Herdr side effects, and active Change recovery continues", async () => {
     const returned = await fixture(true);
     await recordReview(returned.repository, returned.goalId, "001", returned.base, returned.base);
@@ -329,3 +340,4 @@ describe("Application terminal resolution", () => {
     await expect(returnApplication({ cwd: repository.root, goalId, applicationId: "001", statement: "Again." })).rejects.toThrow("exact unresolved FIFO head");
   });
 });
+}

@@ -1,27 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { changeDecisionPath, createChange, landChange } from "./change.ts";
-import { candidateRef } from "./git-change.ts";
-import { createGoal, integratedRef } from "./goal.ts";
-import { revisePlan } from "./plan.ts";
-import { publishImplementationReport, publishReviewReport } from "./report.ts";
-import { deriveRepositoryStatus } from "./status.ts";
-import { issueTicket, reportPath, ticketPath } from "./ticket.ts";
+import { changeDecisionPath, createChange, landChange } from "../../src/change.ts";
+import { candidateRef } from "../../src/git-change.ts";
+import { createGoal, integratedRef } from "../../src/goal.ts";
+import { revisePlan } from "../../src/plan.ts";
+import { publishImplementationReport, publishReviewReport } from "../../src/report.ts";
+import { deriveRepositoryStatus } from "../../src/status.ts";
+import { issueTicket, reportPath, ticketPath } from "../../src/ticket.ts";
 import {
   dispatchLocalImplementation,
   dispatchLocalReview,
   exchangePath,
   loadRecordedWorkerIfPresent,
   workerRecordPath,
-} from "./worker.ts";
-import { temporaryRepository } from "../test/support/repository.ts";
+} from "../../src/worker.ts";
+import { temporaryRepository } from "../support/repository.ts";
 
 const repositories: Array<Awaited<ReturnType<typeof temporaryRepository>>> = [];
 afterEach(async () => { await Promise.all(repositories.splice(0).map((repository) => repository.remove())); });
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 const timestamp = new Date(0);
-const completionUrl = pathToFileURL(join(import.meta.dir, "worker-completion.ts")).href;
+const completionUrl = pathToFileURL(join(import.meta.dir, "..", "..", "src", "worker-completion.ts")).href;
 
 /** Explicit rendezvous proves overlap without timers or service processes. */
 function barrier(parties: number) {

@@ -2,15 +2,15 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createChange, loadChangeDecision } from "./change.ts";
-import { createGoal } from "./goal.ts";
-import { loadPlan } from "./plan.ts";
-import { issueTicket } from "./ticket.ts";
-import { workerRecordPath } from "./worker.ts";
-import { usage, version } from "./cli.ts";
-import { fixtureGuidance, temporaryRepository } from "../test/support/repository.ts";
+import { createChange, loadChangeDecision } from "../../src/change.ts";
+import { createGoal } from "../../src/goal.ts";
+import { loadPlan } from "../../src/plan.ts";
+import { issueTicket } from "../../src/ticket.ts";
+import { workerRecordPath } from "../../src/worker.ts";
+import { usage, version } from "../../src/cli.ts";
+import { fixtureGuidance, temporaryRepository } from "../support/repository.ts";
 
-const root = join(import.meta.dir, "..");
+const root = join(import.meta.dir, "..", "..");
 const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
 
 afterEach(async () => {

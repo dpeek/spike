@@ -15,8 +15,9 @@ Version 2 is starting from a deliberately small foundation.
 Requires [Bun](https://bun.sh/).
 
 ```bash
-bun run test
-bun run check
+bun run check             # focused tests + one complete CLI tracer bullet
+bun run test:integration  # scenario and adapter-contract suites
+bun run check:full        # all non-Docker tests
 # Explicit Docker coverage (requires a safe local daemon)
 bun test test/docker/
 bin/spike --help

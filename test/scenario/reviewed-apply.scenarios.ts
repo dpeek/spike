@@ -94,6 +94,7 @@ async function repository() {
   const result = await temporaryRepository(); repos.push(result); await result.git("branch", "-M", "main"); return result;
 }
 
+export function registerReviewedApplyCoreScenarios() {
 describe("reviewed application production scenarios", () => {
   test("reviewed diverged apply advances only main by CAS", async () => {
     const repo = await repository();
@@ -127,6 +128,11 @@ describe("reviewed application production scenarios", () => {
     expect(supervisor.durable.applicationQueue[0]).toMatchObject({ state: "applied", evidenceState: "applied", decision: { candidateRevision: app.candidate }, cleanup: { healthy: true } });
   });
 
+});
+}
+
+export function registerReviewedApplyCasScenario() {
+describe("reviewed application production scenarios", () => {
   test("CAS mismatch never overwrites moved main", async () => {
     const repo = await repository(); const goal = await landedGoal(repo, "goal-one.txt", "goal one\n"); const target = await moveMain(repo); const app = await reviewedApplication(repo, goal, "mismatch");
     await expect(applyQueueHead({ cwd: repo.root, goalId: goal.goalId, applicationId: app.queued.applicationId, crash: async event => { if (event.point === "application-target-advance" && event.moment === "before") throw new Error("interrupt"); } })).rejects.toThrow("interrupt");
@@ -139,6 +145,11 @@ describe("reviewed application production scenarios", () => {
     expect(status.applicationQueue[0]).toMatchObject({ state: "target-mismatch", evidenceState: "target-mismatch", candidate: { revision: app.candidate }, decision: { expectedPreviousMainRevision: target }, cleanup: { healthy: true } });
   });
 
+});
+}
+
+export function registerReviewedApplyFifoScenario() {
+describe("reviewed application production scenarios", () => {
   test("two disjoint Goals deliver FIFO as two squash commits", async () => {
     const repo = await repository();
     const first = await landedGoal(repo, "goal-one.txt", "one\n");
@@ -177,6 +188,11 @@ describe("reviewed application production scenarios", () => {
     expect(secondApp.candidate).toBe(secondApplied.resultingTargetRevision);
   });
 
+});
+}
+
+export function registerReviewedApplyCleanBaseScenario() {
+describe("reviewed application production scenarios", () => {
   test("clean-base apply and Change review remain unchanged", async () => {
     const repo = await repository();
     const goal = await landedGoal(repo, "clean-goal.txt", "clean content\n");
@@ -191,3 +207,4 @@ describe("reviewed application production scenarios", () => {
     expect((await deriveRepositoryStatus(repo.root)).applicationQueue[0]).toMatchObject({ state: "applied", evidenceState: "applied", candidate: null, decision: { kind: "application-decision" }, cleanup: { healthy: true } });
   });
 });
+}
