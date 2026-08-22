@@ -119,6 +119,7 @@ export const supervisorToolNames = [
   "spike_create_goal",
   "spike_create_request",
   "spike_list_requests",
+  "spike_close_request",
   "spike_show_request",
   "spike_revise_plan",
   "spike_create_change",
@@ -365,6 +366,12 @@ function commandSummary(response: SpikeJsonSuccess): string {
       const projects = Array.isArray(object(request?.metadata)?.projects) ? object(request?.metadata)?.projects : [];
       const affinity = projects.filter((project: unknown): project is string => typeof project === "string").join(", ") || "unassigned";
       return `${response.command === "request create" ? "Created" : "Request"} Request ${id} · ${state} · ${affinity}`;
+    }
+    case "request close": {
+      const request = object(data);
+      const id = string(object(request?.metadata)?.requestId) ?? "unknown";
+      const disposition = string(object(object(request?.closure)?.metadata)?.disposition) ?? "unknown";
+      return `Closed Request ${id} · ${disposition}`;
     }
     case "request list": {
       const requests = Array.isArray(response.data) ? response.data : [];
@@ -1075,6 +1082,24 @@ export function registerSupervisorExtension(
         if (params.closed === true) args.push("--closed");
         return args;
       },
+    }, invoke, options),
+    tool({
+      name: "spike_close_request",
+      label: "Close Request",
+      description: "Close one host-local Request with an explicit disposition and closure statement.",
+      promptSnippet: "Close one Request only with the operator's explicit closure statement",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["requestId", "disposition", "statement"],
+        properties: {
+          requestId,
+          disposition: { type: "string", enum: ["addressed", "declined", "withdrawn"] },
+          statement: requiredNonBlankString,
+        },
+      },
+      command: "request close",
+      args: (params) => ["request", "close", "--request", params.requestId, "--disposition", params.disposition, "--statement", params.statement],
     }, invoke, options),
     tool({
       name: "spike_show_request",

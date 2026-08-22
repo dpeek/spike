@@ -594,6 +594,9 @@ describe("Pi supervisor extension", () => {
         if (input.expectedCommand === "request list") {
           return { ok: true, command: "request list", data: [{ metadata: { requestId: "request-001", projects: ["spike"] }, title: "Future work", state: "open" }] };
         }
+        if (input.expectedCommand === "request close") {
+          return { ok: true, command: "request close", data: { metadata: { requestId: "request-001", projects: [] }, state: "closed", closure: { metadata: { disposition: "addressed" } } } };
+        }
         if (input.expectedCommand.startsWith("request")) {
           return { ok: true, command: input.expectedCommand, data: { metadata: { requestId: "request-001", projects: [] }, state: "open" } };
         }
@@ -610,6 +613,9 @@ describe("Pi supervisor extension", () => {
     const listed = await registered.get("spike_list_requests")!.execute("call", {
       projectSlug: "spike", closed: true,
     }, undefined, undefined, context);
+    const closed = await registered.get("spike_close_request")!.execute("call", {
+      requestId: "request-001", disposition: "addressed", statement: "Completed outside Spike.",
+    }, undefined, undefined, context);
     await registered.get("spike_show_request")!.execute("call", { requestId: "request-001" }, undefined, undefined, context);
     await registered.get("spike_create_goal")!.execute("call", {
       title: "Approved", outcome: "Use selected intake.", approval: "Approved.", sourceRequestIds: ["request-001", "request-002"],
@@ -619,12 +625,24 @@ describe("Pi supervisor extension", () => {
       ["guidance", "show", "--step", "goal"],
       ["request", "create", "--title", "Future work", "--statement", "Capture this without approval.", "--project", "spike", "--project", "other-project"],
       ["request", "list", "--project", "spike", "--closed"],
+      ["request", "close", "--request", "request-001", "--disposition", "addressed", "--statement", "Completed outside Spike."],
       ["request", "show", "--request", "request-001"],
       ["goal", "create", "--title", "Approved", "--outcome", "Use selected intake.", "--approval", "Approved.", "--request", "request-001", "--request", "request-002"],
     ]);
     expect(calls[1]!.stdin).toBe("Capture this without approval.");
     expect(renderSupervisorResponse(created.details, false)).toBe("Created Request request-001 · open · unassigned");
     expect(renderSupervisorResponse(listed.details, false)).toBe("Inbox 1 Request\nrequest-001 · Future work · open · spike");
+    expect(renderSupervisorResponse(closed.details, false)).toBe("Closed Request request-001 · addressed");
+    expect(registered.get("spike_close_request")!.parameters).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["requestId", "disposition", "statement"],
+      properties: {
+        requestId: { type: "string", pattern: "^request-(?!0+$)[0-9]{3,}$", maxLength: 64 },
+        disposition: { type: "string", enum: ["addressed", "declined", "withdrawn"] },
+        statement: { type: "string", minLength: 1, pattern: "\\S" },
+      },
+    });
 
     const fake = await fakeSpike();
     const fakeTools = registeredTools(fake.executable, { ...process.env, FAKE_SPIKE_CALLS: fake.calls });
@@ -632,13 +650,41 @@ describe("Pi supervisor extension", () => {
       title: "Future work", body: "Read from stdin.", projectSlugs: ["spike"],
     }, undefined, undefined, { cwd: fake.directory });
     await fakeTools.get("spike_list_requests")!.execute("call", { unassigned: true, closed: true }, undefined, undefined, { cwd: fake.directory });
+    await fakeTools.get("spike_close_request")!.execute("call", {
+      requestId: "request-001", disposition: "withdrawn", statement: "Operator withdrew this Request.",
+    }, undefined, undefined, { cwd: fake.directory });
     await fakeTools.get("spike_show_request")!.execute("call", { requestId: "request-001" }, undefined, undefined, { cwd: fake.directory });
     const fakeCalls = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     expect(fakeCalls.map(({ args, stdin }) => ({ args, stdin }))).toEqual([
       { args: ["request", "create", "--title", "Future work", "--statement", "Read from stdin.", "--project", "spike", "--json"], stdin: "Read from stdin." },
       { args: ["request", "list", "--unassigned", "--closed", "--json"], stdin: "" },
+      { args: ["request", "close", "--request", "request-001", "--disposition", "withdrawn", "--statement", "Operator withdrew this Request.", "--json"], stdin: "" },
       { args: ["request", "show", "--request", "request-001", "--json"], stdin: "" },
     ]);
+  });
+
+  test("propagates a fake CLI Request-close refusal unchanged", async () => {
+    const fake = await fakeSpike();
+    const tools = registeredTools(fake.executable, {
+      ...process.env,
+      FAKE_SPIKE_CALLS: fake.calls,
+      FAKE_SPIKE_RESPONSE: JSON.stringify({
+        ok: false,
+        command: "request close",
+        error: { code: "request-not-open", message: "Request request-001 is already closed" },
+      }) + "\n",
+    });
+    const params = { requestId: "request-001", disposition: "declined", statement: "No longer needed." };
+
+    await expect(tools.get("spike_close_request")!.execute("call", params, undefined, undefined, { cwd: fake.directory }))
+      .rejects.toThrow("Spike rejected request close: Request request-001 is already closed");
+
+    const calls = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(calls).toEqual([{
+      cwd: fake.directory,
+      args: ["request", "close", "--request", "request-001", "--disposition", "declined", "--statement", "No longer needed.", "--json"],
+      stdin: "",
+    }]);
   });
 
   test("propagates sourced Goal refusal and consumes its selected guidance", async () => {
