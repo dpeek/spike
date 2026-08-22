@@ -3,7 +3,6 @@ import type { HostPaths } from "./data-root.ts";
 import { loadProjectConfig } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { applicationSupervisorToolNames, supervisorToolNames } from "./pi-supervisor-extension.ts";
-import { listProjectApplications } from "./application.ts";
 
 export type LaunchPlannerInput = {
   cwd: string;
@@ -18,8 +17,7 @@ export async function launchPlanner(input: LaunchPlannerInput): Promise<number> 
   const selection = (await loadProjectConfig(repository.root)).agents.planner;
   const extension = resolve(import.meta.dir, "pi-supervisor-extension.ts");
   const spikeExecutable = input.spikeExecutable ?? input.environment?.["SPIKE_BIN"] ?? resolve(import.meta.dir, "..", "bin", "spike");
-  const hasApplications = (await listProjectApplications(repository)).length > 0;
-  const environment = { ...(input.environment ?? process.env), SPIKE_BIN: spikeExecutable, ...(hasApplications ? { SPIKE_APPLICATION_TOOLS: "1" } : {}) };
+  const environment = { ...(input.environment ?? process.env), SPIKE_BIN: spikeExecutable, SPIKE_APPLICATION_TOOLS: "1" };
   const processHandle = Bun.spawn([
     input.piExecutable ?? input.environment?.["SPIKE_PI_BIN"] ?? "pi",
     "--model",
@@ -31,7 +29,7 @@ export async function launchPlanner(input: LaunchPlannerInput): Promise<number> 
     "--extension",
     extension,
     "--tools",
-    ["read", "grep", "find", "ls", ...supervisorToolNames, ...(hasApplications ? applicationSupervisorToolNames : [])].join(","),
+    ["read", "grep", "find", "ls", ...supervisorToolNames, ...applicationSupervisorToolNames].join(","),
   ], {
     cwd: repository.root,
     env: environment,

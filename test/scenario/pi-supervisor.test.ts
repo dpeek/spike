@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { applicationSupervisorToolNames, supervisorToolNames } from "../../src/pi-supervisor-extension.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
@@ -30,7 +31,7 @@ process.exit(17);
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const args = process.argv.slice(2);
-await writeFile(process.env.FAKE_PI_RECORD, JSON.stringify({ cwd: process.cwd(), args, spikeBin: process.env.SPIKE_BIN }));
+await writeFile(process.env.FAKE_PI_RECORD, JSON.stringify({ cwd: process.cwd(), args, spikeBin: process.env.SPIKE_BIN, applicationTools: process.env.SPIKE_APPLICATION_TOOLS }));
 const extensionPath = args[args.indexOf("--extension") + 1];
 const extension = await import(pathToFileURL(extensionPath).href);
 const tools = [];
@@ -77,6 +78,7 @@ describe("direct Pi supervisor", () => {
     const planner = JSON.parse(await readFile(fake.piRecord, "utf8"));
     expect(await realpath(planner.cwd)).toBe(await realpath(repository.root));
     expect(planner.spikeBin).toBe(fake.spike);
+    expect(planner.applicationTools).toBe("1");
     expect(planner.args).toContain("--no-approve");
     expect(planner.args).toContain("--no-extensions");
     expect(planner.args.filter((arg: string) => arg === "--extension")).toHaveLength(1);
@@ -84,7 +86,7 @@ describe("direct Pi supervisor", () => {
     expect(planner.args[planner.args.indexOf("--model") + 1]).toBe("planner-model");
     expect(planner.args[planner.args.indexOf("--thinking") + 1]).toBe("high");
     expect(planner.args[planner.args.indexOf("--tools") + 1]).toBe(
-      "read,grep,find,ls,spike_begin_step,spike_status,spike_queue_goal,spike_create_goal,spike_create_request,spike_list_requests,spike_close_request,spike_show_request,spike_revise_plan,spike_create_change,spike_decide_change,spike_issue_implement,spike_issue_review,spike_issue_remediate,spike_dispatch_pi,spike_worker_status,spike_worker_read,spike_publish_report,spike_recover",
+      ["read", "grep", "find", "ls", ...supervisorToolNames, ...applicationSupervisorToolNames].join(","),
     );
     expect(planner.args).not.toContain("--print");
 
