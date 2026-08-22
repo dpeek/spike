@@ -1,3 +1,5 @@
+import type { HostPaths } from "./data-root.ts";
+import type { ProjectPaths } from "./project.ts";
 import {
   changeStatus,
   listChangeIds,
@@ -132,7 +134,7 @@ function decisionStatus(decision: ChangeDecision): DerivedDecision {
 }
 
 async function cleanupWarningsForChange(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CleanupWarning[]> {
@@ -152,7 +154,7 @@ async function cleanupWarningsForChange(
 }
 
 async function deriveActiveChangeStatus(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<DerivedChangeStatus> {
@@ -210,14 +212,14 @@ async function deriveActiveChangeStatus(
   };
 }
 
-export async function deriveGoalStatus(cwd: string, goalId: string): Promise<DerivedGoalStatus> {
-  const repository = await discoverRepository(cwd);
+export async function deriveGoalStatus(cwd: string, hostPaths: HostPaths, goalId: string): Promise<DerivedGoalStatus> {
+  const repository = await discoverRepository(cwd, hostPaths);
   const [goal, plan, changeIds, integratedRevision, application] = await Promise.all([
-    loadGoal(repository.root, goalId),
-    loadPlan(repository.root, goalId),
-    listChangeIds(repository.root, goalId),
+    loadGoal(repository, goalId),
+    loadPlan(repository, goalId),
+    listChangeIds(repository, goalId),
     git(repository.root, ["rev-parse", "--verify", `${integratedRef(goalId)}^{commit}`]),
-    applicationEvidence(repository.root, goalId),
+    applicationEvidence(repository, goalId),
   ]);
   if (goal.metadata.goalId !== plan.metadata.goalId) throw new Error(`Plan does not belong to Goal ${goalId}`);
 
@@ -225,10 +227,10 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
   const activeChangeIds: string[] = [];
   const cleanupWarnings: CleanupWarning[] = [];
   for (const changeId of changeIds) {
-    if ((await changeStatus(repository.root, goalId, changeId)) === "active") activeChangeIds.push(changeId);
-    const decision = await loadChangeDecisionIfPresent(repository.root, goalId, changeId);
+    if ((await changeStatus(repository, goalId, changeId)) === "active") activeChangeIds.push(changeId);
+    const decision = await loadChangeDecisionIfPresent(repository, goalId, changeId);
     if (decision !== undefined) decisions.push(decisionStatus(decision));
-    cleanupWarnings.push(...(await cleanupWarningsForChange(repository.root, goalId, changeId)));
+    cleanupWarnings.push(...(await cleanupWarningsForChange(repository, goalId, changeId)));
   }
   if (activeChangeIds.length > 1) throw new Error(`Goal ${goalId} has more than one active Change`);
 
@@ -236,12 +238,12 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
   const currentChange =
     activeChangeId === undefined
       ? null
-      : await deriveActiveChangeStatus(repository.root, goalId, activeChangeId);
+      : await deriveActiveChangeStatus(repository, goalId, activeChangeId);
 
   const applicationWithReview = await Promise.all(application.map(async entry => {
-    const status = await deriveApplicationStatus(repository.root, goalId, entry.applicationId);
+    const status = await deriveApplicationStatus(repository.root, hostPaths, goalId, entry.applicationId);
     let resolution: "return" | "stale" | "malformed" | null = null;
-    try { const evidence = await loadApplicationResolutionIfPresent(repository.root, goalId, entry.applicationId); resolution = evidence?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
+    try { const evidence = await loadApplicationResolutionIfPresent(repository, goalId, entry.applicationId); resolution = evidence?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
     return {
       applicationId: entry.applicationId, state: entry.state, resolution, candidate: status.candidate,
       review: status.review, decision: status.decision, queue: status.queue,
@@ -250,7 +252,7 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
     };
   }));
   let freeze: Awaited<ReturnType<typeof goalApplicationFreeze>>;
-  try { freeze = await goalApplicationFreeze(repository.root, goalId); } catch { freeze = { frozen: true, returnedRequeueEligible: false, stale: false }; }
+  try { freeze = await goalApplicationFreeze(repository, goalId); } catch { freeze = { frozen: true, returnedRequeueEligible: false, stale: false }; }
   return {
     goalId,
     integratedRevision,
@@ -265,19 +267,19 @@ export async function deriveGoalStatus(cwd: string, goalId: string): Promise<Der
   };
 }
 
-export async function deriveRepositoryStatus(cwd: string): Promise<DerivedRepositoryStatus> {
-  const repository = await discoverRepository(cwd);
+export async function deriveRepositoryStatus(cwd: string, hostPaths: HostPaths): Promise<DerivedRepositoryStatus> {
+  const repository = await discoverRepository(cwd, hostPaths);
   const project = await loadProjectIdentity(repository.root);
   const goals: DerivedGoalStatus[] = [];
-  for (const goalId of await listGoalIds(repository.root)) {
-    goals.push(await deriveGoalStatus(repository.root, goalId));
+  for (const goalId of await listGoalIds(repository)) {
+    goals.push(await deriveGoalStatus(repository.root, hostPaths, goalId));
   }
-  const queue = await listProjectApplications(repository.root);
+  const queue = await listProjectApplications(repository);
   // Decision publication alone is never terminal: only its exact main target
   // projection marks an entry applied. Invalid or unexpected evidence remains
   // visible as the FIFO barrier rather than allowing a later entry to lead.
-  const queueStates = await Promise.all(queue.map((application) => applicationState(repository.root, application)));
-  const head = await queuedApplicationHead(repository.root);
+  const queueStates = await Promise.all(queue.map((application) => applicationState(repository, application)));
+  const head = await queuedApplicationHead(repository);
   const warnings = goals.flatMap((goal) => goal.cleanup.warnings);
   return {
     root: repository.root,
@@ -285,9 +287,9 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
     goals,
     cleanup: { healthy: warnings.length === 0, warnings },
     applicationQueue: await Promise.all(queue.map(async (application, index) => {
-      const status = await deriveApplicationStatus(repository.root, application.metadata.goalId, application.metadata.applicationId);
+      const status = await deriveApplicationStatus(repository.root, hostPaths, application.metadata.goalId, application.metadata.applicationId);
       let resolution: "return" | "stale" | "malformed" | null = null;
-      try { resolution = (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
+      try { resolution = (await loadApplicationResolutionIfPresent(repository, application.metadata.goalId, application.metadata.applicationId))?.metadata.disposition ?? null; } catch { resolution = "malformed"; }
       const evidenceState = queueStates[index]!;
       return {
         goalId: application.metadata.goalId, applicationId: application.metadata.applicationId,
@@ -305,12 +307,13 @@ export async function deriveRepositoryStatus(cwd: string): Promise<DerivedReposi
 
 export async function deriveSupervisorPlannerStatus(
   cwd: string,
+  hostPaths: HostPaths,
   herdr: HerdrOperations = herdrOperations,
 ): Promise<SupervisorPlannerStatus> {
-  const [durable, repository] = await Promise.all([deriveRepositoryStatus(cwd), discoverRepository(cwd)]);
+  const [durable, repository] = await Promise.all([deriveRepositoryStatus(cwd, hostPaths), discoverRepository(cwd, hostPaths)]);
   const planners = await Promise.all(durable.goals.map(async ({ goalId }) => {
     try {
-      return await goalPlannerOperations.observe({ cwd: repository.root, goalId, herdr });
+      return await goalPlannerOperations.observe({ cwd: repository.root, hostPaths, goalId, herdr });
     } catch {
       // Keep the exact durable identity visible even when Herdr discovery is
       // unavailable. This is an operational observation, not a health error.

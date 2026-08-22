@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,30 +10,20 @@ import { issueReplacementTicket, issueTicket, reportPath, ticketPath, ticketStat
 import { prepareTicketExchange, recordLocalCloneWorker, workerRecordPath } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 
 describe("interrupted Ticket recovery", () => {
   test("finalizes recorded resources, publishes interruption evidence, and lets the planner issue 002", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Recover interrupted implementation",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Recover interrupted implementation",
       outcome: "Interrupt Ticket 001 and produce Candidate A from replacement Ticket 002.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     const change = await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Produce Candidate A",
       intent: "Replace uncertain worker progress with a fresh implementation.",
       rationale: "Only committed Reports may advance Candidate history.",
@@ -41,8 +31,7 @@ describe("interrupted Ticket recovery", () => {
     });
     const baseRevision = change.change.metadata.baseRevision;
     const first = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Produce Candidate A.",
       curatedContext: "Discard uncertain progress after interruption.",
@@ -63,12 +52,12 @@ describe("interrupted Ticket recovery", () => {
     );
 
     const identity = { goalId, changeId: "001", ticketId: "001" };
-    const exchange = await prepareTicketExchange(repository.root, identity);
+    const exchange = await prepareTicketExchange(repository.project, identity);
     await writeFile(join(exchange.outputDirectory, "submission.md"), "incomplete, untrusted output\n");
     await writeFile(join(exchange.outputDirectory, "worker.tmp"), "preserve for diagnosis\n");
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     await writeFile(join(workspace, "uncertain.txt"), "uncertain worker state\n");
-    await recordLocalCloneWorker(repository.root, {
+    await recordLocalCloneWorker(repository.project, {
       ...identity,
       role: "implement",
       worker: "interrupted-worker",
@@ -89,6 +78,7 @@ describe("interrupted Ticket recovery", () => {
       recoverInterruptedTicket(
         {
           cwd: repository.root,
+          hostPaths: repository.hostPaths,
           ...identity,
           role: "implement",
           reason,
@@ -100,14 +90,13 @@ describe("interrupted Ticket recovery", () => {
     await expect(recover("  ")).rejects.toThrow("Interruption reason must not be blank");
     await expect(
       recoverInterruptedTicket({
-        cwd: repository.root,
-        ...identity,
+        cwd: repository.root, hostPaths: repository.hostPaths, ...identity,
         role: "review",
         reason: "Wrong role.",
       }),
     ).rejects.toThrow("does not match Ticket role");
 
-    const runtimePath = workerRecordPath(repository.root, identity);
+    const runtimePath = workerRecordPath(repository.project, identity);
     const validRuntimeRecord = await readFile(runtimePath, "utf8");
     await writeFile(runtimePath, validRuntimeRecord.replace('"ticketId": "001"', '"ticketId": "999"'));
     await expect(recover()).rejects.toThrow("Worker record belongs to a different Ticket");
@@ -118,8 +107,7 @@ describe("interrupted Ticket recovery", () => {
     await writeFile(runtimePath, validRuntimeRecord);
 
     await expect(publishInterruptedReport({
-      cwd: repository.root,
-      ...identity,
+      cwd: repository.root, hostPaths: repository.hostPaths, ...identity,
       role: "implement",
       reason: "False host provenance.",
       execution: {
@@ -166,11 +154,10 @@ describe("interrupted Ticket recovery", () => {
       },
     });
     expect(cleanupFailed.report.body).toContain("Supervisor restarted while Ticket 001 was running.");
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "002")).exists()).toBe(false);
     const replacement = (
       await issueReplacementTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         interruptedTicketId: "001",
         now: new Date("2026-03-24T10:05:00.000Z"),
@@ -187,12 +174,12 @@ describe("interrupted Ticket recovery", () => {
     });
     expect(replacement.body).toContain("## Instruction\n\nProduce Candidate A.");
     expect(replacement.body).toContain("Discard uncertain progress after interruption.");
-    expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
-    expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toBeUndefined();
-    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(true);
+    expect(await ticketStatus(repository.project, goalId, "001", "001")).toBe("reported");
+    expect(await deriveCurrentCandidate(repository.project, goalId, "001")).toBeUndefined();
+    expect(await Bun.file(workerRecordPath(repository.project, identity)).exists()).toBe(true);
     expect(await Bun.file(join(workspace, "uncertain.txt")).exists()).toBe(true);
 
-    const reportSource = await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8");
+    const reportSource = await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8");
     const cleanupRetried = await recover(undefined, {
       async stop() {
         stopAttempts++;
@@ -205,9 +192,9 @@ describe("interrupted Ticket recovery", () => {
     expect(cleanupRetried.cleanup).toEqual({ status: "finalized" });
     expect(stopAttempts).toBe(2);
     expect(removeAttempts).toBe(2);
-    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(false);
+    expect(await Bun.file(workerRecordPath(repository.project, identity)).exists()).toBe(false);
     expect(await Bun.file(join(workspace, "uncertain.txt")).exists()).toBe(false);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8")).toBe(reportSource);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8")).toBe(reportSource);
     expect(await readFile(join(exchange.outputDirectory, "submission.md"), "utf8")).toBe("incomplete, untrusted output\n");
     expect(await readFile(join(exchange.outputDirectory, "worker.tmp"), "utf8")).toBe("preserve for diagnosis\n");
 
@@ -220,25 +207,21 @@ describe("interrupted Ticket recovery", () => {
 
   test("refuses to signal a persisted direct-worker PID after restart", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Recover a stale direct worker",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Recover a stale direct worker",
       outcome: "Publish interruption evidence without signalling an unowned PID.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Interrupt stale direct work",
       intent: "Treat persisted direct runtime state as unsafe to signal.",
       rationale: "A PID does not prove process identity after restart.",
       acceptanceCriteria: ["Recovery surfaces a cleanup warning without signalling the persisted PID."],
     });
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Remain interrupted across supervisor restart.",
       executionPolicy: policy,
@@ -248,7 +231,7 @@ describe("interrupted Ticket recovery", () => {
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
     const workspaceMarker = join(workspace, "stale-worker.txt");
     await writeFile(workspaceMarker, "stale direct worker state\n");
-    await recordLocalCloneWorker(repository.root, {
+    await recordLocalCloneWorker(repository.project, {
       ...identity,
       role: "implement",
       worker: "stale-direct-worker",
@@ -258,8 +241,7 @@ describe("interrupted Ticket recovery", () => {
     });
 
     const recovered = await recoverInterruptedTicket({
-      cwd: repository.root,
-      ...identity,
+      cwd: repository.root, hostPaths: repository.hostPaths, ...identity,
       role: "implement",
       reason: "Supervisor restarted and no longer owns the direct process handle.",
       now: new Date("2026-03-24T12:05:00.000Z"),
@@ -269,10 +251,9 @@ describe("interrupted Ticket recovery", () => {
       message: "direct worker session is unavailable after restart; refusing to signal a persisted PID",
     });
     expect(recovered.report.metadata.outcome).toBe("interrupted");
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "002")).exists()).toBe(false);
     const replacement = await issueReplacementTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       interruptedTicketId: "001",
       now: new Date("2026-03-24T12:05:00.000Z"),
@@ -283,6 +264,7 @@ describe("interrupted Ticket recovery", () => {
     const cleanupRetried = await recoverInterruptedTicket(
       {
         cwd: repository.root,
+        hostPaths: repository.hostPaths,
         ...identity,
         role: "implement",
         reason: "Supervisor restarted and no longer owns the direct process handle.",

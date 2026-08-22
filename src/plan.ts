@@ -5,7 +5,7 @@ import { installImmutable, readDocument, replaceAtomic, serializeDocument } from
 import { goalIdPattern } from "./identity.ts";
 import { loadChangeReportHistory, type ChangeReportHistory } from "./report.ts";
 import { assertGoalNotFrozen } from "./application.ts";
-import { projectRoot } from "./project.ts";
+import type { ProjectPaths } from "./project.ts";
 
 const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
 const planSchema = z
@@ -30,8 +30,8 @@ export type ChurnIndicator =
       outcomes: ["partial" | "blocked", "partial" | "blocked"];
     };
 
-export function planPath(root: string, goalId: string): string {
-  return join(projectRoot(root), "goals", goalId, "plan.md");
+export function planPath(project: ProjectPaths, goalId: string): string {
+  return join(project.controlRoot, "goals", goalId, "plan.md");
 }
 
 function initialBody(title: string, outcome: string): string {
@@ -75,7 +75,7 @@ None.`;
 }
 
 export async function createInitialPlan(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   title: string,
   outcome: string,
@@ -83,25 +83,25 @@ export async function createInitialPlan(
 ): Promise<Plan> {
   const metadata = planSchema.parse({ kind: "plan", goalId, updatedAt: now });
   const body = `${initialBody(title, outcome)}\n`;
-  await installImmutable(root, planPath(root, goalId), serializeDocument(metadata, body));
+  await installImmutable(root.controlRoot, planPath(root, goalId), serializeDocument(metadata, body));
   return { metadata, body };
 }
 
-export async function loadPlan(root: string, goalId: string): Promise<Plan> {
-  await assertGoalBelongsToProject(root, goalId);
-  const document = await readDocument(root, planPath(root, goalId));
+export async function loadPlan(root: ProjectPaths, goalId: string): Promise<Plan> {
+  await assertGoalBelongsToProject(root.root, goalId);
+  const document = await readDocument(root.controlRoot, planPath(root, goalId));
   const metadata = planSchema.parse(document.metadata);
   if (metadata.goalId !== goalId) throw new Error(`Plan belongs to a different Goal: ${metadata.goalId}`);
   return { metadata, body: document.body };
 }
 
-export async function revisePlan(root: string, goalId: string, body: string, now = new Date().toISOString()): Promise<Plan> {
+export async function revisePlan(root: ProjectPaths, goalId: string, body: string, now = new Date().toISOString()): Promise<Plan> {
   await assertGoalNotFrozen(root, goalId);
   if (!body.trim()) throw new Error("Plan body must not be blank");
   const current = await loadPlan(root, goalId);
   const metadata = planSchema.parse({ ...current.metadata, updatedAt: now });
   const revisedBody = `${body.trimEnd()}\n`;
-  await replaceAtomic(root, planPath(root, goalId), serializeDocument(metadata, revisedBody));
+  await replaceAtomic(root.controlRoot, planPath(root, goalId), serializeDocument(metadata, revisedBody));
   return { metadata, body: revisedBody };
 }
 
@@ -172,7 +172,7 @@ function replaceChurnSection(body: string, content: string): string {
 }
 
 export async function refreshChangeChurn(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   now = new Date().toISOString(),
@@ -183,6 +183,6 @@ export async function refreshChangeChurn(
   const indicators = detectChangeChurn(history);
   const metadata = planSchema.parse({ ...current.metadata, updatedAt: now });
   const body = replaceChurnSection(current.body, churnBody(changeId, indicators));
-  await replaceAtomic(root, planPath(root, goalId), serializeDocument(metadata, body));
+  await replaceAtomic(root.controlRoot, planPath(root, goalId), serializeDocument(metadata, body));
   return { plan: { metadata, body }, indicators };
 }

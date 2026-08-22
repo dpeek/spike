@@ -1,11 +1,12 @@
 import { join } from "node:path";
 import { z } from "zod";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
+import type { HostPaths } from "./data-root.ts";
 import { documentExists, installImmutable, listDirectoryNames, readDocument, serializeDocument } from "./durable-state.ts";
 import { git } from "./git.ts";
 import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
 import { loadGoal } from "./goal.ts";
-import { projectRoot } from "./project.ts";
+import type { ProjectPaths } from "./project.ts";
 
 const revision = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
 const time = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "invalid timestamp");
@@ -39,17 +40,17 @@ export type ApplicationDecision = CleanApplicationDecision | ReviewedApplication
 export type ApplicationResolution = { metadata: z.infer<typeof resolutionSchema>; body: string };
 export type QueuedApplication = Application & { decision?: ApplicationDecision; invalidDecision?: true };
 
-function rootPath(root: string, goalId: string) { return join(projectRoot(root), "goals", goalId, "applications"); }
-export function applicationPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "application.md"); }
-export function applicationDecisionPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "decision.md"); }
-export function applicationResolutionPath(root: string, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "resolution.md"); }
+function rootPath(project: ProjectPaths, goalId: string) { return join(project.controlRoot, "goals", goalId, "applications"); }
+export function applicationPath(root: ProjectPaths, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "application.md"); }
+export function applicationDecisionPath(root: ProjectPaths, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "decision.md"); }
+export function applicationResolutionPath(root: ProjectPaths, goalId: string, applicationId: string) { return join(rootPath(root, goalId), applicationId, "resolution.md"); }
 /** Allocated IDs include abandoned pre-publication directories and only burn IDs. */
-export async function listApplicationIds(root: string, goalId: string): Promise<string[]> { return (await listDirectoryNames(root, rootPath(root, goalId))).filter((id) => sequenceIdPattern.test(id)).sort(); }
+export async function listApplicationIds(root: ProjectPaths, goalId: string): Promise<string[]> { return (await listDirectoryNames(root.controlRoot, rootPath(root, goalId))).filter((id) => sequenceIdPattern.test(id)).sort(); }
 /** Only a published Application document is workflow evidence. */
-export async function listPublishedApplicationIds(root: string, goalId: string): Promise<string[]> {
+export async function listPublishedApplicationIds(root: ProjectPaths, goalId: string): Promise<string[]> {
   const published: string[] = [];
   for (const id of await listApplicationIds(root, goalId)) {
-    if (!(await documentExists(root, applicationPath(root, goalId, id)))) continue;
+    if (!(await documentExists(root.controlRoot, applicationPath(root, goalId, id)))) continue;
     // A partial, malformed, or mismatched document did not publish a valid
     // Application. Its directory still consumes this Goal-relative ID only.
     try { await loadApplication(root, goalId, id); }
@@ -58,14 +59,14 @@ export async function listPublishedApplicationIds(root: string, goalId: string):
   }
   return published;
 }
-export async function loadApplication(root: string, goalId: string, applicationId: string): Promise<Application> {
-  const doc = await readDocument(root, applicationPath(root, goalId, applicationId)); const metadata = identity.parse(doc.metadata);
+export async function loadApplication(root: ProjectPaths, goalId: string, applicationId: string): Promise<Application> {
+  const doc = await readDocument(root.controlRoot, applicationPath(root, goalId, applicationId)); const metadata = identity.parse(doc.metadata);
   if (metadata.goalId !== goalId || metadata.applicationId !== applicationId) throw new Error("Application document belongs to a different Application");
   return { metadata, body: doc.body };
 }
-export async function loadApplicationDecisionIfPresent(root: string, goalId: string, applicationId: string): Promise<ApplicationDecision | undefined> {
-  if (!(await documentExists(root, applicationDecisionPath(root, goalId, applicationId)))) return undefined;
-  const doc = await readDocument(root, applicationDecisionPath(root, goalId, applicationId)); const metadata = decisionSchema.parse(doc.metadata);
+export async function loadApplicationDecisionIfPresent(root: ProjectPaths, goalId: string, applicationId: string): Promise<ApplicationDecision | undefined> {
+  if (!(await documentExists(root.controlRoot, applicationDecisionPath(root, goalId, applicationId)))) return undefined;
+  const doc = await readDocument(root.controlRoot, applicationDecisionPath(root, goalId, applicationId)); const metadata = decisionSchema.parse(doc.metadata);
   if (metadata.goalId !== goalId || metadata.applicationId !== applicationId) throw new Error("Application decision belongs to a different Application");
   return metadata.kind === "application-reviewed-apply-decision"
     ? { metadata: reviewedDecisionSchema.parse(metadata), body: doc.body }
@@ -73,22 +74,22 @@ export async function loadApplicationDecisionIfPresent(root: string, goalId: str
 }
 /** Resolution parsing is deliberately lazy: unrelated later evidence cannot
  * obstruct an earlier valid FIFO head. */
-export async function loadApplicationResolutionIfPresent(root: string, goalId: string, applicationId: string): Promise<ApplicationResolution | undefined> {
-  if (!(await documentExists(root, applicationResolutionPath(root, goalId, applicationId)))) return undefined;
-  const doc = await readDocument(root, applicationResolutionPath(root, goalId, applicationId)); const metadata = resolutionSchema.parse(doc.metadata);
+export async function loadApplicationResolutionIfPresent(root: ProjectPaths, goalId: string, applicationId: string): Promise<ApplicationResolution | undefined> {
+  if (!(await documentExists(root.controlRoot, applicationResolutionPath(root, goalId, applicationId)))) return undefined;
+  const doc = await readDocument(root.controlRoot, applicationResolutionPath(root, goalId, applicationId)); const metadata = resolutionSchema.parse(doc.metadata);
   if (metadata.goalId !== goalId || metadata.applicationId !== applicationId) throw new Error("Application resolution belongs to a different Application");
   const resolution = { metadata, body: doc.body };
   await validateApplicationResolution(root, goalId, applicationId, resolution);
   return resolution;
 }
 function next(ids: string[]) { const high = ids.reduce((n, id) => Math.max(n, Number(id)), 0); if (high >= 999) throw new Error("Application ID sequence is exhausted"); return String(high + 1).padStart(3, "0"); }
-async function checkedOutMain(root: string) { const branch = await git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); if (branch !== "main") throw new Error("apply refused: main must be the currently checked-out local branch"); }
-async function main(root: string) { return git(root, ["rev-parse", "--verify", "refs/heads/main^{commit}"]); }
+async function checkedOutMain(root: ProjectPaths) { const branch = await git(root.root, ["symbolic-ref", "--quiet", "--short", "HEAD"]); if (branch !== "main") throw new Error("apply refused: main must be the currently checked-out local branch"); }
+async function main(root: ProjectPaths) { return git(root.root, ["rev-parse", "--verify", "refs/heads/main^{commit}"]); }
 function isReviewedDecision(decision: ApplicationDecision): decision is ReviewedApplicationDecision { return decision.metadata.kind === "application-reviewed-apply-decision"; }
 
 /** All published Application documents are the authoritative Project FIFO. */
-export async function listProjectApplications(root: string): Promise<QueuedApplication[]> {
-  const goals = (await listDirectoryNames(root, join(projectRoot(root), "goals"))).filter((id) => goalIdPattern.test(id)).sort();
+export async function listProjectApplications(root: ProjectPaths): Promise<QueuedApplication[]> {
+  const goals = (await listDirectoryNames(root.controlRoot, join(root.controlRoot, "goals"))).filter((id) => goalIdPattern.test(id)).sort();
   const entries: QueuedApplication[] = [];
   for (const goalId of goals) for (const applicationId of await listPublishedApplicationIds(root, goalId)) {
     const application = await loadApplication(root, goalId, applicationId);
@@ -106,7 +107,7 @@ export async function listProjectApplications(root: string): Promise<QueuedAppli
   return entries;
 }
 /** Validate an Application's decision against the exact checked-out main projection. */
-export async function applicationState(root: string, application: QueuedApplication): Promise<ApplicationEvidenceState> {
+export async function applicationState(root: ProjectPaths, application: QueuedApplication): Promise<ApplicationEvidenceState> {
   if (application.invalidDecision === true) return "inconsistent";
   if (application.decision === undefined) return "incomplete";
   if (!(await validDecision(root, application, application.decision))) return "inconsistent";
@@ -117,13 +118,13 @@ export async function applicationState(root: string, application: QueuedApplicat
   // After a reviewed CAS has reached C, a later FIFO squash necessarily makes
   // C an ancestor. Historical owners stay applied; only an unrelated target
   // movement while the owner is pending is a target mismatch.
-  if (isReviewedDecision(application.decision) && await git(root, ["merge-base", "--is-ancestor", application.decision.metadata.resultingMainRevision, current]).then(() => true).catch(() => false)) return "applied";
+  if (isReviewedDecision(application.decision) && await git(root.root, ["merge-base", "--is-ancestor", application.decision.metadata.resultingMainRevision, current]).then(() => true).catch(() => false)) return "applied";
   return isReviewedDecision(application.decision) ? "target-mismatch" : "inconsistent";
 }
 
 /** The first non-terminal entry is a barrier even when its decision is pending
  * target advancement or is invalid. Callers must never skip it. */
-export async function queuedApplicationHead(root: string): Promise<QueuedApplication | undefined> {
+export async function queuedApplicationHead(root: ProjectPaths): Promise<QueuedApplication | undefined> {
   for (const application of await listProjectApplications(root)) {
     let resolution: ApplicationResolution | undefined;
     try { resolution = await loadApplicationResolutionIfPresent(root, application.metadata.goalId, application.metadata.applicationId); }
@@ -137,7 +138,7 @@ export async function queuedApplicationHead(root: string): Promise<QueuedApplica
 
 /** Return releases Goal planning immediately but only becomes requeue-eligible
  * after G advances. Stale and unresolved attempts always freeze. */
-export async function goalApplicationFreeze(root: string, goalId: string): Promise<{ frozen: boolean; returnedRequeueEligible: boolean; stale: boolean }> {
+export async function goalApplicationFreeze(root: ProjectPaths, goalId: string): Promise<{ frozen: boolean; returnedRequeueEligible: boolean; stale: boolean }> {
   let latest: ApplicationResolution | undefined;
   for (const applicationId of await listPublishedApplicationIds(root, goalId)) {
     // Validate each reached historical boundary, but stop at an unresolved
@@ -151,31 +152,31 @@ export async function goalApplicationFreeze(root: string, goalId: string): Promi
   }
   if (latest === undefined) return { frozen: false, returnedRequeueEligible: false, stale: false };
   if (latest.metadata.disposition === "stale") return { frozen: true, returnedRequeueEligible: false, stale: true };
-  const currentG = await git(root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
+  const currentG = await git(root.root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
   return { frozen: false, returnedRequeueEligible: currentG !== latest.metadata.goalRevision, stale: false };
 }
-export async function applicationRequeueEligibility(root: string, goalId: string): Promise<"none" | "returned" | "stale"> {
+export async function applicationRequeueEligibility(root: ProjectPaths, goalId: string): Promise<"none" | "returned" | "stale"> {
   const ids = await listPublishedApplicationIds(root, goalId);
   if (ids.length === 0) return "none";
   const applicationId = ids.at(-1)!;
   const application = await loadApplication(root, goalId, applicationId);
   const resolution = await loadApplicationResolutionIfPresent(root, goalId, applicationId);
   if (resolution === undefined) return "none";
-  const currentG = await git(root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
+  const currentG = await git(root.root, ["rev-parse", "--verify", `refs/spike/goals/${goalId}/integrated^{commit}`]);
   if (resolution.metadata.disposition === "return") return currentG !== resolution.metadata.goalRevision ? "returned" : "none";
   return currentG === application.metadata.integratedRevision ? "stale" : "none";
 }
-export async function assertGoalNotFrozen(root: string, goalId: string): Promise<void> {
+export async function assertGoalNotFrozen(root: ProjectPaths, goalId: string): Promise<void> {
   if ((await goalApplicationFreeze(root, goalId)).frozen) throw new Error(`Goal ${goalId} is frozen by immutable Application evidence`);
 }
 
 /** Create the immutable squash object without changing any ref or worktree. */
-export async function createSquashCandidate(root: string, goalId: string, integratedRevision: string, previousMain: string): Promise<string> {
-  const tree = await git(root, ["rev-parse", "--verify", `${integratedRevision}^{tree}`]);
-  return git(root, ["commit-tree", tree, "-p", previousMain, "-m", `Apply Goal ${goalId} as a squash`]);
+export async function createSquashCandidate(root: ProjectPaths, goalId: string, integratedRevision: string, previousMain: string): Promise<string> {
+  const tree = await git(root.root, ["rev-parse", "--verify", `${integratedRevision}^{tree}`]);
+  return git(root.root, ["commit-tree", tree, "-p", previousMain, "-m", `Apply Goal ${goalId} as a squash`]);
 }
 
-export type PublishApplicationInput = { root: string; goalId: string; integratedRevision: string; approval: string; now?: Date; crash?: CrashInjector };
+export type PublishApplicationInput = { root: ProjectPaths; goalId: string; integratedRevision: string; approval: string; now?: Date; crash?: CrashInjector };
 export async function publishApplication(input: PublishApplicationInput): Promise<Application> {
   const approval = input.approval.trim(); if (!approval) throw new Error("apply refused: explicit operator approval is required");
   // Queue allocation deliberately uses only durable published evidence, never timestamps.
@@ -185,10 +186,10 @@ export async function publishApplication(input: PublishApplicationInput): Promis
   const applicationId = next(await listApplicationIds(input.root, input.goalId));
   const metadata = identity.parse({ kind: "application", goalId: input.goalId, applicationId, target: "main", integratedRevision: input.integratedRevision, approval, requestedAt: (input.now ?? new Date()).toISOString(), queuePosition });
   const body = `# Queue Goal ${input.goalId} for main\n\nOperator approval: ${approval}\n\nFIFO position: ${queuePosition}\n`;
-  await installImmutable(input.root, applicationPath(input.root, input.goalId, applicationId), serializeDocument(metadata, body), commitCrashHooks(input.crash, "application-publication"));
+  await installImmutable(input.root.controlRoot, applicationPath(input.root, input.goalId, applicationId), serializeDocument(metadata, body), commitCrashHooks(input.crash, "application-publication"));
   return { metadata, body };
 }
-async function validateApplicationResolution(root: string, goalId: string, applicationId: string, resolution: ApplicationResolution): Promise<void> {
+async function validateApplicationResolution(root: ProjectPaths, goalId: string, applicationId: string, resolution: ApplicationResolution): Promise<void> {
   const tickets = await import("./application-ticket.ts");
   const reviews = await import("./application-review.ts");
   const application = await loadApplication(root, goalId, applicationId);
@@ -223,7 +224,7 @@ async function validateApplicationResolution(root: string, goalId: string, appli
   if (!review || review.metadata.outcome !== "completed" || review.metadata.candidateRevision !== currentCandidate.revision || review.metadata.producingImplementationTicketId !== currentCandidate.ticketId) throw new Error("Return Application resolution review provenance does not match pinned facts");
 }
 
-async function resolutionPrerequisites(root: string, goalId: string, applicationId: string) {
+async function resolutionPrerequisites(root: ProjectPaths, goalId: string, applicationId: string) {
   const tickets = await import("./application-ticket.ts");
   const reviews = await import("./application-review.ts");
   const implementationIds = await tickets.listApplicationTicketIds(root, goalId, applicationId);
@@ -243,57 +244,57 @@ async function resolutionPrerequisites(root: string, goalId: string, application
   return { first: await tickets.loadApplicationTicket(root, goalId, applicationId, implementationIds[0]!), currentCandidate, highestReviewId: reviewIds.at(-1), highestReview: reviewReports.at(-1) };
 }
 
-export type ResolveApplicationInput = { cwd: string; goalId: string; applicationId: string; statement?: string; now?: Date };
+export type ResolveApplicationInput = { cwd: string; hostPaths: HostPaths; goalId: string; applicationId: string; statement?: string; now?: Date };
 /** Supervisor-only terminal return. Every check precedes immutable publication. */
 export async function returnApplication(input: ResolveApplicationInput): Promise<{ root: string; resolution: ApplicationResolution }> {
   const statement = input.statement?.trim(); if (!statement) throw new Error("Application return statement must not be blank");
-  const repository = await (await import("./git.ts")).discoverRepository(input.cwd);
-  const head = await queuedApplicationHead(repository.root);
+  const repository = await (await import("./git.ts")).discoverRepository(input.cwd, input.hostPaths);
+  const head = await queuedApplicationHead(repository);
   if (!head || head.metadata.goalId !== input.goalId || head.metadata.applicationId !== input.applicationId) throw new Error("Application return requires the exact unresolved FIFO head");
   if (head.decision !== undefined || head.invalidDecision === true) throw new Error("Application return cannot bypass a published apply decision");
-  if (await documentExists(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
-  const facts = await resolutionPrerequisites(repository.root, input.goalId, input.applicationId);
+  if (await documentExists(repository.controlRoot, applicationResolutionPath(repository, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
+  const facts = await resolutionPrerequisites(repository, input.goalId, input.applicationId);
   const review = facts.highestReview;
   if (!review || review.metadata.outcome !== "completed" || !facts.currentCandidate || review.metadata.candidateRevision !== facts.currentCandidate.revision || review.metadata.producingImplementationTicketId !== facts.currentCandidate.ticketId || facts.highestReviewId === undefined) throw new Error("Application return requires the completed highest review for the exact current Candidate and producer");
-  const observed = await main(repository.root);
+  const observed = await main(repository);
   if (observed !== facts.first.metadata.targetRevision) throw new Error(`Application return requires main ${facts.first.metadata.targetRevision}`);
   const metadata = resolutionSchema.parse({ kind: "application-resolution", disposition: "return", goalId: input.goalId, applicationId: input.applicationId, expectedMainRevision: facts.first.metadata.targetRevision, goalRevision: facts.first.metadata.goalRevision, candidateRevision: facts.currentCandidate.revision, producingImplementationTicketId: facts.currentCandidate.ticketId, highestReviewTicketId: facts.highestReviewId, decidedAt: (input.now ?? new Date()).toISOString(), statement });
   const body = `# Return Application\n\n${statement}\n`;
-  await installImmutable(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId), serializeDocument(metadata, body));
+  await installImmutable(repository.controlRoot, applicationResolutionPath(repository, input.goalId, input.applicationId), serializeDocument(metadata, body));
   return { root: repository.root, resolution: { metadata, body } };
 }
 /** Supervisor-only terminal stale resolution. It records target movement, never repairs it. */
 export async function staleApplication(input: ResolveApplicationInput): Promise<{ root: string; resolution: ApplicationResolution }> {
-  const repository = await (await import("./git.ts")).discoverRepository(input.cwd);
-  const head = await queuedApplicationHead(repository.root);
+  const repository = await (await import("./git.ts")).discoverRepository(input.cwd, input.hostPaths);
+  const head = await queuedApplicationHead(repository);
   if (!head || head.metadata.goalId !== input.goalId || head.metadata.applicationId !== input.applicationId) throw new Error("Application stale requires the exact unresolved FIFO head");
   if (head.decision !== undefined || head.invalidDecision === true) throw new Error("Application stale cannot bypass a published apply decision");
-  if (await documentExists(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
-  const facts = await resolutionPrerequisites(repository.root, input.goalId, input.applicationId);
-  const observed = await main(repository.root);
+  if (await documentExists(repository.controlRoot, applicationResolutionPath(repository, input.goalId, input.applicationId))) throw new Error("Application already has immutable resolution evidence");
+  const facts = await resolutionPrerequisites(repository, input.goalId, input.applicationId);
+  const observed = await main(repository);
   if (observed === facts.first.metadata.targetRevision) throw new Error("Application stale requires main to differ from pinned M");
   const metadata = resolutionSchema.parse({ kind: "application-resolution", disposition: "stale", goalId: input.goalId, applicationId: input.applicationId, expectedMainRevision: facts.first.metadata.targetRevision, observedMainRevision: observed, goalRevision: facts.first.metadata.goalRevision, ...(facts.currentCandidate === undefined ? {} : { candidateRevision: facts.currentCandidate.revision, producingImplementationTicketId: facts.currentCandidate.ticketId }), decidedAt: (input.now ?? new Date()).toISOString() });
   const body = `# Stale Application\n\nPinned main \`${facts.first.metadata.targetRevision}\` moved to \`${observed}\`.\n`;
-  await installImmutable(repository.root, applicationResolutionPath(repository.root, input.goalId, input.applicationId), serializeDocument(metadata, body));
+  await installImmutable(repository.controlRoot, applicationResolutionPath(repository, input.goalId, input.applicationId), serializeDocument(metadata, body));
   return { root: repository.root, resolution: { metadata, body } };
 }
 
-export async function publishApplyDecision(root: string, application: Application, candidateRevision: string, expectedPreviousMainRevision: string, now?: Date, crash?: CrashInjector): Promise<CleanApplicationDecision> {
+export async function publishApplyDecision(root: ProjectPaths, application: Application, candidateRevision: string, expectedPreviousMainRevision: string, now?: Date, crash?: CrashInjector): Promise<CleanApplicationDecision> {
   const metadata = cleanDecisionSchema.parse({ kind: "application-decision", goalId: application.metadata.goalId, applicationId: application.metadata.applicationId, candidateRevision, expectedPreviousMainRevision, resultingMainRevision: candidateRevision, decidedAt: (now ?? new Date()).toISOString() });
   const body = `# Apply decision\n\nAdvance main from \`${expectedPreviousMainRevision}\` to \`${candidateRevision}\`.\n`;
-  await installImmutable(root, applicationDecisionPath(root, metadata.goalId, metadata.applicationId), serializeDocument(metadata, body), commitCrashHooks(crash, "application-decision-publication"));
+  await installImmutable(root.controlRoot, applicationDecisionPath(root, metadata.goalId, metadata.applicationId), serializeDocument(metadata, body), commitCrashHooks(crash, "application-decision-publication"));
   return { metadata, body };
 }
 
 /** Publish reviewed intent only after the caller has checked the exact durable
  * ticket/review/cleanup facts. Publication is the commit point before CAS. */
-export async function publishReviewedApplyDecision(root: string, application: Application, facts: { expectedPreviousMainRevision: string; goalRevision: string; mergeBase: string; candidateRevision: string; producingImplementationTicketId: string; approvingReviewTicketId: string }, now?: Date, crash?: CrashInjector): Promise<ReviewedApplicationDecision> {
+export async function publishReviewedApplyDecision(root: ProjectPaths, application: Application, facts: { expectedPreviousMainRevision: string; goalRevision: string; mergeBase: string; candidateRevision: string; producingImplementationTicketId: string; approvingReviewTicketId: string }, now?: Date, crash?: CrashInjector): Promise<ReviewedApplicationDecision> {
   const metadata = reviewedDecisionSchema.parse({ kind: "application-reviewed-apply-decision", form: "reviewed-squash", goalId: application.metadata.goalId, applicationId: application.metadata.applicationId, applicationApproval: application.metadata.approval, resultingMainRevision: facts.candidateRevision, decidedAt: (now ?? new Date()).toISOString(), ...facts });
   const body = `# Reviewed apply decision\n\nApproved Application \`${application.metadata.goalId}/${application.metadata.applicationId}\` advances main from \`${facts.expectedPreviousMainRevision}\` to reviewed Candidate \`${facts.candidateRevision}\`.\n`;
-  await installImmutable(root, applicationDecisionPath(root, metadata.goalId, metadata.applicationId), serializeDocument(metadata, body), commitCrashHooks(crash, "application-decision-publication"));
+  await installImmutable(root.controlRoot, applicationDecisionPath(root, metadata.goalId, metadata.applicationId), serializeDocument(metadata, body), commitCrashHooks(crash, "application-decision-publication"));
   return { metadata, body };
 }
-export async function advanceDecision(root: string, decision: ApplicationDecision, crash?: CrashInjector): Promise<void> {
+export async function advanceDecision(root: ProjectPaths, decision: ApplicationDecision, crash?: CrashInjector): Promise<void> {
   const current = await main(root);
   if (current === decision.metadata.resultingMainRevision) return;
   if (current !== decision.metadata.expectedPreviousMainRevision) throw new Error(`apply recovery refused: main is ${current}, expected ${decision.metadata.expectedPreviousMainRevision} or ${decision.metadata.resultingMainRevision}`);
@@ -301,22 +302,22 @@ export async function advanceDecision(root: string, decision: ApplicationDecisio
   if (isReviewedDecision(decision)) {
     // Plumbing CAS changes only this ref. It deliberately never checks out,
     // resets, merges, or reads the host worktree.
-    await git(root, ["update-ref", "refs/heads/main", decision.metadata.candidateRevision, decision.metadata.expectedPreviousMainRevision]);
+    await git(root.root, ["update-ref", "refs/heads/main", decision.metadata.candidateRevision, decision.metadata.expectedPreviousMainRevision]);
   } else {
     await checkedOutMain(root);
-    await git(root, ["merge", "--ff-only", decision.metadata.candidateRevision]);
+    await git(root.root, ["merge", "--ff-only", decision.metadata.candidateRevision]);
   }
   if ((await main(root)) !== decision.metadata.resultingMainRevision) throw new Error("apply failed: main did not reach the decided revision");
   await crash?.({ point: "application-target-advance", moment: "after" });
 }
-export async function validDecision(root: string, application: Application, decision: ApplicationDecision): Promise<boolean> {
+export async function validDecision(root: ProjectPaths, application: Application, decision: ApplicationDecision): Promise<boolean> {
   if (decision.metadata.candidateRevision !== decision.metadata.resultingMainRevision || application.metadata.goalId !== decision.metadata.goalId || application.metadata.applicationId !== decision.metadata.applicationId) return false;
   try {
-    const parents = (await git(root, ["rev-list", "--parents", "-n", "1", decision.metadata.candidateRevision])).split(/\s+/);
+    const parents = (await git(root.root, ["rev-list", "--parents", "-n", "1", decision.metadata.candidateRevision])).split(/\s+/);
     if (parents.length !== 2 || parents[0] !== decision.metadata.candidateRevision || parents[1] !== decision.metadata.expectedPreviousMainRevision) return false;
     if (!isReviewedDecision(decision)) {
       if (decision.metadata.expectedPreviousMainRevision !== (await loadGoal(root, application.metadata.goalId)).metadata.repository.initialRevision) return false;
-      const [candidateTree, integratedTree] = await Promise.all([git(root, ["rev-parse", "--verify", `${decision.metadata.candidateRevision}^{tree}`]), git(root, ["rev-parse", "--verify", `${application.metadata.integratedRevision}^{tree}`])]);
+      const [candidateTree, integratedTree] = await Promise.all([git(root.root, ["rev-parse", "--verify", `${decision.metadata.candidateRevision}^{tree}`]), git(root.root, ["rev-parse", "--verify", `${application.metadata.integratedRevision}^{tree}`])]);
       return candidateTree === integratedTree;
     }
     if (decision.metadata.applicationApproval !== application.metadata.approval || decision.metadata.goalRevision !== application.metadata.integratedRevision) return false;
@@ -344,7 +345,7 @@ export async function validDecision(root: string, application: Application, deci
 }
 
 /** Recovery is supervisor-owned and advances only decisions already in FIFO evidence. */
-export async function recoverApplications(root: string, _goalId?: string): Promise<void> {
+export async function recoverApplications(root: ProjectPaths, _goalId?: string): Promise<void> {
   for (const queued of await listProjectApplications(root)) {
     let resolution: ApplicationResolution | undefined;
     try { resolution = await loadApplicationResolutionIfPresent(root, queued.metadata.goalId, queued.metadata.applicationId); }
@@ -363,13 +364,13 @@ export async function recoverApplications(root: string, _goalId?: string): Promi
   }
 }
 export type ApplicationEvidenceState = "incomplete" | "decision-pending" | "target-mismatch" | "inconsistent" | "applied";
-export async function hasTerminalApplication(root: string, goalId: string): Promise<boolean> {
+export async function hasTerminalApplication(root: ProjectPaths, goalId: string): Promise<boolean> {
   for (const application of await listProjectApplications(root)) {
     if (application.metadata.goalId === goalId && (await applicationState(root, application)) === "applied") return true;
   }
   return false;
 }
-export async function applicationEvidence(root: string, goalId: string) {
+export async function applicationEvidence(root: ProjectPaths, goalId: string) {
   const result: Array<{ applicationId: string; state: ApplicationEvidenceState }> = [];
   for (const application of await listProjectApplications(root)) {
     if (application.metadata.goalId === goalId) {

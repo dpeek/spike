@@ -19,10 +19,10 @@ beforeAll(async () => {
 async function fixture(policy: ExecutionPolicy = { isolation: "container", networkAccess: "none", credentialGrants: [] }, modelOverride?: string, instruction = "Execute Docker contract.") {
   const repository = await temporaryRepository();
   const model = modelOverride ?? (policy.credentialGrants.length === 1 ? `${policy.credentialGrants[0]}/test-model` : "contract-model");
-  const goal = await createGoal({ cwd: repository.root, title: "Docker adapter", outcome: "Exercise Docker isolation.", approval: "Approved." });
-  await createChange({ cwd: repository.root, goalId: goal.goal.metadata.goalId, title: "Docker", intent: "Run Docker.", rationale: "Exercise the adapter.", acceptanceCriteria: ["Docker runs."] });
-  const issued = await issueTicket({ cwd: repository.root, goalId: goal.goal.metadata.goalId, changeId: "001", instruction, executionPolicy: policy, model, thinking: "off" });
-  return { root: repository.root, identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId }, revision: issued.ticket.metadata.inputRevision, remove: repository.remove };
+  const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Docker adapter", outcome: "Exercise Docker isolation.", approval: "Approved." });
+  await createChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId, title: "Docker", intent: "Run Docker.", rationale: "Exercise the adapter.", acceptanceCriteria: ["Docker runs."] });
+  const issued = await issueTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId, changeId: "001", instruction, executionPolicy: policy, model, thinking: "off" });
+  return { root: repository.root, hostPaths: repository.hostPaths, project: repository.project, identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId }, revision: issued.ticket.metadata.inputRevision, remove: repository.remove };
 }
 
 workerAdapterContract({ name: "docker", adapter: dockerWorkerAdapter, createTicket: fixture });
@@ -76,13 +76,13 @@ async function spikeRepositoryFixture() {
   }
   await repository.git("add", "--all");
   await repository.git("commit", "--quiet", "-m", "Spike repository Docker check fixture");
-  const goal = await createGoal({ cwd: repository.root, title: "Repository check", outcome: "Run the complete Spike check in Docker.", approval: "Approved." });
-  await createChange({ cwd: repository.root, goalId: goal.goal.metadata.goalId, title: "Repository check", intent: "Check Spike.", rationale: "Exercise the real repository.", acceptanceCriteria: ["The locked check passes."] });
+  const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Repository check", outcome: "Run the complete Spike check in Docker.", approval: "Approved." });
+  await createChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId, title: "Repository check", intent: "Check Spike.", rationale: "Exercise the real repository.", acceptanceCriteria: ["The locked check passes."] });
   const issued = await issueTicket({
-    cwd: repository.root, goalId: goal.goal.metadata.goalId, changeId: "001", instruction: "Run the deterministic repository check.",
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId, changeId: "001", instruction: "Run the deterministic repository check.",
     executionPolicy: { isolation: "container", networkAccess: "unrestricted", credentialGrants: [] }, model: "contract-model", thinking: "off",
   });
-  return { root: repository.root, identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId }, remove: repository.remove };
+  return { root: repository.root, hostPaths: repository.hostPaths, project: repository.project, identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId }, remove: repository.remove };
 }
 
 describe("Docker worker isolation", () => {
@@ -112,10 +112,10 @@ process.stdout.write(resolved + "\\n");
   test("mounts only the declared exchange, records immutable image provenance, and enforces policy before launch", async () => {
     const active = await fixture();
     try {
-      const dispatching = dockerWorkerAdapter.dispatch({ cwd: active.root, ...active.identity, worker: "isolation-worker", command: ["bun", "-e", "await Bun.sleep(300)"] });
+      const dispatching = dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "isolation-worker", command: ["bun", "-e", "await Bun.sleep(300)"] });
       let record;
       for (let attempt = 0; !record && attempt < 50; attempt++) {
-        record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+        record = await loadRecordedWorkerIfPresent(active.project, active.identity);
         if (!record) await Bun.sleep(10);
       }
       expect(record).toBeDefined();
@@ -124,8 +124,8 @@ process.stdout.write(resolved + "\\n");
       expect(runtime.imageDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
       expectContainerBoundary(inspected, runtime.imageDigest);
       await dispatching;
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
@@ -133,8 +133,8 @@ process.stdout.write(resolved + "\\n");
 
     const unsupported = await fixture({ isolation: "container", networkAccess: "restricted", credentialGrants: [] });
     try {
-      await expect(dockerWorkerAdapter.dispatch({ cwd: unsupported.root, ...unsupported.identity, worker: "policy-worker", command: ["true"] })).rejects.toThrow("restricted network");
-      expect(await loadRecordedWorkerIfPresent(unsupported.root, unsupported.identity)).toBeUndefined();
+      await expect(dockerWorkerAdapter.dispatch({ cwd: unsupported.root, hostPaths: unsupported.hostPaths, ...unsupported.identity, worker: "policy-worker", command: ["true"] })).rejects.toThrow("restricted network");
+      expect(await loadRecordedWorkerIfPresent(unsupported.project, unsupported.identity)).toBeUndefined();
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", unsupported.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await unsupported.remove();
@@ -145,17 +145,17 @@ process.stdout.write(resolved + "\\n");
     const active = await fixture();
     try {
       const dispatched = await dockerWorkerAdapter.dispatch({
-        cwd: active.root, ...active.identity, worker: "tmpfs-execution-regression", command: ["bun", "-e", executeGeneratedTmpfsFiles],
+        cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "tmpfs-execution-regression", command: ["bun", "-e", executeGeneratedTmpfsFiles],
       });
       expect(dispatched.execution).toMatchObject({ exitCode: 0, stdout: "generated /tmp file executed\ngenerated /work file executed\n", stderr: "" });
-      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string; imageDigest: string };
       expect(record!.metadata.environmentDigest).toBe(runtime.imageDigest);
       expectContainerBoundary(await Bun.$`docker inspect ${runtime.containerId}`.json(), runtime.imageDigest);
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
-      expect((await loadRecordedWorkerIfPresent(active.root, active.identity))?.metadata.runtime).toBeUndefined();
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
@@ -169,13 +169,13 @@ process.stdout.write(resolved + "\\n");
     process.env["SPIKE_PI_AUTH_FILE"] = auth;
     const active = await fixture({ isolation: "container", networkAccess: "none", credentialGrants: ["openai-codex"] });
     try {
-      await dockerWorkerAdapter.dispatch({ cwd: active.root, ...active.identity, worker: "credential-worker", command: ["true"] });
-      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      await dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "credential-worker", command: ["true"] });
+      const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string };
       const inspected = await Bun.$`docker inspect ${runtime.containerId}`.json();
       expect((inspected[0].Mounts as Array<{ Destination: string }>).map((mount) => mount.Destination)).not.toContain(auth);
       expect(JSON.stringify(record)).not.toContain("test-secret");
-      await dockerWorkerAdapter.finalize(active.root, active.identity, new Date());
+      await dockerWorkerAdapter.finalize(active.project, active.identity, new Date());
     } finally {
       if (prior === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
       else process.env["SPIKE_PI_AUTH_FILE"] = prior;
@@ -194,12 +194,12 @@ process.stdout.write(resolved + "\\n");
     try {
       let inspected = false;
       await expect(dockerWorkerAdapter.dispatch({
-        cwd: absent.root, ...absent.identity, worker: "missing-credential", command: ["true"],
+        cwd: absent.root, hostPaths: absent.hostPaths, ...absent.identity, worker: "missing-credential", command: ["true"],
         afterDockerImageInspection: async () => { inspected = true; },
       })).rejects.toThrow("unavailable or invalid");
       expect(inspected).toBe(false);
-      expect(await loadRecordedWorkerIfPresent(absent.root, absent.identity)).toBeUndefined();
-      expect(await Bun.file(`${exchangePath(absent.root, absent.identity)}/input/ticket.md`).exists()).toBe(false);
+      expect(await loadRecordedWorkerIfPresent(absent.project, absent.identity)).toBeUndefined();
+      expect(await Bun.file(`${exchangePath(absent.project, absent.identity)}/input/ticket.md`).exists()).toBe(false);
     } finally {
       if (sourceForLater === undefined) delete process.env["SPIKE_PI_AUTH_FILE"];
       else process.env["SPIKE_PI_AUTH_FILE"] = sourceForLater;
@@ -236,7 +236,7 @@ process.stdout.write(resolved + "\\n");
           let diagnostic: unknown;
           try {
             await dockerWorkerAdapter.dispatch({
-              cwd: active.root, ...active.identity, worker: `refusal-${refusal.name}`, command: ["true"],
+              cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: `refusal-${refusal.name}`, command: ["true"],
               afterDockerImageInspection: async () => { inspected = true; },
             });
           } catch (error) {
@@ -246,8 +246,8 @@ process.stdout.write(resolved + "\\n");
           expect((diagnostic as Error).message).toContain(refusal.error);
           for (const secret of refusal.secrets ?? []) expect((diagnostic as Error).message).not.toContain(secret);
           expect(inspected).toBe(false);
-          expect(await loadRecordedWorkerIfPresent(active.root, active.identity)).toBeUndefined();
-          expect(await Bun.file(`${exchangePath(active.root, active.identity)}/input/ticket.md`).exists()).toBe(false);
+          expect(await loadRecordedWorkerIfPresent(active.project, active.identity)).toBeUndefined();
+          expect(await Bun.file(`${exchangePath(active.project, active.identity)}/input/ticket.md`).exists()).toBe(false);
           expect(await Bun.$`docker container ls --all --quiet`.text()).toBe(containersBefore);
         } finally {
           await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
@@ -270,13 +270,13 @@ process.stdout.write(resolved + "\\n");
       await Bun.$`docker commit ${source} spike-worker:retag-regression`.quiet();
       process.env["SPIKE_DOCKER_IMAGE"] = "spike-worker:local";
       const dispatched = await dockerWorkerAdapter.dispatch({
-        cwd: active.root, ...active.identity, worker: "provenance-worker", command: ["true"],
+        cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "provenance-worker", command: ["true"],
         afterDockerImageInspection: async () => { await Bun.$`docker tag spike-worker:retag-regression spike-worker:local`.quiet(); },
       });
-      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       expect(record!.metadata.environmentDigest).toBe(original);
       expect(dispatched.execution.environmentDigest).toBe(original);
-      await dockerWorkerAdapter.finalize(active.root, active.identity, new Date());
+      await dockerWorkerAdapter.finalize(active.project, active.identity, new Date());
     } finally {
       await Bun.$`docker tag ${original} spike-worker:local`.quiet();
       await Bun.$`docker rm --force ${source}`.quiet();
@@ -297,20 +297,20 @@ process.stdout.write(resolved + "\\n");
       async closeTab(tab) { closed.push(tab); },
     };
     try {
-      const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "attended-worker", command: ["bun", "-e", `${executeGeneratedTmpfsFiles}\nawait Bun.sleep(500);`], herdr: host });
+      const dispatched = await dispatchHerdrDockerTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "attended-worker", command: ["bun", "-e", `${executeGeneratedTmpfsFiles}\nawait Bun.sleep(500);`], herdr: host });
       expect(dispatched.status).toBe("working");
-      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string; host: string; imageDigest: string; workspace: string }; 
       const inspected = await Bun.$`docker inspect ${runtime.containerId}`.json();
       expect(inspected[0].Config.Tty).toBe(true);
       expect(inspected[0].Config.OpenStdin).toBe(true);
       expect(record!.metadata.environmentDigest).toBe(runtime.imageDigest);
       expectContainerBoundary(inspected, runtime.imageDigest);
-      expect((await observeWorker(active.root, active.identity, host)).status).toBe("working");
-      await waitForWorkerDone(active.root, active.identity);
-      expect((await observeWorker(active.root, active.identity, host)).status).toBe("done");
+      expect((await observeWorker(active.project, active.identity, host)).status).toBe("working");
+      await waitForWorkerDone(active.project, active.identity);
+      expect((await observeWorker(active.project, active.identity, host)).status).toBe("done");
       expect((await Bun.$`docker logs ${runtime.containerId}`.text()).replaceAll("\r\n", "\n")).toBe("generated /tmp file executed\ngenerated /work file executed\n");
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), {
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), {
         async stop(runtime) { await Bun.$`docker stop --time 1 ${(runtime as { containerId: string }).containerId}`.quiet(); await host.closeTab("docker-tab"); },
         async cleanup(runtime) {
           await Bun.$`docker rm --force ${(runtime as { containerId: string }).containerId}`.quiet();
@@ -320,8 +320,8 @@ process.stdout.write(resolved + "\\n");
       expect(closed).toEqual(["docker-tab"]);
       expect(await Bun.file(runtime.workspace).exists()).toBe(false);
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
-      expect((await loadRecordedWorkerIfPresent(active.root, active.identity))?.metadata.runtime).toBeUndefined();
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
       expect(closed).toEqual(["docker-tab"]);
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
@@ -339,9 +339,9 @@ process.stdout.write(resolved + "\\n");
       async closeTab(tab) { closed.push(tab); },
     };
     try {
-      await dispatchHerdrDockerTicket({ cwd: active.root, ...active.identity, worker: "cleanup-race", command: ["true"], herdr: host });
-      await waitForWorkerDone(active.root, active.identity);
-      const durable = (await loadRecordedWorkerIfPresent(active.root, active.identity))!;
+      await dispatchHerdrDockerTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "cleanup-race", command: ["true"], herdr: host });
+      await waitForWorkerDone(active.project, active.identity);
+      const durable = (await loadRecordedWorkerIfPresent(active.project, active.identity))!;
       expect(durable.metadata).toMatchObject({ finishedAt: expect.any(String), exitCode: 0 });
       const runtime = durable.metadata.runtime!.resource as { containerId: string; workspace: string };
       await mkdir(runtime.workspace, { recursive: true });
@@ -370,14 +370,14 @@ process.stdout.write(resolved + "\\n");
           await rm(value.workspace, { recursive: true, force: true });
         },
       };
-      await expect(dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
+      await expect(dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "failed", phase: "cleanup" });
       expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(true);
-      await expect(dockerWorkerAdapter.finalize(active.root, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
+      await expect(dockerWorkerAdapter.finalize(active.project, active.identity, new Date(), operations)).resolves.toMatchObject({ status: "finalized" });
       expect(events).toEqual(["stop/tab-close", "docker-remove", "workspace-remove", "stop/tab-close", "workspace-remove"]);
       expect(await Bun.file(`${runtime.workspace}/cleanup-race-proof`).exists()).toBe(false);
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
       expect(closed).toEqual(["cleanup-race-tab", "cleanup-race-tab"]);
-      expect((await loadRecordedWorkerIfPresent(active.root, active.identity))?.metadata.runtime).toBeUndefined();
+      expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
@@ -387,20 +387,20 @@ process.stdout.write(resolved + "\\n");
   test("stopping a live worker retains terminal evidence through repeated finalization", async () => {
     const active = await fixture();
     try {
-      const dispatching = dockerWorkerAdapter.dispatch({ cwd: active.root, ...active.identity, worker: "stop-worker", command: ["bun", "-e", "await Bun.sleep(5000)"] });
+      const dispatching = dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "stop-worker", command: ["bun", "-e", "await Bun.sleep(5000)"] });
       for (let attempt = 0; ; attempt++) {
-        if (await loadRecordedWorkerIfPresent(active.root, active.identity)) break;
+        if (await loadRecordedWorkerIfPresent(active.project, active.identity)) break;
         if (attempt > 50) throw new Error("Docker worker was not recorded");
         await Bun.sleep(10);
       }
-      const finalizing = dockerWorkerAdapter.finalize(active.root, active.identity, new Date());
+      const finalizing = dockerWorkerAdapter.finalize(active.project, active.identity, new Date());
       const dispatched = await dispatching;
       const finalized = await finalizing;
       expect(dispatched.execution.exitCode).toBe(137);
       expect(finalized.status).toBe("finalized");
-      const finished = await dockerWorkerAdapter.loadFinished(active.root, active.identity);
+      const finished = await dockerWorkerAdapter.loadFinished(active.project, active.identity);
       expect(finished.exitCode).toBe(137);
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
@@ -424,18 +424,18 @@ process.stdout.write(resolved + "\\n");
         "bun run check",
         "printf 'literal bun run check completed\\n'",
       ].join("\n")];
-      const dispatched = await dockerWorkerAdapter.dispatch({ cwd: active.root, ...active.identity, worker: "repository-check-regression", command });
+      const dispatched = await dockerWorkerAdapter.dispatch({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "repository-check-regression", command });
       expect(dispatched.execution.exitCode).toBe(0);
       expect(dispatched.execution.stdout).toContain("locked install left bun.lock unchanged\n");
       expect(dispatched.execution.stdout).toContain("literal bun run check completed\n");
-      const record = await loadRecordedWorkerIfPresent(active.root, active.identity);
+      const record = await loadRecordedWorkerIfPresent(active.project, active.identity);
       const runtime = record!.metadata.runtime!.resource as { containerId: string; imageDigest: string };
       expectContainerBoundary(await Bun.$`docker inspect ${runtime.containerId}`.json(), runtime.imageDigest, "bridge");
-      expect((await dockerWorkerAdapter.finalize(active.root, active.identity, new Date())).status).toBe("finalized");
+      expect((await dockerWorkerAdapter.finalize(active.project, active.identity, new Date())).status).toBe("finalized");
       expect(await Bun.spawn(["docker", "container", "inspect", runtime.containerId], { stdout: "ignore", stderr: "ignore" }).exited).not.toBe(0);
-      expect((await loadRecordedWorkerIfPresent(active.root, active.identity))?.metadata.runtime).toBeUndefined();
+      expect((await loadRecordedWorkerIfPresent(active.project, active.identity))?.metadata.runtime).toBeUndefined();
     } finally {
-      await dockerWorkerAdapter.finalize(active.root, active.identity, new Date()).catch(() => undefined);
+      await dockerWorkerAdapter.finalize(active.project, active.identity, new Date()).catch(() => undefined);
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();
     }
@@ -455,14 +455,14 @@ process.stdout.write(resolved + "\\n");
     try {
       // The environment-selected model is frozen into the issued Ticket, then
       // passed back to the pinned Pi process by the Docker dispatcher.
-      const dispatched = await dispatchPiTicket({ cwd: active.root, ...active.identity, worker: "real-pi-smoke", host: "direct" });
+      const dispatched = await dispatchPiTicket({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, worker: "real-pi-smoke", host: "direct" });
       if (dispatched.hosting !== "direct" || dispatched.classification !== "accepted-submission") {
         throw new Error(`real Pi did not submit successfully: ${dispatched.hosting === "direct" ? dispatched.classification : dispatched.status}`);
       }
-      const published = await publishImplementationReport({ cwd: active.root, ...active.identity, execution: dispatched.execution, commitMessage: { summary: "Real Pi Docker smoke" } });
+      const published = await publishImplementationReport({ cwd: active.root, hostPaths: active.hostPaths, ...active.identity, execution: dispatched.execution, commitMessage: { summary: "Real Pi Docker smoke" } });
       expect(published.report.metadata.execution.environmentDigest).toMatch(/^sha256:/);
       expect(published.report.metadata.execution.model).toBe(model);
-      expect(await loadRecordedWorkerIfPresent(active.root, active.identity)).toBeUndefined();
+      expect(await loadRecordedWorkerIfPresent(active.project, active.identity)).toBeUndefined();
     } finally {
       await Bun.spawn(["chmod", "-R", "u+w", active.root], { stdout: "ignore", stderr: "ignore" }).exited;
       await active.remove();

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import type { HostPaths } from "./data-root.ts";
+import type { ProjectPaths } from "./project.ts";
 import { loadProjectConfig } from "./config.ts";
 import { discoverRepository } from "./git.ts";
 import { listGoalIds, loadGoal } from "./goal.ts";
@@ -25,6 +27,7 @@ export type GoalPlannerOperations = {
 };
 export type GoalPlannerInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   herdr?: HerdrOperations;
   piExecutable?: string;
@@ -47,12 +50,12 @@ export function goalPlannerIdentity(projectIdentity: string, goalId: string): Go
   return { projectIdentity, goalId, name: `spike-goal-${goalId}-${digest}` };
 }
 
-async function selected(input: GoalPlannerInput): Promise<{ root: string; identity: GoalPlannerIdentity }> {
+async function selected(input: GoalPlannerInput): Promise<{ project: ProjectPaths; identity: GoalPlannerIdentity }> {
   if (typeof input.goalId !== "string" || !input.goalId.trim()) throw new Error("Goal ID must not be blank");
-  const repository = await discoverRepository(input.cwd);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
   // Loading proves both existence and Project qualification before Herdr lookup.
-  await loadGoal(repository.root, input.goalId);
-  return { root: repository.root, identity: goalPlannerIdentity(repository.identity, input.goalId) };
+  await loadGoal(repository, input.goalId);
+  return { project: repository, identity: goalPlannerIdentity(repository.identity, input.goalId) };
 }
 
 async function observation(identity: GoalPlannerIdentity, herdr: HerdrOperations): Promise<GoalPlannerObservation> {
@@ -82,7 +85,7 @@ async function observation(identity: GoalPlannerIdentity, herdr: HerdrOperations
 }
 
 async function otherPlannerObservations(
-  root: string,
+  root: ProjectPaths,
   identity: GoalPlannerIdentity,
   herdr: HerdrOperations,
 ): Promise<GoalPlannerObservation[]> {
@@ -126,10 +129,10 @@ function shellArgument(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function launch(selectedGoal: { root: string; identity: GoalPlannerIdentity }, input: GoalPlannerInput, herdr: HerdrOperations): Promise<GoalPlannerObservation> {
-  const selection = (await loadProjectConfig(selectedGoal.root)).agents.planner;
+async function launch(selectedGoal: { project: ProjectPaths; identity: GoalPlannerIdentity }, input: GoalPlannerInput, herdr: HerdrOperations): Promise<GoalPlannerObservation> {
+  const selection = (await loadProjectConfig(selectedGoal.project.root)).agents.planner;
   const tab = await herdr.createTab({
-    cwd: selectedGoal.root,
+    cwd: selectedGoal.project.root,
     label: selectedGoal.identity.name,
     environment: {
       SPIKE_GOAL_ID: selectedGoal.identity.goalId,
@@ -166,14 +169,14 @@ export const goalPlannerOperations: GoalPlannerOperations = {
   },
   async startOrReattach(input) {
     const target = await selected(input);
-    await assertGoalNotFrozen(target.root, input.goalId);
+    await assertGoalNotFrozen(target.project, input.goalId);
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
     if (current.state === "duplicate") throw new Error(`multiple live Goal planners found for ${target.identity.name}; refusing to choose or close either`);
     // Admission is fully derived from exact Herdr discovery. In particular it
     // happens before selected stale tabs are closed, a tab is created, Pi is
     // launched, or any workflow path/ref is touched.
-    assertAdmissionCapacity(current, await otherPlannerObservations(target.root, target.identity, herdr));
+    assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
     if (current.state === "live") return current;
     if (current.state === "stale" || current.state === "unavailable") await close(current.resources, herdr);
     return launch(target, input, herdr);
@@ -193,13 +196,13 @@ export const goalPlannerOperations: GoalPlannerOperations = {
   },
   async replace(input) {
     const target = await selected(input);
-    await assertGoalNotFrozen(target.root, input.goalId);
+    await assertGoalNotFrozen(target.project, input.goalId);
     const herdr = input.herdr ?? herdrOperations;
     const current = await observation(target.identity, herdr);
     // Replacement keeps the selected Goal's one owner. At capacity its old
     // owner counts as the selected slot, so closing it then launching its
     // replacement is permitted without touching the other Goal's resources.
-    assertAdmissionCapacity(current, await otherPlannerObservations(target.root, target.identity, herdr));
+    assertAdmissionCapacity(current, await otherPlannerObservations(target.project, target.identity, herdr));
     await close(current.resources, herdr);
     return launch(target, input, herdr);
   },

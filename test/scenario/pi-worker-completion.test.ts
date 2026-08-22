@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { pathToFileURL } from "node:url";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
@@ -8,14 +8,7 @@ import { issueTicket } from "../../src/ticket.ts";
 import { dispatchLocalImplementation } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void>; git: (...args: string[]) => Promise<string> }> = [];
 
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const extensionUrl = pathToFileURL(`${import.meta.dir}/../../src/pi-worker-extension.ts`).href;
 const spikePath = `${import.meta.dir}/../../bin/spike`;
@@ -70,25 +63,21 @@ if (shutdowns !== 1) throw new Error("accepted completion did not request gracef
 describe("Pi worker completion boundary", () => {
   test("rejects completion when Pi's observed selection differs from the Ticket assignment", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Verify actual Pi provenance",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Verify actual Pi provenance",
       outcome: "Reject execution that does not match immutable Ticket provenance.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Verify Pi selection",
       intent: "Compare observed execution with the Ticket assignment.",
       rationale: "Reports must record actual rather than requested model provenance.",
       acceptanceCriteria: ["Mismatched Pi execution cannot produce an accepted Submission."],
     });
     const issued = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Attempt completion with mismatched observed provenance.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
@@ -98,6 +87,7 @@ describe("Pi worker completion boundary", () => {
 
     const dispatched = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: issued.ticket.metadata.ticketId,
@@ -114,25 +104,21 @@ describe("Pi worker completion boundary", () => {
 
   test("publishes a blocked implementation without a Candidate or repository bundle", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Report an implementation blocker",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Report an implementation blocker",
       outcome: "Retain truthful blocked evidence without accepting partial work.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Exercise blocked completion",
       intent: "Publish worker-authored blocked evidence.",
       rationale: "A blocker must not produce a Candidate.",
       acceptanceCriteria: ["Blocked implementation evidence produces no Candidate."],
     });
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Report the external Docker blocker.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
@@ -142,6 +128,7 @@ describe("Pi worker completion boundary", () => {
 
     const dispatched = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "001",
@@ -154,7 +141,7 @@ describe("Pi worker completion boundary", () => {
     const publication = Bun.spawn([
       spikePath,
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001", "--json",
-    ], { cwd: repository.root, env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+    ], { cwd: repository.root, env: { ...process.env, SPIKE_DATA_DIR: repository.dataRoot }, stdout: "pipe", stderr: "pipe" });
     const [exitCode, stdout, stderr] = await Promise.all([
       publication.exited,
       new Response(publication.stdout).text(),
@@ -163,10 +150,10 @@ describe("Pi worker completion boundary", () => {
     expect(exitCode).toBe(0);
     expect(stderr).toBe("");
     expect(JSON.parse(stdout)).toMatchObject({ ok: true, data: { report: { outcome: "blocked", role: "implement" } } });
-    const report = await loadReport(repository.root, goalId, "001", "001");
+    const report = await loadReport(repository.project, goalId, "001", "001");
     expect(report.body).toContain("Required Docker daemon is unavailable.");
     expect(report.metadata).not.toHaveProperty("candidateRevision");
-    expect((await deriveGoalStatus(repository.root, goalId)).currentChange?.latestReport).toEqual({
+    expect((await deriveGoalStatus(repository.root, repository.hostPaths, goalId)).currentChange?.latestReport).toEqual({
       ticketId: "001",
       role: "implement",
       outcome: "blocked",
@@ -175,25 +162,21 @@ describe("Pi worker completion boundary", () => {
 
   test("produces a publishable implementation exchange through only the terminating tool", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Complete a Ticket through Pi",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Complete a Ticket through Pi",
       outcome: "Produce canonical exchange output through the worker extension.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Add Pi completion evidence",
       intent: "Exercise the Node-compatible worker boundary.",
       rationale: "Workers should not format workflow documents or Git bundles.",
       acceptanceCriteria: ["The accepted completion produces a publishable Candidate."],
     });
     const issued = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Implement and complete through the role-specific Pi tool.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
@@ -203,6 +186,7 @@ describe("Pi worker completion boundary", () => {
 
     const dispatched = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: issued.ticket.metadata.ticketId,
@@ -213,8 +197,7 @@ describe("Pi worker completion boundary", () => {
     expect(dispatched.execution.stderr).toBe("");
 
     const published = await publishImplementationReport({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       ticketId: "001",
       execution: dispatched.execution,

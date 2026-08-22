@@ -1,17 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { guidancePaths, loadGuidance } from "./guidance.ts";
 import { fixtureGuidance, temporaryRepository } from "../test/support/repository.ts";
 
-const repositories: Array<{ remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  await Promise.all(repositories.splice(0).map((repository) => repository.remove()));
-});
 
 async function fixture() {
   const repository = await temporaryRepository();
-  repositories.push(repository);
   return repository;
 }
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadChangeDecision } from "../../src/change.ts";
@@ -6,13 +6,6 @@ import { integratedRef } from "../../src/goal.ts";
 import { loadImplementationReport, loadReviewReport } from "../../src/report.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
 const worker = String.raw`
@@ -73,14 +66,14 @@ if (ticketId === "001") {
 }
 `;
 
-async function spikeResult(cwd: string, args: string[]): Promise<{ exitCode: number; output: any }> {
+async function spikeResult(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[]): Promise<{ exitCode: number; output: any }> {
   const separator = args.indexOf("--");
   const jsonArgs = separator === -1
     ? [...args, "--json"]
     : [...args.slice(0, separator), "--json", ...args.slice(separator)];
   const child = Bun.spawn([spikePath, ...jsonArgs], {
-    cwd,
-    env: { ...process.env },
+    cwd: repository.root,
+    env: { ...process.env, SPIKE_DATA_DIR: repository.dataRoot },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -95,8 +88,8 @@ async function spikeResult(cwd: string, args: string[]): Promise<{ exitCode: num
   return { exitCode, output: JSON.parse(stdout) };
 }
 
-async function spike(cwd: string, args: string[]): Promise<any> {
-  const result = await spikeResult(cwd, args);
+async function spike(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[]): Promise<any> {
+  const result = await spikeResult(repository, args);
   if (result.exitCode !== 0 || result.output.ok !== true) throw new Error(JSON.stringify(result.output));
   return result.output;
 }
@@ -104,17 +97,16 @@ async function spike(cwd: string, args: string[]): Promise<any> {
 describe("direct CLI tracer bullet", () => {
   test("issues, dispatches, publishes implementation and approval Reports, then lands", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const hostHead = repository.head;
 
-    const createdGoal = await spike(repository.root, [
+    const createdGoal = await spike(repository, [
       "goal", "create",
       "--title", "Complete the direct CLI tracer bullet",
       "--outcome", "Land one directly dispatched and reviewed Candidate.",
       "--approval", "Approved.",
     ]);
     const goalId = createdGoal.data.goal.goalId as string;
-    await spike(repository.root, [
+    await spike(repository, [
       "change", "create", "--goal", goalId,
       "--title", "Add direct CLI behavior",
       "--intent", "Exercise the complete local-clone command path.",
@@ -122,7 +114,7 @@ describe("direct CLI tracer bullet", () => {
       "--acceptance", "The direct CLI Candidate is independently approved.",
     ]);
 
-    const issuedImplementation = await spike(repository.root, [
+    const issuedImplementation = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001",
       "--instruction", "Implement the direct CLI Candidate.",
       "--network-access", "unrestricted",
@@ -135,7 +127,7 @@ describe("direct CLI tracer bullet", () => {
     config.agents.implement = { model: "changed-after-issuance", thinking: "minimal", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] };
     await writeFile(join(repository.root, "spike.json"), `${JSON.stringify(config, null, 2)}\n`);
 
-    const implementationDispatch = await spike(repository.root, [
+    const implementationDispatch = await spike(repository, [
       "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "direct-cli-implementer", "--", "bun", "-e", worker,
     ]);
@@ -145,7 +137,7 @@ describe("direct CLI tracer bullet", () => {
     expect(await readFile(join(repository.root, implementationDispatch.data.paths.input, "context.md"), "utf8"))
       .toContain("spike_complete_implementation");
 
-    const implementationPublication = await spike(repository.root, [
+    const implementationPublication = await spike(repository, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--commit-summary", "Add direct CLI behavior",
       "--commit-body", "Complete the direct local-clone tracer bullet.",
@@ -157,7 +149,7 @@ describe("direct CLI tracer bullet", () => {
     const candidateRevision = implementationPublication.data.report.candidateRevision as string;
     expect(await repository.git("show", `${candidateRevision}:direct-cli.txt`)).toBe("approved through direct CLI");
 
-    const issuedReview = await spike(repository.root, [
+    const issuedReview = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--role", "review",
       "--instruction", "Independently review the exact Candidate.",
       "--network-access", "unrestricted",
@@ -167,7 +159,7 @@ describe("direct CLI tracer bullet", () => {
       producingImplementationTicketId: "001", model: "review-model", thinking: "high",
     });
 
-    const reviewDispatch = await spike(repository.root, [
+    const reviewDispatch = await spike(repository, [
       "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "002",
       "--worker", "direct-cli-reviewer", "--", "bun", "-e", worker,
     ]);
@@ -175,7 +167,7 @@ describe("direct CLI tracer bullet", () => {
     expect(await readFile(join(repository.root, reviewDispatch.data.paths.input, "context.md"), "utf8"))
       .toContain("spike_complete_review");
 
-    const reviewPublication = await spike(repository.root, [
+    const reviewPublication = await spike(repository, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "002",
     ]);
     expect(reviewPublication.data).toMatchObject({
@@ -186,11 +178,11 @@ describe("direct CLI tracer bullet", () => {
       cleanup: { status: "finalized" },
     });
 
-    const landed = await spike(repository.root, ["change", "land", "--goal", goalId, "--change", "001"]);
+    const landed = await spike(repository, ["change", "land", "--goal", goalId, "--change", "001"]);
     expect(landed.data).toMatchObject({ disposition: "land", approvedRevision: candidateRevision });
-    expect((await loadImplementationReport(repository.root, goalId, "001", "001")).metadata.candidateRevision).toBe(candidateRevision);
-    expect((await loadReviewReport(repository.root, goalId, "001", "002")).metadata.verdict).toBe("approve");
-    expect((await loadChangeDecision(repository.root, goalId, "001")).metadata.disposition).toBe("land");
+    expect((await loadImplementationReport(repository.project, goalId, "001", "001")).metadata.candidateRevision).toBe(candidateRevision);
+    expect((await loadReviewReport(repository.project, goalId, "001", "002")).metadata.verdict).toBe("approve");
+    expect((await loadChangeDecision(repository.project, goalId, "001")).metadata.disposition).toBe("land");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(candidateRevision);
     expect(await repository.git("rev-parse", "HEAD")).toBe(hostHead);
   }, 30_000);

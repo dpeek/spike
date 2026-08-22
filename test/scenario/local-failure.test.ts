@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange } from "../../src/change.ts";
@@ -15,13 +15,6 @@ import { issueTicket, reportPath, ticketStatus } from "../../src/ticket.ts";
 import { dispatchLocalImplementation } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const failedWorker = String.raw`
 import { writeFile } from "node:fs/promises";
@@ -43,17 +36,14 @@ function clock(...timestamps: string[]): () => Date {
 describe("failed Ticket replacement", () => {
   test("publishes a host-generated failed Report and replaces it from the latest committed revision", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Recover from failed implementation",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Recover from failed implementation",
       outcome: "Preserve failure evidence and produce Candidate A from a replacement Ticket.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     const change = await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Publish Candidate A",
       intent: "Replace a failed implementation Ticket without accepting its staging output.",
       rationale: "Terminal failure evidence must not become a Candidate.",
@@ -62,8 +52,7 @@ describe("failed Ticket replacement", () => {
     const baseRevision = change.change.metadata.baseRevision;
 
     const first = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Attempt Candidate A.",
       executionPolicy: policy,
@@ -83,6 +72,7 @@ describe("failed Ticket replacement", () => {
 
     const failed = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "001",
@@ -97,8 +87,7 @@ describe("failed Ticket replacement", () => {
 
     const publishFailure = (overrides: Partial<Parameters<typeof publishFailedReport>[0]> = {}) =>
       publishFailedReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "001",
         role: "implement",
@@ -125,7 +114,7 @@ describe("failed Ticket replacement", () => {
     await expect(
       publishFailure({ execution: { ...failed.execution, adapter: "not-the-selected-adapter" } }),
     ).rejects.toThrow("adapter does not match its Ticket execution policy");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(false);
 
     const publication = await publishFailure();
     expect(publication.report.metadata).toEqual({
@@ -151,22 +140,21 @@ describe("failed Ticket replacement", () => {
     expect(publication.report.metadata).not.toHaveProperty("workerRevision");
     expect(publication.report.metadata).not.toHaveProperty("verdict");
     expect(publication.report.body).toContain("Worker exited with code 23 before producing a valid Submission.");
-    expect((await loadReport(repository.root, goalId, "001", "001")).metadata.outcome).toBe("failed");
-    expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
-    expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toBeUndefined();
-    expect(await deriveCurrentRemediation(repository.root, goalId, "001")).toBeUndefined();
-    expect(await deriveCurrentApproval(repository.root, goalId, "001")).toBeUndefined();
+    expect((await loadReport(repository.project, goalId, "001", "001")).metadata.outcome).toBe("failed");
+    expect(await ticketStatus(repository.project, goalId, "001", "001")).toBe("reported");
+    expect(await deriveCurrentCandidate(repository.project, goalId, "001")).toBeUndefined();
+    expect(await deriveCurrentRemediation(repository.project, goalId, "001")).toBeUndefined();
+    expect(await deriveCurrentApproval(repository.project, goalId, "001")).toBeUndefined();
     await expect(repository.git("rev-parse", "--verify", candidateRef(goalId, "001", "001"))).rejects.toThrow();
 
-    const failedReportSource = await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8");
+    const failedReportSource = await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8");
     await expect(publishFailure()).rejects.toThrow("immutable Report already exists");
-    expect(await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8")).toBe(failedReportSource);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8")).toBe(failedReportSource);
     expect(await readFile(join(failed.exchange.outputDirectory, "partial-output.tmp"), "utf8")).toBe(stagedPartialOutput);
     expect(await readFile(join(failed.exchange.outputDirectory, "diagnostic.log"), "utf8")).toBe(stagedDiagnostic);
 
     const replacement = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Produce Candidate A in a fresh worker.",
       executionPolicy: policy,

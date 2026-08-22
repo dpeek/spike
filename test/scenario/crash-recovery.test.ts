@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, changeDecisionPath, landChange } from "../../src/change.ts";
@@ -19,13 +19,6 @@ import {
 } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 function crashAt(point: ImmutableCommitPoint, moment: CrashMoment): CrashInjector {
   return (event) => {
@@ -80,7 +73,6 @@ const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" 
 describe("crash-point recovery", () => {
   test("reconciles crashes immediately before and after every immutable commit point", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
 
     await writeFile(join(repository.root, "host-staged.txt"), "host index state\n");
     await repository.git("add", "host-staged.txt");
@@ -92,21 +84,19 @@ describe("crash-point recovery", () => {
 
     await expect(
       createGoal({
-        cwd: repository.root,
-        title: "Unpublished Goal",
+        cwd: repository.root, hostPaths: repository.hostPaths, title: "Unpublished Goal",
         outcome: "Must remain staging only.",
         approval: "Approved.",
         crash: crashAt("goal-publication", "before"),
       }),
     ).rejects.toThrow("injected crash before goal-publication");
-    const beforeGoalRecovery = await reconcileRepository({ cwd: repository.root });
+    const beforeGoalRecovery = await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     expect(beforeGoalRecovery.goals).toHaveLength(0);
     expect(beforeGoalRecovery.ignoredUnpublishedGoalIds).toHaveLength(1);
 
     await expect(
       createGoal({
-        cwd: repository.root,
-        title: "Recover every commit point",
+        cwd: repository.root, hostPaths: repository.hostPaths, title: "Recover every commit point",
         outcome: "Land only the exact reviewed Candidate after deterministic restart.",
         approval: "Approved.",
         crash: crashAt("goal-publication", "after"),
@@ -117,13 +107,12 @@ describe("crash-point recovery", () => {
     expect(goalId).toBeDefined();
     if (goalId === undefined) throw new Error("published Goal was not found");
 
-    const goalRecovery = await reconcileRepository({ cwd: repository.root });
+    const goalRecovery = await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     expect(goalRecovery.goals.map((goal) => goal.goalId)).toEqual([goalId]);
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
 
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Recover one reviewed Candidate",
       intent: "Exercise every Ticket, Report, and Change decision crash boundary.",
       rationale: "Only immutable evidence may advance workflow authority.",
@@ -132,25 +121,23 @@ describe("crash-point recovery", () => {
 
     await expect(
       issueTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         instruction: "Produce the candidate.",
         executionPolicy: policy,
         crash: crashAt("ticket-issuance", "after"),
       }),
     ).rejects.toThrow("injected crash after ticket-issuance");
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "001")).exists()).toBe(true);
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "001")).exists()).toBe(true);
 
-    const issuedRecovery = await reconcileRepository({ cwd: repository.root, now: new Date("2026-04-01T00:00:00.000Z") });
+    const issuedRecovery = await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths, now: new Date("2026-04-01T00:00:00.000Z") });
     expect(issuedRecovery.goals[0]?.interruptedTickets[0]?.report.metadata).toMatchObject({
       outcome: "interrupted",
       execution: { adapter: "host", worker: "not-launched", model: "implementation-model", thinking: "medium" },
     });
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "002")).exists()).toBe(false);
     const replacement002 = await issueReplacementTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       interruptedTicketId: "001",
     });
@@ -162,6 +149,7 @@ describe("crash-point recovery", () => {
 
     const implementationBefore = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "002",
@@ -170,8 +158,7 @@ describe("crash-point recovery", () => {
     });
     await expect(
       publishImplementationReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "002",
         execution: implementationBefore.execution,
@@ -179,33 +166,33 @@ describe("crash-point recovery", () => {
         crash: crashAt("implementation-report-publication", "before"),
       }),
     ).rejects.toThrow("injected crash before implementation-report-publication");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", "002")).exists()).toBe(false);
     const unpublishedCandidateRef = candidateRef(goalId, "001", "002");
     const unpublishedCandidate = await repository.git("rev-parse", unpublishedCandidateRef);
     const quarantineRef = `refs/spike/quarantine/goals/${goalId}/changes/001/tickets/002/test-debris`;
     await repository.git("update-ref", quarantineRef, unpublishedCandidate);
     const unpublishedSubmission = await readFile(join(implementationBefore.exchange.outputDirectory, "submission.md"), "utf8");
 
-    const implementationBeforeRecovery = await reconcileRepository({ cwd: repository.root });
+    const implementationBeforeRecovery = await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     expect(implementationBeforeRecovery.goals[0]?.discardedRefs).toEqual(
       expect.arrayContaining([unpublishedCandidateRef, quarantineRef]),
     );
     expect(implementationBeforeRecovery.goals[0]?.ignoredOutputPaths).toContain(implementationBefore.exchange.outputDirectory);
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "003")).exists()).toBe(false);
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "003")).exists()).toBe(false);
     const replacement003 = await issueReplacementTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       interruptedTicketId: "002",
     });
     expect(replacement003.ticket.metadata.ticketId).toBe("003");
-    expect(await deriveCurrentCandidate(repository.root, goalId, "001")).toBeUndefined();
+    expect(await deriveCurrentCandidate(repository.project, goalId, "001")).toBeUndefined();
     expect(await readFile(join(implementationBefore.exchange.outputDirectory, "submission.md"), "utf8")).toBe(unpublishedSubmission);
     expect(await Bun.file(join(implementationBefore.exchange.outputDirectory, "repository.bundle")).exists()).toBe(true);
-    const interruptedImplementationReport = await readFile(reportPath(repository.root, goalId, "001", "002"), "utf8");
+    const interruptedImplementationReport = await readFile(reportPath(repository.project, goalId, "001", "002"), "utf8");
 
     const implementationAfter = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "003",
@@ -214,8 +201,7 @@ describe("crash-point recovery", () => {
     });
     await expect(
       publishImplementationReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "003",
         execution: implementationAfter.execution,
@@ -223,19 +209,18 @@ describe("crash-point recovery", () => {
         crash: crashAt("implementation-report-publication", "after"),
       }),
     ).rejects.toThrow("injected crash after implementation-report-publication");
-    const implementationReportSource = await readFile(reportPath(repository.root, goalId, "001", "003"), "utf8");
-    expect(await Bun.file(workerRecordPath(repository.root, { goalId, changeId: "001", ticketId: "003" })).exists()).toBe(true);
+    const implementationReportSource = await readFile(reportPath(repository.project, goalId, "001", "003"), "utf8");
+    expect(await Bun.file(workerRecordPath(repository.project, { goalId, changeId: "001", ticketId: "003" })).exists()).toBe(true);
 
-    const implementationAfterRecovery = await reconcileRepository({ cwd: repository.root });
-    const candidate = await deriveCurrentCandidate(repository.root, goalId, "001");
+    const implementationAfterRecovery = await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
+    const candidate = await deriveCurrentCandidate(repository.project, goalId, "001");
     expect(candidate?.producingImplementationTicketId).toBe("003");
     expect(implementationAfterRecovery.goals[0]?.currentCandidates[0]?.candidateRevision).toBe(candidate?.candidateRevision);
-    expect(await Bun.file(workerRecordPath(repository.root, { goalId, changeId: "001", ticketId: "003" })).exists()).toBe(false);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "003"), "utf8")).toBe(implementationReportSource);
+    expect(await Bun.file(workerRecordPath(repository.project, { goalId, changeId: "001", ticketId: "003" })).exists()).toBe(false);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "003"), "utf8")).toBe(implementationReportSource);
 
     const reviewBeforeTicket = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       role: "review",
       instruction: "Review the exact Candidate.",
@@ -244,6 +229,7 @@ describe("crash-point recovery", () => {
     expect(reviewBeforeTicket.ticket.metadata.ticketId).toBe("004");
     const reviewBefore = await dispatchLocalReview({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "004",
@@ -252,19 +238,17 @@ describe("crash-point recovery", () => {
     });
     await expect(
       publishReviewReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "004",
         execution: reviewBefore.execution,
         crash: crashAt("review-report-publication", "before"),
       }),
     ).rejects.toThrow("injected crash before review-report-publication");
-    await reconcileRepository({ cwd: repository.root });
-    expect(await Bun.file(ticketPath(repository.root, goalId, "001", "005")).exists()).toBe(false);
+    await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
+    expect(await Bun.file(ticketPath(repository.project, goalId, "001", "005")).exists()).toBe(false);
     const replacement005 = await issueReplacementTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       interruptedTicketId: "004",
     });
@@ -273,10 +257,11 @@ describe("crash-point recovery", () => {
       replacesTicketId: "004",
       inputRevision: candidate?.candidateRevision,
     });
-    const interruptedReviewReport = await readFile(reportPath(repository.root, goalId, "001", "004"), "utf8");
+    const interruptedReviewReport = await readFile(reportPath(repository.project, goalId, "001", "004"), "utf8");
 
     const reviewAfter = await dispatchLocalReview({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "005",
@@ -285,18 +270,17 @@ describe("crash-point recovery", () => {
     });
     await expect(
       publishReviewReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "005",
         execution: reviewAfter.execution,
         crash: crashAt("review-report-publication", "after"),
       }),
     ).rejects.toThrow("injected crash after review-report-publication");
-    const reviewReportSource = await readFile(reportPath(repository.root, goalId, "001", "005"), "utf8");
-    expect(await Bun.file(workerRecordPath(repository.root, { goalId, changeId: "001", ticketId: "005" })).exists()).toBe(true);
-    await reconcileRepository({ cwd: repository.root });
-    expect(await Bun.file(workerRecordPath(repository.root, { goalId, changeId: "001", ticketId: "005" })).exists()).toBe(false);
+    const reviewReportSource = await readFile(reportPath(repository.project, goalId, "001", "005"), "utf8");
+    expect(await Bun.file(workerRecordPath(repository.project, { goalId, changeId: "001", ticketId: "005" })).exists()).toBe(true);
+    await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
+    expect(await Bun.file(workerRecordPath(repository.project, { goalId, changeId: "001", ticketId: "005" })).exists()).toBe(false);
 
     if (candidate === undefined) throw new Error("authoritative Candidate was not recovered");
     const candidateTree = await repository.git("rev-parse", `${candidate.candidateRevision}^{tree}`);
@@ -309,43 +293,40 @@ describe("crash-point recovery", () => {
       "Unreviewed projection debris",
     );
     await repository.git("update-ref", integratedRef(goalId), unreviewedRevision);
-    await reconcileRepository({ cwd: repository.root });
+    await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
 
     await expect(
       landChange({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         crash: crashAt("change-decision-publication", "before"),
       }),
     ).rejects.toThrow("injected crash before change-decision-publication");
-    expect(await Bun.file(changeDecisionPath(repository.root, goalId, "001")).exists()).toBe(false);
+    expect(await Bun.file(changeDecisionPath(repository.project, goalId, "001")).exists()).toBe(false);
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
 
     await expect(
       landChange({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         crash: crashAt("change-decision-publication", "after"),
       }),
     ).rejects.toThrow("injected crash after change-decision-publication");
-    const decisionSource = await readFile(changeDecisionPath(repository.root, goalId, "001"), "utf8");
+    const decisionSource = await readFile(changeDecisionPath(repository.project, goalId, "001"), "utf8");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(repository.head);
-    await expect(landChange({ cwd: repository.root, goalId, changeId: "001" })).rejects.toThrow("already has a terminal decision");
+    await expect(landChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001" })).rejects.toThrow("already has a terminal decision");
 
-    await reconcileRepository({ cwd: repository.root });
+    await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(candidate.candidateRevision);
-    expect(await readFile(changeDecisionPath(repository.root, goalId, "001"), "utf8")).toBe(decisionSource);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "002"), "utf8")).toBe(interruptedImplementationReport);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "003"), "utf8")).toBe(implementationReportSource);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "004"), "utf8")).toBe(interruptedReviewReport);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "005"), "utf8")).toBe(reviewReportSource);
+    expect(await readFile(changeDecisionPath(repository.project, goalId, "001"), "utf8")).toBe(decisionSource);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "002"), "utf8")).toBe(interruptedImplementationReport);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "003"), "utf8")).toBe(implementationReportSource);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "004"), "utf8")).toBe(interruptedReviewReport);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "005"), "utf8")).toBe(reviewReportSource);
     await expect(
       publishReviewReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId: "005",
         execution: reviewAfter.execution,
@@ -353,8 +334,7 @@ describe("crash-point recovery", () => {
     ).rejects.toThrow("immutable Report already exists");
 
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Reserve a crashed Ticket ID",
       intent: "Prove pre-publication Ticket IDs are not reused.",
       rationale: "A prepared immutable parent directory burns the sequence number.",
@@ -362,19 +342,17 @@ describe("crash-point recovery", () => {
     });
     await expect(
       issueTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "002",
         instruction: "Crash immediately before Ticket publication.",
         executionPolicy: policy,
         crash: crashAt("ticket-issuance", "before"),
       }),
     ).rejects.toThrow("injected crash before ticket-issuance");
-    expect(await Bun.file(ticketPath(repository.root, goalId, "002", "001")).exists()).toBe(false);
-    await reconcileRepository({ cwd: repository.root });
+    expect(await Bun.file(ticketPath(repository.project, goalId, "002", "001")).exists()).toBe(false);
+    await reconcileRepository({ cwd: repository.root, hostPaths: repository.hostPaths });
     const retriedTicket = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "002",
       instruction: "Retry in a fresh Ticket.",
       executionPolicy: policy,

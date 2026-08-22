@@ -1,10 +1,13 @@
 import { deriveGoalIntegratedRevision, listChangeIds, loadChange, loadChangeDecisionIfPresent } from "./change.ts";
+import type { HostPaths } from "./data-root.ts";
+import type { ProjectPaths } from "./project.ts";
 import { discoverRepository } from "./git.ts";
 import { loadGoal } from "./goal.ts";
 import { loadGuidance, guidanceStepSchema, type Guidance, type GuidanceStep } from "./guidance.ts";
 
 export type SelectGuidanceInput = {
   cwd: string;
+  hostPaths: HostPaths;
   step: GuidanceStep;
   goalId?: string;
   changeId?: string;
@@ -18,11 +21,11 @@ function requireIdentity(value: string | undefined, option: "--goal" | "--change
   return value;
 }
 
-async function integratedRevision(root: string, goalId: string): Promise<string> {
+async function integratedRevision(root: ProjectPaths, goalId: string): Promise<string> {
   return deriveGoalIntegratedRevision(root, goalId);
 }
 
-async function recoverRevision(root: string, goalId: string): Promise<string> {
+async function recoverRevision(root: ProjectPaths, goalId: string): Promise<string> {
   await loadGoal(root, goalId);
   const active: string[] = [];
   for (const changeId of await listChangeIds(root, goalId)) {
@@ -36,7 +39,7 @@ async function recoverRevision(root: string, goalId: string): Promise<string> {
 
 export async function selectGuidance(input: SelectGuidanceInput): Promise<Guidance> {
   const step = guidanceStepSchema.parse(input.step);
-  const repository = await discoverRepository(input.cwd);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
 
   let revision: string;
   if (step === "goal") {
@@ -48,12 +51,12 @@ export async function selectGuidance(input: SelectGuidanceInput): Promise<Guidan
     if (input.changeId !== undefined) throw new Error(`${step} guidance does not accept --change`);
     const goalId = requireIdentity(input.goalId, "--goal");
     revision = step === "recover"
-      ? await recoverRevision(repository.root, goalId)
-      : await integratedRevision(repository.root, goalId);
+      ? await recoverRevision(repository, goalId)
+      : await integratedRevision(repository, goalId);
   } else if (changeSteps.has(step)) {
     const goalId = requireIdentity(input.goalId, "--goal");
     const changeId = requireIdentity(input.changeId, "--change");
-    revision = (await loadChange(repository.root, goalId, changeId)).metadata.baseRevision;
+    revision = (await loadChange(repository, goalId, changeId)).metadata.baseRevision;
   } else {
     throw new Error(`unsupported guidance step: ${step}`);
   }

@@ -1,4 +1,6 @@
 import { dirname, join } from "node:path";
+import type { HostPaths } from "./data-root.ts";
+import type { ProjectPaths } from "./project.ts";
 import { z } from "zod";
 import { changePath, changeStatus, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
@@ -75,6 +77,7 @@ export type TicketStatus = "open" | "reported";
 
 export type IssueTicketInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   changeId: string;
   role?: "implement" | "review";
@@ -91,11 +94,13 @@ export type IssueTicketInput = {
 
 export type IssuedTicket = {
   root: string;
+  project: ProjectPaths;
   ticket: Ticket;
 };
 
 export type IssueReplacementTicketInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   changeId: string;
   interruptedTicketId: string;
@@ -103,15 +108,15 @@ export type IssueReplacementTicketInput = {
   crash?: CrashInjector;
 };
 
-function ticketsPath(root: string, goalId: string, changeId: string): string {
+function ticketsPath(root: ProjectPaths, goalId: string, changeId: string): string {
   return join(dirname(changePath(root, goalId, changeId)), "tickets");
 }
 
-export function ticketPath(root: string, goalId: string, changeId: string, ticketId: string): string {
+export function ticketPath(root: ProjectPaths, goalId: string, changeId: string, ticketId: string): string {
   return join(ticketsPath(root, goalId, changeId), ticketId, "ticket.md");
 }
 
-export function reportPath(root: string, goalId: string, changeId: string, ticketId: string): string {
+export function reportPath(root: ProjectPaths, goalId: string, changeId: string, ticketId: string): string {
   return join(ticketsPath(root, goalId, changeId), ticketId, "report.md");
 }
 
@@ -121,8 +126,8 @@ function requireText(value: string, label: string): string {
   return normalized;
 }
 
-async function allocatedTicketIds(root: string, goalId: string, changeId: string): Promise<string[]> {
-  return (await listDirectoryNames(root, ticketsPath(root, goalId, changeId)))
+async function allocatedTicketIds(root: ProjectPaths, goalId: string, changeId: string): Promise<string[]> {
+  return (await listDirectoryNames(root.controlRoot, ticketsPath(root, goalId, changeId)))
     .filter((name) => sequenceIdPattern.test(name))
     .sort();
 }
@@ -133,9 +138,9 @@ function nextTicketId(ids: string[]): string {
   return String(maximum + 1).padStart(3, "0");
 }
 
-async function openTicketId(root: string, goalId: string, changeId: string): Promise<string | undefined> {
+async function openTicketId(root: ProjectPaths, goalId: string, changeId: string): Promise<string | undefined> {
   for (const ticketId of await allocatedTicketIds(root, goalId, changeId)) {
-    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    if (!(await documentExists(root.controlRoot, ticketPath(root, goalId, changeId, ticketId)))) continue;
     if ((await ticketStatus(root, goalId, changeId, ticketId)) === "open") return ticketId;
   }
   return undefined;
@@ -184,11 +189,11 @@ ${context === undefined || !context.trim() ? "None." : context.trim()}
 ${relevantReport === undefined ? "" : `### ${relevantReport.heading}\n\n${relevantReport.document.trimEnd()}\n`}`;
 }
 
-export async function listTicketIds(root: string, goalId: string, changeId: string): Promise<string[]> {
+export async function listTicketIds(root: ProjectPaths, goalId: string, changeId: string): Promise<string[]> {
   const ticketIds = await allocatedTicketIds(root, goalId, changeId);
   const published: string[] = [];
   for (const ticketId of ticketIds) {
-    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    if (!(await documentExists(root.controlRoot, ticketPath(root, goalId, changeId, ticketId)))) continue;
     await loadTicket(root, goalId, changeId, ticketId);
     published.push(ticketId);
   }
@@ -212,8 +217,8 @@ export async function loadTicketDocument(root: string, path: string): Promise<Ti
   return parseTicketDocument(await readDocument(root, path));
 }
 
-export async function loadTicket(root: string, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
-  const ticket = await loadTicketDocument(root, ticketPath(root, goalId, changeId, ticketId));
+export async function loadTicket(root: ProjectPaths, goalId: string, changeId: string, ticketId: string): Promise<Ticket> {
+  const ticket = await loadTicketDocument(root.controlRoot, ticketPath(root, goalId, changeId, ticketId));
   const { metadata } = ticket;
   if (metadata.goalId !== goalId || metadata.changeId !== changeId || metadata.ticketId !== ticketId) {
     throw new Error(
@@ -228,7 +233,7 @@ export async function loadTicket(root: string, goalId: string, changeId: string,
 }
 
 export async function ticketStatus(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   ticketId: string,
@@ -238,7 +243,7 @@ export async function ticketStatus(
 }
 
 export async function loadOpenTicket(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<Ticket | undefined> {
@@ -247,14 +252,14 @@ export async function loadOpenTicket(
 }
 
 export async function loadReplacementTicketIfPresent(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   interruptedTicketId: string,
 ): Promise<Ticket | undefined> {
   let replacement: Ticket | undefined;
   for (const ticketId of await allocatedTicketIds(root, goalId, changeId)) {
-    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    if (!(await documentExists(root.controlRoot, ticketPath(root, goalId, changeId, ticketId)))) continue;
     const ticket = await loadTicket(root, goalId, changeId, ticketId);
     if (ticket.metadata.replacesTicketId !== interruptedTicketId) continue;
     if (replacement !== undefined) {
@@ -266,17 +271,17 @@ export async function loadReplacementTicketIfPresent(
 }
 
 export async function issueReplacementTicket(input: IssueReplacementTicketInput): Promise<IssuedTicket> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const [change, interrupted] = await Promise.all([
-    loadChange(repository.root, input.goalId, input.changeId),
-    loadTicket(repository.root, input.goalId, input.changeId, input.interruptedTicketId),
+    loadChange(repository, input.goalId, input.changeId),
+    loadTicket(repository, input.goalId, input.changeId, input.interruptedTicketId),
   ]);
-  if ((await changeStatus(repository.root, input.goalId, input.changeId)) === "resolved") {
+  if ((await changeStatus(repository, input.goalId, input.changeId)) === "resolved") {
     throw new Error(`Change ${input.goalId}/${input.changeId} is resolved`);
   }
   const interruptedReport = await loadReportIfPresent(
-    repository.root,
+    repository,
     input.goalId,
     input.changeId,
     input.interruptedTicketId,
@@ -288,7 +293,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
     throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.interruptedTicketId} was not interrupted`);
   }
 
-  const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  const candidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
   const inputRevision = candidate?.candidateRevision ?? change.metadata.baseRevision;
   if (interrupted.metadata.inputRevision !== inputRevision) {
     throw new Error("interrupted Ticket does not start from the latest committed Candidate or Change base");
@@ -301,7 +306,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
       throw new Error("interrupted review Ticket does not select the latest committed Candidate");
     }
   } else if (candidate !== undefined) {
-    const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
+    const responseToReview = await deriveCurrentReview(repository, input.goalId, input.changeId);
     if (
       responseToReview === undefined ||
       responseToReview.reviewReport.metadata.verdict === "approve" ||
@@ -313,7 +318,7 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
   }
 
   const existing = await loadReplacementTicketIfPresent(
-    repository.root,
+    repository,
     input.goalId,
     input.changeId,
     input.interruptedTicketId,
@@ -341,14 +346,14 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
     ) {
       throw new Error("existing replacement implementation Ticket selects different review provenance");
     }
-    return { root: repository.root, ticket: existing };
+    return { root: repository.root, project: repository, ticket: existing };
   }
 
-  const currentOpenTicket = await openTicketId(repository.root, input.goalId, input.changeId);
+  const currentOpenTicket = await openTicketId(repository, input.goalId, input.changeId);
   if (currentOpenTicket !== undefined) {
     throw new Error(`Change ${input.goalId}/${input.changeId} already has open Ticket ${currentOpenTicket}`);
   }
-  const ticketId = nextTicketId(await allocatedTicketIds(repository.root, input.goalId, input.changeId));
+  const ticketId = nextTicketId(await allocatedTicketIds(repository, input.goalId, input.changeId));
   const metadata = ticketSchema.parse({
     ...interrupted.metadata,
     ticketId,
@@ -357,27 +362,27 @@ export async function issueReplacementTicket(input: IssueReplacementTicketInput)
     replacesTicketId: input.interruptedTicketId,
   });
   await installImmutable(
-    repository.root,
-    ticketPath(repository.root, input.goalId, input.changeId, ticketId),
+    repository.controlRoot,
+    ticketPath(repository, input.goalId, input.changeId, ticketId),
     serializeDocument(metadata, interrupted.body),
     commitCrashHooks(input.crash, "ticket-issuance"),
   );
-  return { root: repository.root, ticket: { metadata, body: interrupted.body } };
+  return { root: repository.root, project: repository, ticket: { metadata, body: interrupted.body } };
 }
 
 export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const [goal, change, plan] = await Promise.all([
-    loadGoal(repository.root, input.goalId),
-    loadChange(repository.root, input.goalId, input.changeId),
-    loadPlan(repository.root, input.goalId),
+    loadGoal(repository, input.goalId),
+    loadChange(repository, input.goalId, input.changeId),
+    loadPlan(repository, input.goalId),
   ]);
 
-  if ((await changeStatus(repository.root, input.goalId, input.changeId)) === "resolved") {
+  if ((await changeStatus(repository, input.goalId, input.changeId)) === "resolved") {
     throw new Error(`Change ${input.goalId}/${input.changeId} is resolved`);
   }
-  const currentOpenTicket = await openTicketId(repository.root, input.goalId, input.changeId);
+  const currentOpenTicket = await openTicketId(repository, input.goalId, input.changeId);
   if (currentOpenTicket !== undefined) {
     throw new Error(`Change ${input.goalId}/${input.changeId} already has open Ticket ${currentOpenTicket}`);
   }
@@ -403,7 +408,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   let responseToReviewTicketId: string | undefined;
   let relevantReport: { heading: string; document: string } | undefined;
   if (role === "review") {
-    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    const candidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
     if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
     if (
       input.producingImplementationTicketId !== undefined &&
@@ -426,14 +431,14 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     if (input.producingImplementationTicketId !== undefined) {
       throw new Error("implement Ticket must not reference a producing implementation Ticket");
     }
-    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    const candidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
     if (candidate === undefined) {
       if (input.responseToReviewTicketId !== undefined) {
         throw new Error("initial implement Ticket must not reference a prior review Ticket");
       }
       derivedRevision = change.metadata.baseRevision;
     } else {
-      const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
+      const responseToReview = await deriveCurrentReview(repository, input.goalId, input.changeId);
       if (responseToReview === undefined) {
         throw new Error(`current Candidate ${candidate.candidateRevision} has no exact review Report`);
       }
@@ -458,7 +463,7 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   const inputRevision = await git(repository.root, ["rev-parse", "--verify", `${derivedRevision}^{commit}`]);
   if (inputRevision !== derivedRevision) throw new Error("Ticket input revision must identify a commit exactly");
 
-  const ticketId = nextTicketId(await allocatedTicketIds(repository.root, input.goalId, input.changeId));
+  const ticketId = nextTicketId(await allocatedTicketIds(repository, input.goalId, input.changeId));
   const guidanceStep = role === "review" ? "review" : responseToReviewTicketId === undefined ? "implement" : "remediate";
   const guidance = await loadGuidance(repository.root, guidanceStep, change.metadata.baseRevision);
   const metadata = ticketSchema.parse({
@@ -479,10 +484,10 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
   const body = ticketBody(role, instruction, goal.body, change.body, plan.body, guidance, input.curatedContext, relevantReport);
 
   await installImmutable(
-    repository.root,
-    ticketPath(repository.root, input.goalId, input.changeId, ticketId),
+    repository.controlRoot,
+    ticketPath(repository, input.goalId, input.changeId, ticketId),
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, "ticket-issuance"),
   );
-  return { root: repository.root, ticket: { metadata, body } };
+  return { root: repository.root, project: repository, ticket: { metadata, body } };
 }

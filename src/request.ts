@@ -1,7 +1,7 @@
 import { lstat, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { z } from "zod";
-import { spikeDataRoot } from "./data-root.ts";
+import type { HostPaths } from "./data-root.ts";
 import { documentExists, installImmutable, listDirectoryNames, readDocument, serializeDocument } from "./durable-state.ts";
 import { projectSlugPattern } from "./identity.ts";
 
@@ -29,8 +29,6 @@ export type RequestState = "open" | "closed";
 export type RequestView = Request & { state: RequestState; closure: RequestClosure | null };
 /** Lightweight Inbox projection; full documents remain available through loadRequest. */
 export type RequestSummary = { metadata: Request["metadata"]; title: string; state: RequestState };
-
-export const requestDataRoot = spikeDataRoot;
 
 /** Ensure an absolute selected root is a real directory before it is used. */
 async function prepareRoot(root: string, create = false): Promise<boolean> {
@@ -98,11 +96,11 @@ function nextId(ids: string[]): string {
   return `request-${String(highest + 1).padStart(3, "0")}`;
 }
 
-export async function createRequest(input: { title: string; statement: string; projects?: string[]; root?: string; now?: Date }): Promise<RequestView> {
+export async function createRequest(input: { hostPaths: HostPaths; title: string; statement: string; projects?: string[]; now?: Date }): Promise<RequestView> {
   const title = requestTitle(input.title);
   const statement = text(input.statement, "Request statement");
   const projects = (input.projects ?? []).map((project) => text(project, "Project slug"));
-  const root = input.root === undefined ? requestDataRoot() : resolve(input.root);
+  const root = resolve(input.hostPaths.dataRoot);
   const checkedProjects = requestSchema.shape.projects.parse(projects);
   await prepareRoot(root, true);
   const createdAt = (input.now ?? new Date()).toISOString();
@@ -138,9 +136,9 @@ export async function loadRequest(rootInput: string, requestId: string): Promise
   return { metadata, body: requestDocument.body, state: "closed", closure: { metadata: closureMetadata, body: closureDocument.body } };
 }
 
-export async function listRequests(input: { root?: string; project?: string; unassigned?: boolean; closed?: boolean }): Promise<RequestSummary[]> {
+export async function listRequests(input: { hostPaths: HostPaths; project?: string; unassigned?: boolean; closed?: boolean }): Promise<RequestSummary[]> {
   if (input.project !== undefined && input.unassigned) throw new Error("--project cannot be combined with --unassigned");
-  const root = input.root === undefined ? requestDataRoot() : resolve(input.root);
+  const root = resolve(input.hostPaths.dataRoot);
   const project = input.project === undefined ? undefined : z.string().regex(projectSlugPattern).parse(input.project);
   if (!(await prepareRoot(root))) return [];
   const views = await Promise.all((await allocatedIds(root)).map((requestId) => loadRequest(root, requestId)));
@@ -150,8 +148,8 @@ export async function listRequests(input: { root?: string; project?: string; una
     .map((view) => ({ metadata: view.metadata, title: titleFromBody(view.body), state: view.state }));
 }
 
-export async function closeRequest(input: { requestId: string; disposition: ClosureDisposition; statement: string; root?: string; now?: Date }): Promise<RequestView> {
-  const root = input.root === undefined ? requestDataRoot() : resolve(input.root);
+export async function closeRequest(input: { hostPaths: HostPaths; requestId: string; disposition: ClosureDisposition; statement: string; now?: Date }): Promise<RequestView> {
+  const root = resolve(input.hostPaths.dataRoot);
   const statement = text(input.statement, "Closure statement");
   const disposition = closureSchema.shape.disposition.parse(input.disposition);
   const view = await loadRequest(root, input.requestId);

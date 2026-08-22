@@ -11,22 +11,19 @@ workerAdapterContract({
   async createTicket() {
     const repository = await temporaryRepository();
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Worker adapter contract",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Worker adapter contract",
       outcome: "Exercise adapter-owned runtime behavior.",
       approval: "Approved.",
     });
     await createChange({
-      cwd: repository.root,
-      goalId: goal.goal.metadata.goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId,
       title: "Exercise local clone",
       intent: "Run the shared Worker adapter contract.",
       rationale: "The contract must use real dispatch and evidence.",
       acceptanceCriteria: ["The adapter contract is executable."],
     });
     const issued = await issueTicket({
-      cwd: repository.root,
-      goalId: goal.goal.metadata.goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId,
       changeId: "001",
       instruction: "Execute the scripted adapter contract.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
@@ -35,6 +32,8 @@ workerAdapterContract({
     });
     return {
       root: repository.root,
+      hostPaths: repository.hostPaths,
+      project: repository.project,
       identity: { goalId: goal.goal.metadata.goalId, changeId: "001", ticketId: issued.ticket.metadata.ticketId },
       revision: issued.ticket.metadata.inputRevision,
       remove: repository.remove,

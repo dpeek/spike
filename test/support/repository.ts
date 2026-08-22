@@ -1,7 +1,9 @@
+import { onTestFinished } from "bun:test";
 import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { resolveProject } from "../../src/project.ts";
+import type { HostPaths } from "../../src/data-root.ts";
+import { resolveProject, type ProjectPaths } from "../../src/project.ts";
 
 export const fixtureGuidance = {
   goal: "# Fixture Goal guidance\n\nRequire explicit operator approval.\n",
@@ -40,6 +42,8 @@ export async function temporaryRepository(): Promise<{
   head: string;
   git: (...args: string[]) => Promise<string>;
   dataRoot: string;
+  hostPaths: HostPaths;
+  project: ProjectPaths;
   projectRoot: string;
   remove: () => Promise<void>;
 }> {
@@ -48,7 +52,6 @@ export async function temporaryRepository(): Promise<{
   // prevents unrelated test repositories with the same tracked slug from
   // colliding, while keeping all workflow state at projects/<slug>/.
   const dataRoot = await realpath(await mkdtemp(join(tmpdir(), "spike-test-data-")));
-  process.env["SPIKE_DATA_DIR"] = dataRoot;
   await git(root, "init", "--quiet");
   await git(root, "config", "user.name", "Spike Test");
   await git(root, "config", "user.email", "spike@example.test");
@@ -76,22 +79,26 @@ export async function temporaryRepository(): Promise<{
   ]);
   await git(root, "add", "README.md", "spike.json", "spike/guidance");
   await git(root, "commit", "--quiet", "-m", "Initial fixture");
-  // Resolve once in this test realm as well as in any spawned CLI process so
-  // synchronous path helpers consistently point at this fixture's Project.
-  await resolveProject(root);
+  const hostPaths = { dataRoot };
+  const project = await resolveProject(root, hostPaths);
+  let removed = false;
+  const remove = async () => {
+    if (removed) return;
+    removed = true;
+    // Remove the checkout first. A just-finished worker can still be closing
+    // repository handles while publishing its final central marker.
+    await removeTree(root);
+    await removeTree(dataRoot);
+  };
+  onTestFinished(remove);
   return {
     root,
     head: await git(root, "rev-parse", "HEAD"),
     git: (...args) => git(root, ...args),
     dataRoot,
+    hostPaths,
+    project,
     projectRoot: join(dataRoot, "projects", "spike"),
-    remove: async () => {
-      // Remove the checkout first. A just-finished worker can still be closing
-      // repository handles while publishing its final central marker; deleting
-      // both trees concurrently races that publication on macOS.
-      await removeTree(root);
-      await removeTree(dataRoot);
-      if (process.env["SPIKE_DATA_DIR"] === dataRoot) delete process.env["SPIKE_DATA_DIR"];
-    },
+    remove,
   };
 }

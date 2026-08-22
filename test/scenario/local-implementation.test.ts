@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { serializeDocument } from "../../src/durable-state.ts";
@@ -8,13 +8,6 @@ import { reportPath } from "../../src/ticket.ts";
 import { dispatchLocalImplementation } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const workerSource = String.raw`
 import { createHash } from "node:crypto";
@@ -63,7 +56,6 @@ if (bundleCode !== 0) throw new Error(bundleError);
 
 async function fixture() {
   const repository = await temporaryRepository();
-  repositories.push(repository);
   const goalId = "spike-001";
   const ticketId = "001";
   const baseRevision = repository.head;
@@ -116,6 +108,7 @@ async function fixture() {
 
   const dispatched = await dispatchLocalImplementation({
     cwd: repository.root,
+    hostPaths: repository.hostPaths,
     goalId,
     changeId: "001",
     ticketId,
@@ -150,8 +143,7 @@ describe("host-local implementation exchange", () => {
     const validSubmission = await readFile(join(output, "submission.md"), "utf8");
     const publication = () =>
       publishImplementationReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId,
         execution: dispatched.execution,
@@ -168,7 +160,7 @@ describe("host-local implementation exchange", () => {
     renamed.project.slug = "renamed";
     await writeFile(configPath, `${JSON.stringify(renamed)}\n`);
     await expect(publication()).rejects.toThrow("Goal spike-001 does not belong to Project renamed");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", ticketId)).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", ticketId)).exists()).toBe(false);
     await writeFile(configPath, configured);
 
     await writeFile(join(output, "repository.bundle"), "not a Git bundle\n");
@@ -179,7 +171,7 @@ describe("host-local implementation exchange", () => {
       validSubmission.replace(/"workerRevision": "[0-9a-f]+"/, `"workerRevision": "${baseRevision}"`),
     );
     await expect(publication()).rejects.toThrow("does not advertise worker revision");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", ticketId)).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", ticketId)).exists()).toBe(false);
     await expect(repository.git("rev-parse", "--verify", candidateRef(goalId, "001", ticketId))).rejects.toThrow();
     await writeFile(join(output, "submission.md"), validSubmission);
 
@@ -204,7 +196,7 @@ describe("host-local implementation exchange", () => {
     expect(await repository.git("rev-parse", candidateRef(goalId, "001", ticketId))).toBe(
       report.metadata.candidateRevision,
     );
-    expect((await loadReport(repository.root, goalId, "001", ticketId)).body).toContain(
+    expect((await loadReport(repository.project, goalId, "001", ticketId)).body).toContain(
       "## Verification\n\nControlled verification passed.",
     );
     expect(report.metadata.artifacts).toHaveLength(1);
@@ -220,8 +212,7 @@ describe("host-local implementation exchange", () => {
 
     await expect(
       publishImplementationReport({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         ticketId,
         execution: dispatched.execution,

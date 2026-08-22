@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -20,13 +20,6 @@ import { issueTicket, reportPath, ticketPath } from "../../src/ticket.ts";
 import { dispatchLocalImplementation, dispatchLocalReview } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const worker = String.raw`
 import { createHash } from "node:crypto";
@@ -86,31 +79,28 @@ const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" 
 
 async function implementedChange() {
   const repository = await temporaryRepository();
-  repositories.push(repository);
   const goal = await createGoal({
-    cwd: repository.root,
-    title: "Resolve a Change",
+    cwd: repository.root, hostPaths: repository.hostPaths, title: "Resolve a Change",
     outcome: "Resolve work without advancing integrated history.",
     approval: "Approved.",
   });
   const goalId = goal.goal.metadata.goalId;
   const change = await createChange({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     title: "Evaluate a proposal",
     intent: "Produce durable evidence before resolving the Change.",
     rationale: "Terminal decisions must preserve attempted work.",
     acceptanceCriteria: ["The proposal is suitable for integration."],
   });
   await issueTicket({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     changeId: "001",
     instruction: "Produce the proposal Candidate.",
     executionPolicy: policy,
   });
   const execution = await dispatchLocalImplementation({
     cwd: repository.root,
+    hostPaths: repository.hostPaths,
     goalId,
     changeId: "001",
     ticketId: "001",
@@ -118,8 +108,7 @@ async function implementedChange() {
     worker: "controlled-implementer",
   });
   const publication = await publishImplementationReport({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     changeId: "001",
     ticketId: "001",
     execution: execution.execution,
@@ -140,6 +129,7 @@ async function reviewImplementedChange(
 ) {
   await issueTicket({
     cwd: implemented.repository.root,
+    hostPaths: implemented.repository.hostPaths,
     goalId: implemented.goalId,
     changeId: "001",
     role: "review",
@@ -148,6 +138,7 @@ async function reviewImplementedChange(
   });
   const execution = await dispatchLocalReview({
     cwd: implemented.repository.root,
+    hostPaths: implemented.repository.hostPaths,
     goalId: implemented.goalId,
     changeId: "001",
     ticketId: "002",
@@ -156,6 +147,7 @@ async function reviewImplementedChange(
   });
   return publishReviewReport({
     cwd: implemented.repository.root,
+    hostPaths: implemented.repository.hostPaths,
     goalId: implemented.goalId,
     changeId: "001",
     ticketId: "002",
@@ -192,8 +184,7 @@ async function expectHostUnchanged(
 
 async function nextChange(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string) {
   return createChange({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     title: "Try a different direction",
     intent: "Continue under the next monotonic Change identity.",
     rationale: "Resolved Changes are never reopened.",
@@ -209,6 +200,7 @@ describe("Change rejection and abandonment", () => {
 
     const response = await issueTicket({
       cwd: implemented.repository.root,
+      hostPaths: implemented.repository.hostPaths,
       goalId: implemented.goalId,
       changeId: "001",
       instruction: "Try a different implementation direction.",
@@ -231,7 +223,7 @@ describe("Change rejection and abandonment", () => {
     const review = await reviewImplementedChange(implemented, askOperatorWorker);
     expect(review.report.metadata.verdict).toBe("ask-operator");
 
-    const status = await deriveGoalStatus(implemented.repository.root, implemented.goalId);
+    const status = await deriveGoalStatus(implemented.repository.root, implemented.repository.hostPaths, implemented.goalId);
     expect(status.currentChange?.review).toMatchObject({
       ticketId: "002",
       verdict: "ask-operator",
@@ -244,12 +236,11 @@ describe("Change rejection and abandonment", () => {
     const { repository, goalId, baseRevision, candidateRevision, artifactPath } = await implementedChange();
 
     await expect(
-      rejectChange({ cwd: repository.root, goalId, changeId: "001", statement: "Reject the direction." }),
+      rejectChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001", statement: "Reject the direction." }),
     ).rejects.toThrow(`current Candidate ${candidateRevision} has no exact reject review Report`);
 
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       role: "review",
       instruction: "Decide whether this Candidate should be integrated or rejected.",
@@ -257,6 +248,7 @@ describe("Change rejection and abandonment", () => {
     });
     const reviewExecution = await dispatchLocalReview({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "002",
@@ -264,14 +256,13 @@ describe("Change rejection and abandonment", () => {
       worker: "independent-rejector",
     });
     const review = await publishReviewReport({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       ticketId: "002",
       execution: reviewExecution.execution,
     });
     expect(review.report.metadata.verdict).toBe("reject");
-    expect(await deriveCurrentRejection(repository.root, goalId, "001")).toMatchObject({
+    expect(await deriveCurrentRejection(repository.project, goalId, "001")).toMatchObject({
       candidateRevision,
       producingImplementationTicketId: "001",
       reviewTicketId: "002",
@@ -280,32 +271,30 @@ describe("Change rejection and abandonment", () => {
 
     await expect(
       rejectChange({
-        cwd: repository.root,
-        goalId: "spike-999",
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId: "spike-999",
         changeId: "001",
         statement: "Wrong Goal identity.",
       }),
     ).rejects.toThrow();
     await expect(
-      rejectChange({ cwd: repository.root, goalId, changeId: "002", statement: "Wrong Change identity." }),
+      rejectChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "002", statement: "Wrong Change identity." }),
     ).rejects.toThrow();
     await expect(
-      rejectChange({ cwd: repository.root, goalId, changeId: "001", statement: "   " }),
+      rejectChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001", statement: "   " }),
     ).rejects.toThrow("Change decision statement must not be blank");
 
     const ticketSources = await Promise.all(["001", "002"].map((ticketId) =>
-      readFile(ticketPath(repository.root, goalId, "001", ticketId), "utf8")
+      readFile(ticketPath(repository.project, goalId, "001", ticketId), "utf8")
     ));
     const reportSources = await Promise.all(["001", "002"].map((ticketId) =>
-      readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
+      readFile(reportPath(repository.project, goalId, "001", ticketId), "utf8")
     ));
     const artifact = await readFile(artifactPath, "utf8");
     const host = await dirtyHost(repository);
     const integratedBefore = await repository.git("rev-parse", integratedRef(goalId));
 
     const rejected = await rejectChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       statement: "The review shows this direction should not enter integrated history.",
       now: new Date("2026-03-23T10:00:00.000Z"),
@@ -317,31 +306,30 @@ describe("Change rejection and abandonment", () => {
       decidedAt: "2026-03-23T10:00:00.000Z",
       disposition: "reject",
     });
-    expect((await loadChangeDecision(repository.root, goalId, "001")).body).toBe(
+    expect((await loadChangeDecision(repository.project, goalId, "001")).body).toBe(
       "The review shows this direction should not enter integrated history.\n",
     );
-    expect(await changeStatus(repository.root, goalId, "001")).toBe("resolved");
+    expect(await changeStatus(repository.project, goalId, "001")).toBe("resolved");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(integratedBefore);
     expect(integratedBefore).toBe(baseRevision);
 
     await expect(
       issueTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         instruction: "Attempt to reopen rejected work.",
         executionPolicy: policy,
       }),
     ).rejects.toThrow("is resolved");
     await expect(
-      abandonChange({ cwd: repository.root, goalId, changeId: "001", statement: "Duplicate terminal decision." }),
+      abandonChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001", statement: "Duplicate terminal decision." }),
     ).rejects.toThrow("already has a terminal decision");
 
     expect(await Promise.all(["001", "002"].map((ticketId) =>
-      readFile(ticketPath(repository.root, goalId, "001", ticketId), "utf8")
+      readFile(ticketPath(repository.project, goalId, "001", ticketId), "utf8")
     ))).toEqual(ticketSources);
     expect(await Promise.all(["001", "002"].map((ticketId) =>
-      readFile(reportPath(repository.root, goalId, "001", ticketId), "utf8")
+      readFile(reportPath(repository.project, goalId, "001", ticketId), "utf8")
     ))).toEqual(reportSources);
     expect(await readFile(artifactPath, "utf8")).toBe(artifact);
     expect(await repository.git("rev-parse", candidateRef(goalId, "001", "001"))).toBe(candidateRevision);

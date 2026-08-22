@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, onTestFinished, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createChange } from "../../src/change.ts";
 import { createGoal } from "../../src/goal.ts";
 import { publishImplementationReport } from "../../src/report.ts";
@@ -11,20 +11,10 @@ import type { CreateHerdrTabInput, HerdrOperations } from "../../src/herdr.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
-const repositories: Array<{ root: string; dataRoot: string; remove: () => Promise<void> }> = [];
-const directories: string[] = [];
-
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
-});
 
 async function fakePi(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "spike-fake-pi-"));
-  directories.push(directory);
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const executable = join(directory, "pi");
   await writeFile(executable, `#!/usr/bin/env bun
 import { readFile, writeFile } from "node:fs/promises";
@@ -75,12 +65,10 @@ console.log('{"kind":"report","outcome":"completed"}');
   return executable;
 }
 
-async function spike(cwd: string, args: string[], environment: Record<string, string> = {}) {
-  const dataRoot = repositories.find((repository) => repository.root === cwd)?.dataRoot;
-  if (dataRoot === undefined) throw new Error(`No controlled Project data root for ${cwd}`);
+async function spike(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[], environment: Record<string, string> = {}) {
   const child = Bun.spawn([spikePath, ...args, "--json"], {
-    cwd,
-    env: { ...process.env, SPIKE_DATA_DIR: dataRoot, ...environment },
+    cwd: repository.root,
+    env: { ...process.env, SPIKE_DATA_DIR: repository.dataRoot, ...environment },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -95,17 +83,14 @@ async function spike(cwd: string, args: string[], environment: Record<string, st
 
 async function issuedRepository() {
   const repository = await temporaryRepository();
-  repositories.push(repository);
   const goal = await createGoal({
-    cwd: repository.root,
-    title: "Dispatch a controlled Pi worker",
+    cwd: repository.root, hostPaths: repository.hostPaths, title: "Dispatch a controlled Pi worker",
     outcome: "Produce exchange output through one frozen launcher.",
     approval: "Approved.",
   });
   const goalId = goal.goal.metadata.goalId;
   await createChange({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     title: "Add Pi dispatch",
     intent: "Launch one fresh Pi worker.",
     rationale: "The planner must not assemble Pi commands.",
@@ -118,9 +103,9 @@ describe("controlled Pi dispatch", () => {
   test("uses headed Pi in Herdr with the immutable prompt and publishes through the standard exchange", async () => {
     const { repository, goalId } = await issuedRepository();
     const pi = await fakePi();
-    const argsPath = join(directories[0]!, "headed-args.json");
+    const argsPath = join(dirname(pi), "headed-args.json");
     const identity = { goalId, changeId: "001", ticketId: "001" };
-    const issued = await spike(repository.root, [
+    const issued = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Implement through headed Pi.",
       "--network-access", "unrestricted", "--model", "frozen-headed-model", "--thinking", "high",
     ]);
@@ -165,8 +150,7 @@ describe("controlled Pi dispatch", () => {
     };
 
     const dispatched = await dispatchPiTicket({
-      cwd: repository.root,
-      ...identity,
+      cwd: repository.root, hostPaths: repository.hostPaths, ...identity,
       worker: "headed-pi-implementer",
       host: "herdr",
       piExecutable: pi,
@@ -191,20 +175,19 @@ describe("controlled Pi dispatch", () => {
     );
     expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/ticket.md`);
     expect(headedArgs).toContain(`@${dispatched.exchange.inputDirectory}/context.md`);
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(false);
 
-    expect(await observeWorker(repository.root, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
-    const execution = await loadFinishedWorkerExecution(repository.root, identity);
+    expect(await observeWorker(repository.project, identity, herdr)).toEqual({ hosting: "herdr", status: "done" });
+    const execution = await loadFinishedWorkerExecution(repository.project, identity);
     expect(execution.exitCode).toBe(0);
     const publication = await publishImplementationReport({
-      cwd: repository.root,
-      ...identity,
+      cwd: repository.root, hostPaths: repository.hostPaths, ...identity,
       execution,
       commitMessage: { summary: "Complete headed Pi dispatch" },
       runtimeOperations: {
         async stop(runtime, _identity) {
           expect(runtime).toMatchObject({ host: "herdr", tab: "headed-tab", pane: "headed-pane" });
-          expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(true);
+          expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(true);
           if ((runtime as { host: string }).host !== "herdr") throw new Error("expected Herdr runtime");
           await herdr.closeTab((runtime as { tab: string }).tab);
         },
@@ -226,10 +209,10 @@ describe("controlled Pi dispatch", () => {
   test("uses the immutable Ticket selection and role tools, then leaves publication explicit", async () => {
     const { repository, goalId } = await issuedRepository();
     const pi = await fakePi();
-    const argsPath = join(directories[0]!, "args.json");
+    const argsPath = join(dirname(pi), "args.json");
     const environment = { SPIKE_PI_BIN: pi, FAKE_PI_ARGS: argsPath };
 
-    const issued = await spike(repository.root, [
+    const issued = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Implement through Pi.",
       "--network-access", "unrestricted", "--model", "frozen-implementation-model", "--thinking", "medium",
     ]);
@@ -237,14 +220,14 @@ describe("controlled Pi dispatch", () => {
     await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
 
     for (const override of ["--model", "--thinking", "--role", "--prompt", "--extension"]) {
-      const rejected = await spike(repository.root, [
+      const rejected = await spike(repository, [
         "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", "pi-implementer", override, "override",
       ], environment);
       expect(rejected.exitCode).toBe(2);
       expect(rejected.output.error.message).toBe(`unknown option: ${override}`);
     }
 
-    const implemented = await spike(repository.root, [
+    const implemented = await spike(repository, [
       "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", "pi-implementer", "--host", "direct",
     ], environment);
     expect(implemented.exitCode).toBe(0);
@@ -263,23 +246,23 @@ describe("controlled Pi dispatch", () => {
     expect(implementationArgs.join(" ")).toContain("spike_complete_implementation");
     expect(implementationArgs.join(" ")).toContain("spike_block_implementation");
     expect(implementationArgs).not.toContain("--continue");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(false);
 
-    const publication = await spike(repository.root, [
+    const publication = await spike(repository, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001", "--commit-summary", "Add controlled Pi dispatch",
     ]);
     expect(publication.exitCode).toBe(0);
     const candidate = publication.output.data.report.candidateRevision as string;
     expect(await repository.git("show", `${candidate}:pi-dispatched.txt`)).toBe("completed by controlled Pi dispatch");
 
-    const reviewIssue = await spike(repository.root, [
+    const reviewIssue = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--role", "review", "--instruction", "Review through Pi.",
       "--network-access", "unrestricted", "--model", "frozen-review-model", "--thinking", "high",
     ]);
     expect(reviewIssue.exitCode).toBe(0);
     await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
 
-    const reviewed = await spike(repository.root, [
+    const reviewed = await spike(repository, [
       "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer", "--host", "direct",
     ], environment);
     expect(reviewed.output).toMatchObject({
@@ -291,9 +274,9 @@ describe("controlled Pi dispatch", () => {
     expect(reviewArgs.join(" ")).toContain("spike_block_review");
     expect(reviewArgs.join(" ")).not.toContain("spike_complete_implementation");
     expect(reviewArgs.join(" ")).not.toContain("spike_block_implementation");
-    expect(await Bun.file(reportPath(repository.root, goalId, "001", "002")).exists()).toBe(false);
+    expect(await Bun.file(reportPath(repository.project, goalId, "001", "002")).exists()).toBe(false);
 
-    const reviewPublication = await spike(repository.root, [
+    const reviewPublication = await spike(repository, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "002",
     ]);
     expect(reviewPublication.output).toMatchObject({ ok: true, data: { report: { outcome: "completed", verdict: "approve" } } });
@@ -303,19 +286,19 @@ describe("controlled Pi dispatch", () => {
     for (const [mode, classification] of [["missing", "missing-submission"], ["failed", "failed-execution"]] as const) {
       const { repository, goalId } = await issuedRepository();
       const pi = await fakePi();
-      await spike(repository.root, [
+      await spike(repository, [
         "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Do not complete.", "--network-access", "unrestricted",
       ]);
-      const dispatched = await spike(repository.root, [
+      const dispatched = await spike(repository, [
         "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", `pi-${mode}`, "--host", "direct",
-      ], { SPIKE_PI_BIN: pi, FAKE_PI_ARGS: join(directories.at(-1)!, "args.json"), FAKE_PI_MODE: mode });
+      ], { SPIKE_PI_BIN: pi, FAKE_PI_ARGS: join(dirname(pi), "args.json"), FAKE_PI_MODE: mode });
       expect(dispatched.exitCode).toBe(0);
       expect(dispatched.output).toMatchObject({
         ok: true,
         data: { classification, execution: { exitCode: mode === "failed" ? 23 : 0 } },
       });
       expect(dispatched.output.data.execution.stdout).toContain('"outcome":"completed"');
-      expect(await Bun.file(reportPath(repository.root, goalId, "001", "001")).exists()).toBe(false);
+      expect(await Bun.file(reportPath(repository.project, goalId, "001", "001")).exists()).toBe(false);
     }
   }, 30_000);
 });

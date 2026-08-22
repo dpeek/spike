@@ -2,7 +2,7 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import { join, parse, resolve, sep } from "node:path";
 import { z } from "zod";
 import { loadProjectIdentity } from "./config.ts";
-import { spikeDataRoot } from "./data-root.ts";
+import type { HostPaths } from "./data-root.ts";
 import { documentExists, installImmutable, readDocument, replaceAtomic, serializeDocument } from "./durable-state.ts";
 import { git } from "./git.ts";
 
@@ -13,24 +13,17 @@ const registrationSchema = z.object({
   kind: z.literal("project"), slug: bounded, identity: bounded, activeCheckout: bounded,
 }).strict();
 export type ProjectRegistration = z.infer<typeof registrationSchema>;
-export type ProjectControlPlane = { repositoryRoot: string; root: string; slug: string; registration: ProjectRegistration };
-const roots = new Map<string, string>();
+export type ProjectPaths = { root: string; controlRoot: string };
+export type ProjectControlPlane = ProjectPaths & { slug: string; registration: ProjectRegistration };
 
-export { spikeDataRoot } from "./data-root.ts";
-export function projectDirectory(slug: string): string { return join(spikeDataRoot(), "projects", slug); }
-export function projectRegistrationPath(slug: string): string { return join(projectDirectory(slug), "project.md"); }
-export function projectRoot(repositoryRoot: string): string {
-  const root = roots.get(resolve(repositoryRoot));
-  if (root === undefined) throw new Error("Project control plane is not resolved; discover the repository first");
-  return root;
-}
+export function projectDirectory(hostPaths: HostPaths, slug: string): string { return join(hostPaths.dataRoot, "projects", slug); }
+export function projectRegistrationPath(hostPaths: HostPaths, slug: string): string { return join(projectDirectory(hostPaths, slug), "project.md"); }
 
 /**
- * Build the selected root one component at a time.  `mkdir({recursive:true})`
- * follows an existing ancestor symlink, so it must never be used for this
- * boundary: a refusal has to happen before it can create anything outside it.
+ * Build the selected root one component at a time. `mkdir({recursive:true})`
+ * follows an existing ancestor symlink, so it must never be used here.
  */
-async function prepareDataRoot(selected = spikeDataRoot()): Promise<string> {
+async function prepareDataRoot(selected: string): Promise<string> {
   const root = resolve(selected);
   const parsed = parse(root);
   let current = parsed.root;
@@ -41,8 +34,6 @@ async function prepareDataRoot(selected = spikeDataRoot()): Promise<string> {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Spike data root contains an unsafe component: ${current}`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      // This creates exactly one lexical component. Re-checking also closes a
-      // replacement race before a caller can publish beneath it.
       try { await mkdir(current, { mode: 0o700 }); } catch (mkdirError) {
         if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
       }
@@ -64,24 +55,24 @@ function registrationDocument(registration: ProjectRegistration): string {
   return document;
 }
 function registrationPath(dataRoot: string, slug: string): string { return join(dataRoot, "projects", slug, "project.md"); }
-async function readRegistration(slug: string, selected?: string): Promise<ProjectRegistration | undefined> {
-  const root = await prepareDataRoot(selected);
-  const path = registrationPath(root, slug);
-  if (!(await documentExists(root, path))) return undefined;
-  const registration = registrationSchema.parse((await readDocument(root, path)).metadata);
+async function readRegistration(hostPaths: HostPaths, slug: string): Promise<ProjectRegistration | undefined> {
+  const dataRoot = await prepareDataRoot(hostPaths.dataRoot);
+  const path = registrationPath(dataRoot, slug);
+  if (!(await documentExists(dataRoot, path))) return undefined;
+  const registration = registrationSchema.parse((await readDocument(dataRoot, path)).metadata);
   if (registration.slug !== slug) throw new Error(`Project registration slug does not match its path: ${slug}`);
   return registration;
 }
-async function claim(root: string, slug: string, identity: string, selected?: string): Promise<ProjectRegistration> {
+async function claim(hostPaths: HostPaths, root: string, slug: string, identity: string): Promise<ProjectRegistration> {
   const activeCheckout = await canonicalCheckout(root);
   const registration = registrationSchema.parse({ kind: "project", slug, identity, activeCheckout });
-  const dataRoot = await prepareDataRoot(selected);
+  const dataRoot = await prepareDataRoot(hostPaths.dataRoot);
   try {
     await installImmutable(dataRoot, registrationPath(dataRoot, slug), registrationDocument(registration));
     return registration;
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes("already exists")) throw error;
-    const existing = await readRegistration(slug, dataRoot);
+    const existing = await readRegistration({ dataRoot }, slug);
     if (existing === undefined) throw error;
     return existing;
   }
@@ -102,31 +93,28 @@ async function verifyGitAuthority(current: string, selected: string): Promise<vo
   }
 }
 /** Resolve and enforce the single active checkout before any workflow side effect. */
-export async function resolveProject(repositoryRoot: string): Promise<ProjectControlPlane> {
+export async function resolveProject(repositoryRoot: string, hostPaths: HostPaths): Promise<ProjectControlPlane> {
   const root = await canonicalCheckout(repositoryRoot);
   const { slug } = await loadProjectIdentity(root);
   const identity = await repositoryIdentity(root);
-  let registration = await readRegistration(slug);
-  if (registration === undefined) registration = await claim(root, slug, identity);
+  let registration = await readRegistration(hostPaths, slug);
+  if (registration === undefined) registration = await claim(hostPaths, root, slug, identity);
   if (registration.identity !== identity) throw new Error(`Project slug ${slug} is registered to a different repository; refusing to change Project state`);
   if (registration.activeCheckout !== root) throw new Error(`Checkout is related to Project ${slug} but inactive; run 'spike project activate' from this checkout`);
-  const controlRoot = projectDirectory(slug); roots.set(root, controlRoot);
-  return { repositoryRoot: root, root: controlRoot, slug, registration };
+  return { root, controlRoot: projectDirectory(hostPaths, slug), slug, registration };
 }
 /** Explicitly claim or select an already-related checkout. */
-export async function activateProject(repositoryRoot: string): Promise<ProjectControlPlane> {
+export async function activateProject(repositoryRoot: string, hostPaths: HostPaths): Promise<ProjectControlPlane> {
   const root = await canonicalCheckout(repositoryRoot);
   const { slug } = await loadProjectIdentity(root);
   const identity = await repositoryIdentity(root);
-  let registration = await readRegistration(slug);
-  if (registration === undefined) registration = await claim(root, slug, identity);
+  let registration = await readRegistration(hostPaths, slug);
+  if (registration === undefined) registration = await claim(hostPaths, root, slug, identity);
   if (registration.identity !== identity) throw new Error(`Project slug ${slug} is registered to a different repository; activation refused`);
   if (registration.activeCheckout !== root) {
-    // This check intentionally precedes both replacement and any project-root creation.
     await verifyGitAuthority(registration.activeCheckout, root);
     registration = registrationSchema.parse({ ...registration, activeCheckout: root });
-    await replaceAtomic(await prepareDataRoot(), projectRegistrationPath(slug), registrationDocument(registration));
+    await replaceAtomic(hostPaths.dataRoot, projectRegistrationPath(hostPaths, slug), registrationDocument(registration));
   }
-  const controlRoot = projectDirectory(slug); roots.set(root, controlRoot);
-  return { repositoryRoot: root, root: controlRoot, slug, registration };
+  return { root, controlRoot: projectDirectory(hostPaths, slug), slug, registration };
 }

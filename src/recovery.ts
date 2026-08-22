@@ -6,7 +6,8 @@ import { candidateRef } from "./git-change.ts";
 import { discoverRepository, git } from "./git.ts";
 import { goalPath, integratedRef, listAllocatedGoalIds, loadGoal } from "./goal.ts";
 import { sequenceIdPattern } from "./identity.ts";
-import { projectRoot } from "./project.ts";
+import type { ProjectPaths } from "./project.ts";
+import type { HostPaths } from "./data-root.ts";
 import { assertGoalNotFrozen, goalApplicationFreeze, listProjectApplications, listPublishedApplicationIds, loadApplicationResolutionIfPresent, recoverApplications } from "./application.ts";
 import { listApplicationTicketIds, recoverApplicationTicket } from "./application-ticket.ts";
 import { listApplicationReviewTicketIds, recoverApplicationReviewTicket } from "./application-review.ts";
@@ -31,6 +32,7 @@ import {
 
 export type StopTicketInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   role: "implement" | "review";
   reason: string;
   now?: Date;
@@ -64,17 +66,17 @@ export async function stopTicket(
   input: StopTicketInput,
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<StoppedTicket> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const reason = terminalReason(input.reason, "Stop");
   const now = input.now ?? new Date();
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.role !== input.role) {
     throw new Error(`stop role ${input.role} does not match Ticket role ${ticket.metadata.role}`);
   }
 
-  let report = await loadReportIfPresent(repository.root, input.goalId, input.changeId, input.ticketId);
+  let report = await loadReportIfPresent(repository, input.goalId, input.changeId, input.ticketId);
   if (report !== undefined && report.metadata.outcome !== "stopped") {
     throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.ticketId} is already reported as ${report.metadata.outcome}`);
   }
@@ -82,7 +84,7 @@ export async function stopTicket(
     throw new Error("immutable stopped Report records a different stop reason");
   }
 
-  const recordedWorker = await loadRecordedWorkerIfPresent(repository.root, identity);
+  const recordedWorker = await loadRecordedWorkerIfPresent(repository, identity);
   let cleanup: StoppedTicket["cleanup"] = { status: "finalized" };
   let execution: ReportExecution;
   if (recordedWorker === undefined) {
@@ -99,7 +101,7 @@ export async function stopTicket(
       exitCode: -1,
     };
   } else {
-    const result = await finalizeWorker(repository.root, identity, now, runtimeOperations);
+    const result = await finalizeWorker(repository, identity, now, runtimeOperations);
     if (result.status === "failed" && result.phase === "stop") {
       throw new Error(`direct worker could not be stopped: ${result.message}`);
     }
@@ -113,6 +115,7 @@ export async function stopTicket(
     report = (
       await publishStoppedReport({
         cwd: repository.root,
+        hostPaths: input.hostPaths,
         ...identity,
         role: input.role,
         reason,
@@ -125,7 +128,7 @@ export async function stopTicket(
 
   if (cleanup.status === "finalized") {
     try {
-      await forgetFinalizedWorker(repository.root, identity);
+      await forgetFinalizedWorker(repository, identity);
     } catch (error) {
       cleanup = { status: "failed", message: error instanceof Error ? error.message : String(error) };
     }
@@ -137,17 +140,17 @@ export async function recoverInterruptedTicket(
   input: RecoverInterruptedTicketInput,
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<InterruptedTicketRecovery> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const reason = interruptionReason(input.reason);
   const now = input.now ?? new Date();
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.role !== input.role) {
     throw new Error(`recovery role ${input.role} does not match Ticket role ${ticket.metadata.role}`);
   }
 
-  let report = await loadReportIfPresent(repository.root, input.goalId, input.changeId, input.ticketId);
+  let report = await loadReportIfPresent(repository, input.goalId, input.changeId, input.ticketId);
   if (report !== undefined && report.metadata.outcome !== "interrupted") {
     throw new Error(`Ticket ${input.goalId}/${input.changeId}/${input.ticketId} is already reported as ${report.metadata.outcome}`);
   }
@@ -158,7 +161,7 @@ export async function recoverInterruptedTicket(
     }
   }
 
-  const recordedWorker = await loadRecordedWorkerIfPresent(repository.root, identity);
+  const recordedWorker = await loadRecordedWorkerIfPresent(repository, identity);
   let cleanup: InterruptedTicketRecovery["cleanup"] = { status: "finalized" };
   let execution: ReportExecution;
   if (recordedWorker === undefined) {
@@ -176,7 +179,7 @@ export async function recoverInterruptedTicket(
     };
   } else {
     const result = await finalizeWorker(
-      repository.root,
+      repository,
       identity,
       now,
       runtimeOperations,
@@ -191,6 +194,7 @@ export async function recoverInterruptedTicket(
     report = (
       await publishInterruptedReport({
         cwd: repository.root,
+        hostPaths: input.hostPaths,
         ...identity,
         role: input.role,
         reason,
@@ -206,7 +210,7 @@ export async function recoverInterruptedTicket(
   const interruptedReport = report as TerminalReport;
   if (cleanup.status === "finalized") {
     try {
-      await forgetFinalizedWorker(repository.root, identity);
+      await forgetFinalizedWorker(repository, identity);
     } catch (error) {
       cleanup = {
         status: "failed",
@@ -220,6 +224,7 @@ export async function recoverInterruptedTicket(
 
 export type ReconcileRepositoryInput = {
   cwd: string;
+  hostPaths: HostPaths;
   reason?: string;
   now?: Date;
   /** Goal planners use local reconciliation only; Application/main recovery is supervisor-owned. */
@@ -251,17 +256,18 @@ export type RepositoryReconciliation = {
  * It intentionally neither admits Applications nor changes their documents. */
 export async function recoverPublishedApplicationPlanners(
   cwd: string,
+  hostPaths: HostPaths,
   planners: GoalPlannerOperations = goalPlannerOperations,
 ): Promise<PlannerCleanupWarning[]> {
-  const repository = await discoverRepository(cwd);
+  const repository = await discoverRepository(cwd, hostPaths);
   const warnings: PlannerCleanupWarning[] = [];
-  for (const application of await listProjectApplications(repository.root)) {
+  for (const application of await listProjectApplications(repository)) {
     // Resolved history never owns a planner. A malformed resolution remains a
     // durable barrier for its own operation, not a reason to touch runtime.
-    try { if (await loadApplicationResolutionIfPresent(repository.root, application.metadata.goalId, application.metadata.applicationId)) continue; }
+    try { if (await loadApplicationResolutionIfPresent(repository, application.metadata.goalId, application.metadata.applicationId)) continue; }
     catch { continue; }
     try {
-      await planners.release({ cwd: repository.root, goalId: application.metadata.goalId });
+      await planners.release({ cwd: repository.root, hostPaths, goalId: application.metadata.goalId });
     } catch (error) {
       warnings.push({
         goalId: application.metadata.goalId,
@@ -283,32 +289,32 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function publishedChangeIds(root: string, goalId: string): Promise<string[]> {
-  const directory = join(projectRoot(root), "goals", goalId, "changes");
-  const ids = (await listDirectoryNames(root, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
+async function publishedChangeIds(root: ProjectPaths, goalId: string): Promise<string[]> {
+  const directory = join(root.controlRoot, "goals", goalId, "changes");
+  const ids = (await listDirectoryNames(root.controlRoot, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
   const published: string[] = [];
   for (const changeId of ids) {
-    if (await documentExists(root, changePath(root, goalId, changeId))) published.push(changeId);
+    if (await documentExists(root.controlRoot, changePath(root, goalId, changeId))) published.push(changeId);
   }
   return published;
 }
 
-async function publishedTicketIds(root: string, goalId: string, changeId: string): Promise<string[]> {
+async function publishedTicketIds(root: ProjectPaths, goalId: string, changeId: string): Promise<string[]> {
   const directory = join(dirname(changePath(root, goalId, changeId)), "tickets");
-  const ids = (await listDirectoryNames(root, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
+  const ids = (await listDirectoryNames(root.controlRoot, directory)).filter((name) => sequenceIdPattern.test(name)).sort();
   const published: string[] = [];
   for (const ticketId of ids) {
-    if (await documentExists(root, ticketPath(root, goalId, changeId, ticketId))) published.push(ticketId);
+    if (await documentExists(root.controlRoot, ticketPath(root, goalId, changeId, ticketId))) published.push(ticketId);
   }
   return published;
 }
 
-async function refsBelow(root: string, prefix: string): Promise<string[]> {
-  const source = await git(root, ["for-each-ref", "--format=%(refname)", prefix]);
+async function refsBelow(root: ProjectPaths, prefix: string): Promise<string[]> {
+  const source = await git(root.root, ["for-each-ref", "--format=%(refname)", prefix]);
   return source ? source.split("\n").filter(Boolean) : [];
 }
 
-async function reconcileCandidateRefs(root: string, goalId: string, changeIds: string[]): Promise<string[]> {
+async function reconcileCandidateRefs(root: ProjectPaths, goalId: string, changeIds: string[]): Promise<string[]> {
   const expected = new Map<string, string>();
   for (const changeId of changeIds) {
     for (const ticketId of await publishedTicketIds(root, goalId, changeId)) {
@@ -323,25 +329,25 @@ async function reconcileCandidateRefs(root: string, goalId: string, changeIds: s
   const candidatePrefix = `refs/spike/goals/${goalId}/changes/`;
   for (const ref of await refsBelow(root, candidatePrefix)) {
     if (!expected.has(ref)) {
-      await git(root, ["update-ref", "-d", ref]);
+      await git(root.root, ["update-ref", "-d", ref]);
       discarded.push(ref);
     }
   }
   for (const [ref, revision] of expected) {
-    await git(root, ["update-ref", "--no-deref", ref, revision]);
+    await git(root.root, ["update-ref", "--no-deref", ref, revision]);
   }
 
   const quarantinePrefix = `refs/spike/quarantine/goals/${goalId}/`;
   for (const ref of await refsBelow(root, quarantinePrefix)) {
-    await git(root, ["update-ref", "-d", ref]);
+    await git(root.root, ["update-ref", "-d", ref]);
     discarded.push(ref);
   }
   return discarded;
 }
 
-async function rebuildIntegrationRef(root: string, goalId: string): Promise<string> {
+async function rebuildIntegrationRef(root: ProjectPaths, goalId: string): Promise<string> {
   const integratedRevision = await deriveGoalIntegratedRevision(root, goalId);
-  await git(root, ["update-ref", "--no-deref", integratedRef(goalId), integratedRevision]);
+  await git(root.root, ["update-ref", "--no-deref", integratedRef(goalId), integratedRevision]);
   return integratedRevision;
 }
 
@@ -349,24 +355,24 @@ export async function reconcileGoal(
   input: ReconcileRepositoryInput & { goalId: string },
   runtimeOperations?: WorkerRuntimeOperations,
 ): Promise<ReconciledGoal> {
-  const repository = await discoverRepository(input.cwd);
-  await loadGoal(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await loadGoal(repository, input.goalId);
   // Application evidence freezes Goal-local recovery. The Project supervisor
   // may still recover its already-published target decision, without replaying
   // any Goal ref or workflow mutation.
-  if ((await listPublishedApplicationIds(repository.root, input.goalId)).length !== 0 && (await goalApplicationFreeze(repository.root, input.goalId)).frozen) {
+  if ((await listPublishedApplicationIds(repository, input.goalId)).length !== 0 && (await goalApplicationFreeze(repository, input.goalId)).frozen) {
     // A resolved attempt has no active runtime ownership: return/stale preconditions
     // require all reports and healthy cleanup. Unresolved attempts retain the
     // existing projection-rebuild recovery, but terminal history is never revived.
-    for (const application of await listProjectApplications(repository.root)) {
+    for (const application of await listProjectApplications(repository)) {
       if (application.metadata.goalId !== input.goalId) continue;
       let resolution;
-      try { resolution = await loadApplicationResolutionIfPresent(repository.root, input.goalId, application.metadata.applicationId); } catch { continue; }
+      try { resolution = await loadApplicationResolutionIfPresent(repository, input.goalId, application.metadata.applicationId); } catch { continue; }
       if (resolution !== undefined) continue;
-      for (const ticketId of await listApplicationTicketIds(repository.root, input.goalId, application.metadata.applicationId)) await recoverApplicationTicket(repository.root, input.goalId, application.metadata.applicationId, ticketId, input.reason);
-      for (const reviewId of await listApplicationReviewTicketIds(repository.root, input.goalId, application.metadata.applicationId)) await recoverApplicationReviewTicket(repository.root, input.goalId, application.metadata.applicationId, reviewId, input.reason);
+      for (const ticketId of await listApplicationTicketIds(repository, input.goalId, application.metadata.applicationId)) await recoverApplicationTicket(repository.root, input.hostPaths, input.goalId, application.metadata.applicationId, ticketId, input.reason);
+      for (const reviewId of await listApplicationReviewTicketIds(repository, input.goalId, application.metadata.applicationId)) await recoverApplicationReviewTicket(repository.root, input.hostPaths, input.goalId, application.metadata.applicationId, reviewId, input.reason);
     }
-    if (input.recoverApplications !== false) await recoverApplications(repository.root);
+    if (input.recoverApplications !== false) await recoverApplications(repository);
     return {
       goalId: input.goalId,
       integratedRevision: await git(repository.root, ["rev-parse", "--verify", `${integratedRef(input.goalId)}^{commit}`]),
@@ -375,30 +381,31 @@ export async function reconcileGoal(
   }
   const now = input.now ?? new Date();
   const reason = interruptionReason(input.reason ?? "Supervisor restart interrupted an open Ticket before its Report was published.");
-  const changeIds = await publishedChangeIds(repository.root, input.goalId);
-  const discardedRefs = await reconcileCandidateRefs(repository.root, input.goalId, changeIds);
-  const integratedRevision = await rebuildIntegrationRef(repository.root, input.goalId);
+  const changeIds = await publishedChangeIds(repository, input.goalId);
+  const discardedRefs = await reconcileCandidateRefs(repository, input.goalId, changeIds);
+  const integratedRevision = await rebuildIntegrationRef(repository, input.goalId);
   // Application decisions can advance checked-out main and are Project-wide.
   // A Goal-scoped planner therefore never invokes this branch.
-  if (input.recoverApplications !== false) await recoverApplications(repository.root, input.goalId);
+  if (input.recoverApplications !== false) await recoverApplications(repository, input.goalId);
   const interruptedTickets: InterruptedTicketRecovery[] = [];
   const finalizedWorkers: TicketIdentity[] = [];
   const cleanupWarnings: Array<{ identity: TicketIdentity; message: string }> = [];
   const ignoredOutputPaths: string[] = [];
 
   for (const changeId of changeIds) {
-    const ticketIds = await publishedTicketIds(repository.root, input.goalId, changeId);
+    const ticketIds = await publishedTicketIds(repository, input.goalId, changeId);
     for (const ticketId of ticketIds) {
       const identity = { goalId: input.goalId, changeId, ticketId };
-      const report = await loadReportIfPresent(repository.root, input.goalId, changeId, ticketId);
-      const worker = await loadRecordedWorkerIfPresent(repository.root, identity);
+      const report = await loadReportIfPresent(repository, input.goalId, changeId, ticketId);
+      const worker = await loadRecordedWorkerIfPresent(repository, identity);
       if (report === undefined) {
-        const output = join(exchangePath(repository.root, { goalId: input.goalId, changeId, ticketId }), "output");
+        const output = join(exchangePath(repository, { goalId: input.goalId, changeId, ticketId }), "output");
         if (await pathExists(output)) ignoredOutputPaths.push(output);
-        const ticket = await loadTicket(repository.root, input.goalId, changeId, ticketId);
+        const ticket = await loadTicket(repository, input.goalId, changeId, ticketId);
         const recovered = await recoverInterruptedTicket(
           {
             cwd: repository.root,
+            hostPaths: input.hostPaths,
             ...identity,
             role: ticket.metadata.role,
             reason,
@@ -416,13 +423,13 @@ export async function reconcileGoal(
       }
 
       if (worker === undefined) continue;
-      const cleanup = await finalizeWorker(repository.root, identity, now, runtimeOperations);
+      const cleanup = await finalizeWorker(repository, identity, now, runtimeOperations);
       if (cleanup.status === "failed") {
         cleanupWarnings.push({ identity, message: cleanup.message });
         continue;
       }
       try {
-        await forgetFinalizedWorker(repository.root, identity);
+        await forgetFinalizedWorker(repository, identity);
         finalizedWorkers.push(identity);
       } catch (error) {
         cleanupWarnings.push({ identity, message: error instanceof Error ? error.message : String(error) });
@@ -432,7 +439,7 @@ export async function reconcileGoal(
 
   const currentCandidates: ReconciledGoal["currentCandidates"] = [];
   for (const changeId of changeIds) {
-    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, changeId);
+    const candidate = await deriveCurrentCandidate(repository, input.goalId, changeId);
     if (candidate !== undefined) {
       currentCandidates.push({
         changeId,
@@ -459,16 +466,16 @@ export async function reconcileRepository(
   runtimeOperations?: WorkerRuntimeOperations,
   planners: GoalPlannerOperations = goalPlannerOperations,
 ): Promise<RepositoryReconciliation> {
-  const repository = await discoverRepository(input.cwd);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
   // Run operational cleanup from published evidence before any Goal-local
   // recovery can encounter a target barrier. This is idempotent and is the
   // only retry path needed after a crash just after Application publication.
-  const plannerCleanupWarnings = await recoverPublishedApplicationPlanners(repository.root, planners);
-  const goalIds = await listAllocatedGoalIds(repository.root);
+  const plannerCleanupWarnings = await recoverPublishedApplicationPlanners(repository.root, input.hostPaths, planners);
+  const goalIds = await listAllocatedGoalIds(repository);
   const goals: ReconciledGoal[] = [];
   const ignoredUnpublishedGoalIds: string[] = [];
   for (const goalId of goalIds) {
-    if (!(await documentExists(repository.root, goalPath(repository.root, goalId)))) {
+    if (!(await documentExists(repository.controlRoot, goalPath(repository, goalId)))) {
       ignoredUnpublishedGoalIds.push(goalId);
       continue;
     }
@@ -476,6 +483,7 @@ export async function reconcileRepository(
       await reconcileGoal(
         {
           cwd: repository.root,
+          hostPaths: input.hostPaths,
           goalId,
           ...(input.reason === undefined ? {} : { reason: input.reason }),
           ...(input.now === undefined ? {} : { now: input.now }),

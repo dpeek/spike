@@ -11,6 +11,7 @@ import {
   type ChangeDecision,
 } from "./change.ts";
 import type { ThinkingLevel } from "./config.ts";
+import { resolveHostPaths, type HostPaths } from "./data-root.ts";
 import { discoverRepository } from "./git.ts";
 import { activateProject } from "./project.ts";
 import { createGoal, goalPath } from "./goal.ts";
@@ -23,7 +24,7 @@ import { dispatchApplicationPiTicket, dispatchApplicationWorker, loadFinishedApp
 import { guidanceStepSchema, type GuidanceStep } from "./guidance.ts";
 import { selectGuidance } from "./planner-guidance.ts";
 import { planPath, revisePlan } from "./plan.ts";
-import { closeRequest, createRequest, listRequests, loadRequest, requestDataRoot, type ClosureDisposition } from "./request.ts";
+import { closeRequest, createRequest, listRequests, loadRequest, type ClosureDisposition } from "./request.ts";
 import { launchPlanner } from "./planner.ts";
 import { goalPlannerOperations } from "./goal-planner.ts";
 import {
@@ -864,7 +865,7 @@ function humanReconciliation(goals: ReconciledGoal[], ignored = 0): string {
   return `${lines.join("\n")}\n`;
 }
 
-export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()): Promise<number> {
+export async function run(rawArgs: string[], cwd: string, hostPaths: HostPaths): Promise<number> {
   let args = rawArgs.filter((arg) => arg !== "--json");
   let json = rawArgs.includes("--json");
   let command = commandName(args);
@@ -881,28 +882,28 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "project" && args[1] === "activate") {
       if (args.length !== 2) throw new UsageError(`unknown project option: ${args[2]}`);
-      const project = await activateProject(cwd);
+      const project = await activateProject(cwd, hostPaths);
       return success(json, "project activate", { slug: project.slug, root: project.root, activeCheckout: project.registration.activeCheckout }, `Activated Project ${project.slug}\n`);
     }
 
     if (args[0] === "request" && args[1] === "create") {
-      const created = await createRequest(parseRequestCreate(args.slice(2)));
+      const created = await createRequest({ hostPaths, ...parseRequestCreate(args.slice(2)) });
       return success(json, "request create", created, `Created Request ${created.metadata.requestId}\n`);
     }
 
     if (args[0] === "request" && args[1] === "list") {
-      const requests = await listRequests(parseRequestList(args.slice(2)));
+      const requests = await listRequests({ hostPaths, ...parseRequestList(args.slice(2)) });
       const human = requests.map((request) => `${request.metadata.requestId} ${request.title} ${request.state} ${request.metadata.projects.join(",") || "unassigned"}`).join("\n");
       return success(json, "request list", requests, human ? `${human}\n` : "");
     }
 
     if (args[0] === "request" && args[1] === "show") {
-      const request = await loadRequest(requestDataRoot(), parseRequestShow(args.slice(2)).requestId);
+      const request = await loadRequest(hostPaths.dataRoot, parseRequestShow(args.slice(2)).requestId);
       return success(json, "request show", request, `Request ${request.metadata.requestId} (${request.state})\n\n${request.body}`);
     }
 
     if (args[0] === "request" && args[1] === "close") {
-      const closed = await closeRequest(parseRequestClose(args.slice(2)));
+      const closed = await closeRequest({ hostPaths, ...parseRequestClose(args.slice(2)) });
       return success(json, "request close", closed, `Closed Request ${closed.metadata.requestId} (${closed.closure!.metadata.disposition})\n`);
     }
 
@@ -911,6 +912,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         if (json) throw new UsageError("planner does not support --json");
         return launchPlanner({
           cwd,
+          hostPaths,
           ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
         });
       }
@@ -919,7 +921,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         throw new UsageError(`unknown planner option: ${action}`);
       }
       if (action === "attach" && json) throw new UsageError("planner attach does not support --json");
-      const input = { cwd, ...parseGoalPlanner(args.slice(2)) };
+      const input = { cwd, hostPaths, ...parseGoalPlanner(args.slice(2)) };
       if (action === "attach") return goalPlannerOperations.attach(input);
       const result = action === "observe"
         ? await goalPlannerOperations.observe(input)
@@ -932,21 +934,21 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     if (args[0] === "status") {
       const input = parseStatus(args.slice(1));
       if (input.goalId !== undefined) {
-        const status = await deriveGoalStatus(cwd, input.goalId);
+        const status = await deriveGoalStatus(cwd, hostPaths, input.goalId);
         return success(json, "status", status, humanGoalStatus(status));
       }
       if (input.operational) {
-        const status = await deriveSupervisorPlannerStatus(cwd);
+        const status = await deriveSupervisorPlannerStatus(cwd, hostPaths);
         const plannerLines = `${status.planners.map((planner) => `  Planner ${planner.goalId} ${planner.state}`).join("\n")}${status.planners.length === 0 ? "" : "\n"}`;
         return success(json, "status", status, `${humanRepositoryStatus(status.durable)}${plannerLines}`);
       }
-      const status = await deriveRepositoryStatus(cwd);
+      const status = await deriveRepositoryStatus(cwd, hostPaths);
       return success(json, "status", status, humanRepositoryStatus(status));
     }
 
     if (args[0] === "guidance" && args[1] === "show") {
       const input = parseGuidanceShow(args.slice(2));
-      const guidance = await selectGuidance({ cwd, ...input });
+      const guidance = await selectGuidance({ cwd, hostPaths, ...input });
       return success(
         json,
         "guidance show",
@@ -962,7 +964,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "goal" && args[1] === "queue") {
       const input = parseGoalQueue(args.slice(2));
-      const queued = await queueGoalIntegration({ cwd, ...input });
+      const queued = await queueGoalIntegration({ cwd, hostPaths, ...input });
       return success(json, "goal queue", queued,
         `Queued Goal ${queued.goalId} for main at FIFO position ${queued.queuePosition}\n` +
         `  Application ${queued.applicationId}\n` +
@@ -971,118 +973,118 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "application" && args[1] === "review" && args[2] === "issue") {
       const input = parseApplicationIdentity(args.slice(3), { instruction: true });
-      const issued = await issueApplicationReviewTicket({ cwd, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
+      const issued = await issueApplicationReviewTicket({ cwd, hostPaths, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
       return success(json, "application review issue", { ticket: issued.ticket.metadata }, `Issued Application review Ticket ${input.goalId}/${input.applicationId}/${issued.ticket.metadata.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "prepare") {
-      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd);
-      const exchange = await prepareApplicationReviewExchange(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd, hostPaths);
+      const exchange = await prepareApplicationReviewExchange(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application review prepare", exchange, `Prepared Application review Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-pi") {
-      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewPiTicket({ cwd, ...input });
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewPiTicket({ cwd, hostPaths, ...input });
       return success(json, "application review dispatch-pi", { ticket: input, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "dispatch-test") {
-      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewWorker({ cwd, ...input });
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationReviewWorker({ cwd, hostPaths, ...input });
       return success(json, "application review dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application review ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "worker" && args[3] === "status") {
-      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd), observed = await observeApplicationReviewWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd, hostPaths), observed = await observeApplicationReviewWorker(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application review worker status", { ticket: input, ...observed }, `Application review Worker ${input.ticketId} ${observed.status}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "worker" && args[3] === "read") {
-      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd), terminal = await readApplicationReviewWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(4), { ticket: true }), repository = await discoverRepository(cwd, hostPaths), terminal = await readApplicationReviewWorker(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application review worker read", { ticket: input, terminal }, terminal);
     }
     if (args[0] === "application" && args[1] === "review" && (args[2] === "publish" || (args[2] === "report" && args[3] === "publish"))) {
-      const input = parseApplicationPiDispatch(args.slice(args[2] === "report" ? 4 : 3)); const repository = await discoverRepository(cwd), execution = await loadFinishedApplicationReviewWorker(repository.root, input);
+      const input = parseApplicationPiDispatch(args.slice(args[2] === "report" ? 4 : 3)); const repository = await discoverRepository(cwd, hostPaths), execution = await loadFinishedApplicationReviewWorker(repository, input);
       if (execution.worker !== input.worker) throw new UsageError("application review publish worker does not match recorded Application review Worker");
-      const published = await publishApplicationReviewReport({ cwd: repository.root, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      const published = await publishApplicationReviewReport({ cwd: repository.root, hostPaths, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
       return success(json, "application review publish", { report: published.report.metadata }, `Published Application review Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "status") {
-      const input = parseApplicationIdentity(args.slice(3)); const status = await deriveApplicationReviewStatus(cwd, input.goalId, input.applicationId);
+      const input = parseApplicationIdentity(args.slice(3)); const status = await deriveApplicationReviewStatus(cwd, hostPaths, input.goalId, input.applicationId);
       return success(json, "application review status", status, `Application review approval ${status.approvalUsable ? "usable" : "unusable"}\n`);
     }
     if (args[0] === "application" && args[1] === "review" && args[2] === "recover") {
-      const input = parseApplicationIdentity(args.slice(3), { ticket: true, reason: true }); const result = await recoverApplicationReviewTicket(cwd, input.goalId, input.applicationId, input.ticketId!, input.reason);
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true, reason: true }); const result = await recoverApplicationReviewTicket(cwd, hostPaths, input.goalId, input.applicationId, input.ticketId!, input.reason);
       return success(json, "application review recover", result, `Recovered Application review Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "issue") {
       const input = parseApplicationIdentity(args.slice(3), { instruction: true });
-      const issued = await issueApplicationTicket({ cwd, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
+      const issued = await issueApplicationTicket({ cwd, hostPaths, goalId: input.goalId, applicationId: input.applicationId, instruction: input.instruction! });
       return success(json, "application ticket issue", { ticket: issued.ticket.metadata, path: relative(issued.root, `goals/${input.goalId}/applications/${input.applicationId}/tickets/${issued.ticket.metadata.ticketId}/ticket.md`) }, `Issued Application Ticket ${input.goalId}/${input.applicationId}/${issued.ticket.metadata.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-pi") {
-      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationPiTicket({ cwd, ...input });
+      const input = parseApplicationPiDispatch(args.slice(3)); const dispatched = await dispatchApplicationPiTicket({ cwd, hostPaths, ...input });
       return success(json, "application ticket dispatch-pi", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution }, `Dispatched Application Pi Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "dispatch-test") {
-      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationWorker({ cwd, ...input });
+      const input = parseApplicationTestDispatch(args.slice(3)); const dispatched = await dispatchApplicationWorker({ cwd, hostPaths, ...input });
       return success(json, "application ticket dispatch-test", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, execution: dispatched.execution, paths: { input: relative(dispatched.root, dispatched.exchange.inputDirectory), output: relative(dispatched.root, dispatched.exchange.outputDirectory) } }, `Dispatched Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
     if (args[0] === "application" && args[1] === "worker" && args[2] === "status") {
-      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd); const observed = await observeApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd, hostPaths); const observed = await observeApplicationWorker(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application worker status", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, ...observed }, `Application Worker ${input.goalId}/${input.applicationId}/${input.ticketId} ${observed.status}\n`);
     }
     if (args[0] === "application" && args[1] === "worker" && args[2] === "read") {
-      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd); const terminal = await readApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd, hostPaths); const terminal = await readApplicationWorker(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application worker read", { ticket: { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId }, terminal }, terminal);
     }
     if (args[0] === "application" && args[1] === "ticket" && args[2] === "prepare") {
-      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd);
-      const exchange = await prepareApplicationTicketExchange(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
+      const input = parseApplicationIdentity(args.slice(3), { ticket: true }); const repository = await discoverRepository(cwd, hostPaths);
+      const exchange = await prepareApplicationTicketExchange(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId! });
       return success(json, "application ticket prepare", exchange, `Prepared Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "report" && args[2] === "blocked") {
-      const input = parseApplicationPiDispatch(args.slice(3)); const repository = await discoverRepository(cwd), execution = await loadFinishedApplicationWorker(repository.root, input);
+      const input = parseApplicationPiDispatch(args.slice(3)); const repository = await discoverRepository(cwd, hostPaths), execution = await loadFinishedApplicationWorker(repository, input);
       if (execution.worker !== input.worker) throw new UsageError("application blocked publish worker does not match the recorded Application Worker");
-      const published = await publishApplicationImplementationReport({ cwd: repository.root, ...input, message: { summary: "Blocked Application Ticket" }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      const published = await publishApplicationImplementationReport({ cwd: repository.root, hostPaths, ...input, message: { summary: "Blocked Application Ticket" }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
       return success(json, "application report blocked", { report: published.report.metadata }, `Published blocked Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "report" && args[2] === "partial") {
-      const input = parseApplicationPartialPublish(args.slice(3)); const repository = await discoverRepository(cwd);
-      const execution = await loadFinishedApplicationWorker(repository.root, input);
+      const input = parseApplicationPartialPublish(args.slice(3)); const repository = await discoverRepository(cwd, hostPaths);
+      const execution = await loadFinishedApplicationWorker(repository, input);
       if (execution.worker !== input.worker) throw new UsageError("application partial publish worker does not match the recorded Application Worker");
-      const published = await publishApplicationPartialReport({ cwd: repository.root, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      const published = await publishApplicationPartialReport({ cwd: repository.root, hostPaths, ...input, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
       return success(json, "application report partial", { report: published.report.metadata }, `Published partial Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "report" && args[2] === "publish") {
-      const input = parseApplicationReportPublish(args.slice(3)); const repository = await discoverRepository(cwd);
-      const execution = await loadFinishedApplicationWorker(repository.root, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId });
+      const input = parseApplicationReportPublish(args.slice(3)); const repository = await discoverRepository(cwd, hostPaths);
+      const execution = await loadFinishedApplicationWorker(repository, { goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId });
       if (execution.worker !== input.worker) throw new UsageError("application report publish worker does not match the recorded Application Worker");
-      const published = await publishApplicationImplementationReport({ cwd: repository.root, goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, message: { summary: input.summary }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
+      const published = await publishApplicationImplementationReport({ cwd: repository.root, hostPaths, goalId: input.goalId, applicationId: input.applicationId, ticketId: input.ticketId, message: { summary: input.summary }, execution: { adapter: execution.adapter, isolation: execution.isolation, worker: execution.worker, model: execution.model, thinking: execution.thinking, startedAt: execution.startedAt, finishedAt: execution.finishedAt } });
       return success(json, "application report publish", { report: published.report.metadata }, `Published Application Report ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "status") {
-      const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, input.goalId, input.applicationId);
+      const input = parseApplicationIdentity(args.slice(2)); const status = await deriveApplicationStatus(cwd, hostPaths, input.goalId, input.applicationId);
       return success(json, "application status", status, `Application ${input.goalId}/${input.applicationId}\n  Evidence state ${status.evidenceState}\n  Open Ticket ${status.openTicketId ?? "none"}\n  Candidate ${status.candidate?.revision ?? "none"}\n  Decision ${status.decision === null ? "none" : JSON.stringify(status.decision)}\n  Queue ${status.queue.position}${status.queue.head ? " head" : ""}${status.queue.member ? " member" : " released"}\n  Target mismatch ${status.targetMismatch ? "yes" : "no"}\n  Pinned target moved ${status.pinnedTargetMoved ? "yes" : "no"}\n  Review ${status.review === null ? "unavailable" : JSON.stringify(status.review)}\n  Cleanup ${status.cleanup.healthy ? "healthy" : `${status.cleanup.warnings.length} warnings`}\n  Churn warnings ${status.churnWarnings.length}\n`);
     }
 
     if (args[0] === "application" && args[1] === "recover") {
-      const input = parseApplicationIdentity(args.slice(2), { ticket: true, reason: true }); const recovered = await recoverApplicationTicket(cwd, input.goalId, input.applicationId, input.ticketId!, input.reason);
+      const input = parseApplicationIdentity(args.slice(2), { ticket: true, reason: true }); const recovered = await recoverApplicationTicket(cwd, hostPaths, input.goalId, input.applicationId, input.ticketId!, input.reason);
       return success(json, "application recover", recovered, `Recovered Application Ticket ${input.goalId}/${input.applicationId}/${input.ticketId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "return") {
-      const input = parseApplicationResolution(args.slice(2), true); const resolved = await returnApplication({ cwd, ...input, statement: input.statement! });
+      const input = parseApplicationResolution(args.slice(2), true); const resolved = await returnApplication({ cwd, hostPaths, ...input, statement: input.statement! });
       return success(json, "application return", { resolution: resolved.resolution.metadata }, `Returned Application ${input.goalId}/${input.applicationId}\n`);
     }
     if (args[0] === "application" && args[1] === "stale") {
-      const input = parseApplicationResolution(args.slice(2), false); const resolved = await staleApplication({ cwd, ...input });
+      const input = parseApplicationResolution(args.slice(2), false); const resolved = await staleApplication({ cwd, hostPaths, ...input });
       return success(json, "application stale", { resolution: resolved.resolution.metadata }, `Marked Application stale ${input.goalId}/${input.applicationId}\n`);
     }
 
     if (args[0] === "application" && args[1] === "apply-head") {
       const input = parseApplicationApplyHead(args.slice(2));
-      const applied = await applyQueueHead({ cwd, ...input });
+      const applied = await applyQueueHead({ cwd, hostPaths, ...input });
       return success(json, "application apply-head", applied,
         `Applied FIFO head ${applied.goalId}/${applied.applicationId} to main\n` +
         `  Previous target revision ${applied.previousTargetRevision}\n` +
@@ -1090,13 +1092,13 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     }
     if (args[0] === "application" && args[1] === "recover-apply") {
       if (args.length !== 2) throw new UsageError(`unknown application recover-apply option: ${args[2]}`);
-      const repository = await discoverRepository(cwd); await recoverApplications(repository.root);
+      const repository = await discoverRepository(cwd, hostPaths); await recoverApplications(repository);
       return success(json, "application recover-apply", { root: repository.root }, "Recovered Application target decision\n");
     }
 
     if (args[0] === "goal" && args[1] === "create") {
       const input = parseGoalCreate(args.slice(2));
-      const created = await createGoal({ cwd, ...input });
+      const created = await createGoal({ cwd, hostPaths, ...input });
       const goalId = created.goal.metadata.goalId;
       return success(
         json,
@@ -1104,20 +1106,20 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         {
           goal: created.goal.metadata,
           paths: {
-            goal: relative(created.root, goalPath(created.root, goalId)),
-            plan: relative(created.root, planPath(created.root, goalId)),
+            goal: relative(created.root, goalPath(created.project, goalId)),
+            plan: relative(created.root, planPath(created.project, goalId)),
           },
         },
         `Created Goal ${goalId}\n` +
-          `  ${relative(created.root, goalPath(created.root, goalId))}\n` +
-          `  ${relative(created.root, planPath(created.root, goalId))}\n`,
+          `  ${relative(created.root, goalPath(created.project, goalId))}\n` +
+          `  ${relative(created.root, planPath(created.project, goalId))}\n`,
       );
     }
 
     if (args[0] === "plan" && args[1] === "revise") {
       const input = parsePlanRevise(args.slice(2));
-      const repository = await discoverRepository(cwd);
-      const revised = await revisePlan(repository.root, input.goalId, await planBody(cwd, input.file));
+      const repository = await discoverRepository(cwd, hostPaths);
+      const revised = await revisePlan(repository, input.goalId, await planBody(cwd, input.file));
       return success(
         json,
         "plan revise",
@@ -1128,17 +1130,17 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "change" && args[1] === "create") {
       const input = parseChangeCreate(args.slice(2));
-      const created = await createChange({ cwd, ...input });
+      const created = await createChange({ cwd, hostPaths, ...input });
       const { goalId, changeId } = created.change.metadata;
       return success(
         json,
         "change create",
         {
           change: created.change.metadata,
-          path: relative(created.root, changePath(created.root, goalId, changeId)),
+          path: relative(created.root, changePath(created.project, goalId, changeId)),
         },
         `Created Change ${goalId}/${changeId}\n` +
-          `  ${relative(created.root, changePath(created.root, goalId, changeId))}\n`,
+          `  ${relative(created.root, changePath(created.project, goalId, changeId))}\n`,
       );
     }
 
@@ -1146,10 +1148,10 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       const disposition = args[1] as "land" | "reject" | "abandon";
       const input = parseChangeDecision(args.slice(2), disposition);
       const resolved = disposition === "land"
-        ? await landChange({ cwd, goalId: input.goalId, changeId: input.changeId, ...(input.statement === undefined ? {} : { statement: input.statement }) })
+        ? await landChange({ cwd, hostPaths, goalId: input.goalId, changeId: input.changeId, ...(input.statement === undefined ? {} : { statement: input.statement }) })
         : disposition === "reject"
-          ? await rejectChange({ cwd, goalId: input.goalId, changeId: input.changeId, statement: input.statement! })
-          : await abandonChange({ cwd, goalId: input.goalId, changeId: input.changeId, statement: input.statement! });
+          ? await rejectChange({ cwd, hostPaths, goalId: input.goalId, changeId: input.changeId, statement: input.statement! })
+          : await abandonChange({ cwd, hostPaths, goalId: input.goalId, changeId: input.changeId, statement: input.statement! });
       return success(
         json,
         `change ${disposition}`,
@@ -1160,17 +1162,17 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "ticket" && args[1] === "issue") {
       const input = parseTicketIssue(args.slice(2));
-      const issued = await issueTicket({ cwd, ...input });
+      const issued = await issueTicket({ cwd, hostPaths, ...input });
       const { goalId, changeId, ticketId } = issued.ticket.metadata;
       return success(
         json,
         "ticket issue",
         {
           ticket: issued.ticket.metadata,
-          path: relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId)),
+          path: relative(issued.root, ticketPath(issued.project, goalId, changeId, ticketId)),
         },
         `Issued Ticket ${goalId}/${changeId}/${ticketId}\n` +
-          `  ${relative(issued.root, ticketPath(issued.root, goalId, changeId, ticketId))}\n`,
+          `  ${relative(issued.root, ticketPath(issued.project, goalId, changeId, ticketId))}\n`,
       );
     }
 
@@ -1178,6 +1180,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       const input = parsePiDispatch(args.slice(2));
       const dispatched = await dispatchPiTicket({
         cwd,
+        hostPaths,
         ...input,
         ...(process.env["SPIKE_PI_BIN"] === undefined ? {} : { piExecutable: process.env["SPIKE_PI_BIN"] }),
       });
@@ -1203,7 +1206,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "ticket" && args[1] === "dispatch-test") {
       const input = parseTestDispatch(args.slice(2));
-      const dispatched = await dispatchWorkerTicket({ cwd, ...input });
+      const dispatched = await dispatchWorkerTicket({ cwd, hostPaths, ...input });
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       return success(
         json,
@@ -1223,8 +1226,8 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "worker" && args[1] === "status") {
       const identity = parseWorkerIdentity(args.slice(2));
-      const repository = await discoverRepository(cwd);
-      const observation = await observeWorker(repository.root, identity);
+      const repository = await discoverRepository(cwd, hostPaths);
+      const observation = await observeWorker(repository, identity);
       return success(
         json,
         "worker status",
@@ -1235,8 +1238,8 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "worker" && args[1] === "wait") {
       const identity = parseWorkerIdentity(args.slice(2));
-      const repository = await discoverRepository(cwd);
-      const notification = await waitForWorkerDone(repository.root, identity);
+      const repository = await discoverRepository(cwd, hostPaths);
+      const notification = await waitForWorkerDone(repository, identity);
       return success(
         json,
         "worker wait",
@@ -1247,8 +1250,8 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "worker" && args[1] === "read") {
       const input = parseWorkerRead(args.slice(2));
-      const repository = await discoverRepository(cwd);
-      const terminal = await readWorkerTerminal(repository.root, input, {
+      const repository = await discoverRepository(cwd, hostPaths);
+      const terminal = await readWorkerTerminal(repository, input, {
         ...(input.lines === undefined ? {} : { lines: input.lines }),
         ...(input.ansi === undefined ? {} : { ansi: input.ansi }),
       });
@@ -1258,8 +1261,8 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     if (args[0] === "worker" && args[1] === "attach") {
       if (json) throw new UsageError("worker attach does not support --json");
       const identity = parseWorkerIdentity(args.slice(2));
-      const repository = await discoverRepository(cwd);
-      return attachWorkerTerminal(repository.root, identity);
+      const repository = await discoverRepository(cwd, hostPaths);
+      return attachWorkerTerminal(repository, identity);
     }
 
     if (args[0] === "worker" && (args[1] === "complete" || args[1] === "block")) {
@@ -1277,30 +1280,32 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
 
     if (args[0] === "report" && args[1] === "publish") {
       const input = parseReportPublish(args.slice(2));
-      const repository = await discoverRepository(cwd);
+      const repository = await discoverRepository(cwd, hostPaths);
       const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
       const [ticket, execution] = await Promise.all([
-        loadTicket(repository.root, input.goalId, input.changeId, input.ticketId),
-        loadFinishedWorkerExecution(repository.root, identity),
+        loadTicket(repository, input.goalId, input.changeId, input.ticketId),
+        loadFinishedWorkerExecution(repository, identity),
       ]);
 
       let publication;
       if (input.failure !== undefined) {
         publication = await publishFailedReport({
           cwd: repository.root,
+          hostPaths,
           ...identity,
           role: ticket.metadata.role,
           reason: input.failure,
           execution,
         });
-      } else if (await loadSubmissionOutcome(repository.root, identity) === "blocked") {
-        publication = await publishBlockedReport({ cwd: repository.root, ...identity, execution });
+      } else if (await loadSubmissionOutcome(repository, identity) === "blocked") {
+        publication = await publishBlockedReport({ cwd: repository.root, hostPaths, ...identity, execution });
       } else if (ticket.metadata.role === "implement") {
         if (input.commitSummary === undefined) {
           throw new UsageError("--commit-summary is required for a completed implementation Report");
         }
         publication = await publishImplementationReport({
           cwd: repository.root,
+          hostPaths,
           ...identity,
           execution,
           commitMessage: {
@@ -1312,7 +1317,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         if (input.commitSummary !== undefined || input.commitBody !== undefined) {
           throw new UsageError("review Reports do not accept Candidate commit message options");
         }
-        publication = await publishReviewReport({ cwd: repository.root, ...identity, execution });
+        publication = await publishReviewReport({ cwd: repository.root, hostPaths, ...identity, execution });
       }
 
       return success(
@@ -1321,7 +1326,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
         {
           report: publication.report.metadata,
           cleanup: publication.cleanup,
-          path: relative(repository.root, reportPath(repository.root, input.goalId, input.changeId, input.ticketId)),
+          path: relative(repository.root, reportPath(repository, input.goalId, input.changeId, input.ticketId)),
         },
         `Published ${publication.report.metadata.outcome} Report ${input.goalId}/${input.changeId}/${input.ticketId}\n` +
           humanCleanup(publication.cleanup),
@@ -1331,7 +1336,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
     if (args[0] === "recover") {
       const input = parseRecover(args.slice(1));
       if (input.goalId === undefined) {
-        const reconciled = await reconcileRepository({ cwd, ...(input.reason === undefined ? {} : { reason: input.reason }) });
+        const reconciled = await reconcileRepository({ cwd, hostPaths, ...(input.reason === undefined ? {} : { reason: input.reason }) });
         return success(
           json,
           "recover",
@@ -1341,6 +1346,7 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
       }
       const reconciled = await reconcileGoal({
         cwd,
+        hostPaths,
         goalId: input.goalId,
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(input.goalLocal ? { recoverApplications: false } : {}),
@@ -1354,4 +1360,4 @@ export async function run(rawArgs = process.argv.slice(2), cwd = process.cwd()):
   }
 }
 
-if (import.meta.main) process.exit(await run());
+if (import.meta.main) process.exit(await run(process.argv.slice(2), process.cwd(), resolveHostPaths(process.env)));

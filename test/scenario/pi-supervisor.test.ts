@@ -1,20 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { describe, expect, test } from "bun:test";
+import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { temporaryRepository } from "../support/repository.ts";
 
 const spikePath = join(import.meta.dir, "..", "..", "bin", "spike");
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
 const directories: string[] = [];
 
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
-});
 
 async function fakes() {
   const directory = await mkdtemp(join(tmpdir(), "spike-pi-supervisor-"));
@@ -55,13 +47,13 @@ process.exit(23);
 describe("direct Pi supervisor", () => {
   test("launches the configured planner with only the supervisor extension and delegates facts to fake Spike", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const fake = await fakes();
 
     const child = Bun.spawn([spikePath, "planner"], {
       cwd: repository.root,
       env: {
         ...process.env,
+        SPIKE_DATA_DIR: repository.dataRoot,
         SPIKE_PI_BIN: fake.pi,
         SPIKE_BIN: fake.spike,
         FAKE_PI_RECORD: fake.piRecord,

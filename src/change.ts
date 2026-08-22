@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { assertGoalBelongsToProject } from "./config.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
+import type { HostPaths } from "./data-root.ts";
 import {
   documentExists,
   installImmutable,
@@ -12,7 +13,7 @@ import {
 import { discoverRepository, git } from "./git.ts";
 import { integratedRef, loadGoal } from "./goal.ts";
 import { goalIdPattern, sequenceIdPattern } from "./identity.ts";
-import { projectRoot } from "./project.ts";
+import type { ProjectPaths } from "./project.ts";
 import { assertGoalNotFrozen } from "./application.ts";
 import {
   deriveCurrentApproval,
@@ -63,6 +64,7 @@ export type ChangeStatus = "active" | "resolved";
 
 export type CreateChangeInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   title: string;
   intent: string;
@@ -75,11 +77,13 @@ export type CreateChangeInput = {
 
 export type CreatedChange = {
   root: string;
+  project: ProjectPaths;
   change: Change;
 };
 
 export type LandChangeInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   changeId: string;
   statement?: string;
@@ -94,6 +98,7 @@ export type LandedChange = {
 
 export type ResolveChangeInput = {
   cwd: string;
+  hostPaths: HostPaths;
   goalId: string;
   changeId: string;
   statement: string;
@@ -106,16 +111,16 @@ export type ResolvedChange = {
   decision: ChangeDecision;
 };
 
-function changesPath(root: string, goalId: string): string {
-  return join(projectRoot(root), "goals", goalId, "changes");
+function changesPath(project: ProjectPaths, goalId: string): string {
+  return join(project.controlRoot, "goals", goalId, "changes");
 }
 
-export function changePath(root: string, goalId: string, changeId: string): string {
-  return join(changesPath(root, goalId), changeId, "change.md");
+export function changePath(project: ProjectPaths, goalId: string, changeId: string): string {
+  return join(changesPath(project, goalId), changeId, "change.md");
 }
 
-export function changeDecisionPath(root: string, goalId: string, changeId: string): string {
-  return join(changesPath(root, goalId), changeId, "decision.md");
+export function changeDecisionPath(project: ProjectPaths, goalId: string, changeId: string): string {
+  return join(changesPath(project, goalId), changeId, "decision.md");
 }
 
 function requireText(value: string, label: string): string {
@@ -175,8 +180,8 @@ ${list(dependencies)}
 `;
 }
 
-async function allocatedChangeIds(root: string, goalId: string): Promise<string[]> {
-  return (await listDirectoryNames(root, changesPath(root, goalId))).filter((name) => sequenceIdPattern.test(name)).sort();
+async function allocatedChangeIds(root: ProjectPaths, goalId: string): Promise<string[]> {
+  return (await listDirectoryNames(root.controlRoot, changesPath(root, goalId))).filter((name) => sequenceIdPattern.test(name)).sort();
 }
 
 function nextId(ids: string[], label: string): string {
@@ -185,28 +190,28 @@ function nextId(ids: string[], label: string): string {
   return String(maximum + 1).padStart(3, "0");
 }
 
-async function unresolvedChangeId(root: string, goalId: string): Promise<string | undefined> {
+async function unresolvedChangeId(root: ProjectPaths, goalId: string): Promise<string | undefined> {
   for (const changeId of await allocatedChangeIds(root, goalId)) {
-    if (!(await documentExists(root, changePath(root, goalId, changeId)))) continue;
+    if (!(await documentExists(root.controlRoot, changePath(root, goalId, changeId)))) continue;
     if ((await changeStatus(root, goalId, changeId)) === "active") return changeId;
   }
   return undefined;
 }
 
-export async function listChangeIds(root: string, goalId: string): Promise<string[]> {
+export async function listChangeIds(root: ProjectPaths, goalId: string): Promise<string[]> {
   const changeIds = await allocatedChangeIds(root, goalId);
   const published: string[] = [];
   for (const changeId of changeIds) {
-    if (!(await documentExists(root, changePath(root, goalId, changeId)))) continue;
+    if (!(await documentExists(root.controlRoot, changePath(root, goalId, changeId)))) continue;
     await loadChange(root, goalId, changeId);
     published.push(changeId);
   }
   return published;
 }
 
-export async function loadChange(root: string, goalId: string, changeId: string): Promise<Change> {
-  await assertGoalBelongsToProject(root, goalId);
-  const document = await readDocument(root, changePath(root, goalId, changeId));
+export async function loadChange(root: ProjectPaths, goalId: string, changeId: string): Promise<Change> {
+  await assertGoalBelongsToProject(root.root, goalId);
+  const document = await readDocument(root.controlRoot, changePath(root, goalId, changeId));
   const metadata = changeSchema.parse(document.metadata);
   if (metadata.goalId !== goalId || metadata.changeId !== changeId) {
     throw new Error(`Change document belongs to a different Change: ${metadata.goalId}/${metadata.changeId}`);
@@ -215,12 +220,12 @@ export async function loadChange(root: string, goalId: string, changeId: string)
 }
 
 export async function loadChangeDecision(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<ChangeDecision> {
-  await assertGoalBelongsToProject(root, goalId);
-  const document = await readDocument(root, changeDecisionPath(root, goalId, changeId));
+  await assertGoalBelongsToProject(root.root, goalId);
+  const document = await readDocument(root.controlRoot, changeDecisionPath(root, goalId, changeId));
   const metadata = changeDecisionSchema.parse(document.metadata);
   if (metadata.goalId !== goalId || metadata.changeId !== changeId) {
     throw new Error(`Change decision belongs to a different Change: ${metadata.goalId}/${metadata.changeId}`);
@@ -230,20 +235,20 @@ export async function loadChangeDecision(
 }
 
 export async function loadChangeDecisionIfPresent(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<ChangeDecision | undefined> {
-  if (!(await documentExists(root, changeDecisionPath(root, goalId, changeId)))) return undefined;
+  if (!(await documentExists(root.controlRoot, changeDecisionPath(root, goalId, changeId)))) return undefined;
   return loadChangeDecision(root, goalId, changeId);
 }
 
-export async function changeStatus(root: string, goalId: string, changeId: string): Promise<ChangeStatus> {
+export async function changeStatus(root: ProjectPaths, goalId: string, changeId: string): Promise<ChangeStatus> {
   await loadChange(root, goalId, changeId);
   return (await loadChangeDecisionIfPresent(root, goalId, changeId)) === undefined ? "active" : "resolved";
 }
 
-export async function deriveGoalIntegratedRevision(root: string, goalId: string): Promise<string> {
+export async function deriveGoalIntegratedRevision(root: ProjectPaths, goalId: string): Promise<string> {
   const goal = await loadGoal(root, goalId);
   let integratedRevision = goal.metadata.repository.initialRevision;
 
@@ -270,7 +275,7 @@ export async function deriveGoalIntegratedRevision(root: string, goalId: string)
     ) {
       throw new Error(`land decision ${goalId}/${changeId} does not select the latest exactly approved Candidate`);
     }
-    const commit = (await git(root, ["rev-list", "--parents", "-n", "1", decision.metadata.approvedRevision])).split(/\s+/);
+    const commit = (await git(root.root, ["rev-list", "--parents", "-n", "1", decision.metadata.approvedRevision])).split(/\s+/);
     if (commit.length !== 2 || commit[1] !== integratedRevision) {
       throw new Error(`land decision ${goalId}/${changeId} does not select a one-commit Change on its base`);
     }
@@ -280,7 +285,7 @@ export async function deriveGoalIntegratedRevision(root: string, goalId: string)
   return integratedRevision;
 }
 
-async function assertNoOpenTicket(root: string, goalId: string, changeId: string): Promise<void> {
+async function assertNoOpenTicket(root: ProjectPaths, goalId: string, changeId: string): Promise<void> {
   const history = await loadChangeReportHistory(root, goalId, changeId);
   if (history.reports.length !== history.ticketCount) {
     throw new Error(`Change ${goalId}/${changeId} has an open Ticket`);
@@ -288,21 +293,21 @@ async function assertNoOpenTicket(root: string, goalId: string, changeId: string
 }
 
 export async function landChange(input: LandChangeInput): Promise<LandedChange> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
-  const decisionDocumentPath = changeDecisionPath(repository.root, input.goalId, input.changeId);
-  if (await documentExists(repository.root, decisionDocumentPath)) {
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
+  const decisionDocumentPath = changeDecisionPath(repository, input.goalId, input.changeId);
+  if (await documentExists(repository.controlRoot, decisionDocumentPath)) {
     throw new Error(`Change ${input.goalId}/${input.changeId} already has a terminal decision`);
   }
 
-  await loadGoal(repository.root, input.goalId);
-  const change = await loadChange(repository.root, input.goalId, input.changeId);
-  await assertNoOpenTicket(repository.root, input.goalId, input.changeId);
-  const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  await loadGoal(repository, input.goalId);
+  const change = await loadChange(repository, input.goalId, input.changeId);
+  await assertNoOpenTicket(repository, input.goalId, input.changeId);
+  const candidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
   if (candidate === undefined) {
     throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
   }
-  const approval = await deriveCurrentApproval(repository.root, input.goalId, input.changeId);
+  const approval = await deriveCurrentApproval(repository, input.goalId, input.changeId);
   if (approval === undefined) {
     throw new Error(`current Candidate ${candidate.candidateRevision} has no exact approve review Report`);
   }
@@ -361,7 +366,7 @@ export async function landChange(input: LandChangeInput): Promise<LandedChange> 
   const decision = { metadata, body };
 
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     decisionDocumentPath,
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, "change-decision-publication"),
@@ -374,24 +379,24 @@ async function resolveChangeWithoutLanding(
   input: ResolveChangeInput,
   disposition: "reject" | "abandon",
 ): Promise<ResolvedChange> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
-  const decisionDocumentPath = changeDecisionPath(repository.root, input.goalId, input.changeId);
-  if (await documentExists(repository.root, decisionDocumentPath)) {
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
+  const decisionDocumentPath = changeDecisionPath(repository, input.goalId, input.changeId);
+  if (await documentExists(repository.controlRoot, decisionDocumentPath)) {
     throw new Error(`Change ${input.goalId}/${input.changeId} already has a terminal decision`);
   }
 
-  await loadGoal(repository.root, input.goalId);
-  await loadChange(repository.root, input.goalId, input.changeId);
-  await assertNoOpenTicket(repository.root, input.goalId, input.changeId);
+  await loadGoal(repository, input.goalId);
+  await loadChange(repository, input.goalId, input.changeId);
+  await assertNoOpenTicket(repository, input.goalId, input.changeId);
   const statement = requireText(input.statement, "Change decision statement");
 
   if (disposition === "reject") {
-    const candidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+    const candidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
     if (candidate === undefined) {
       throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
     }
-    const rejection = await deriveCurrentRejection(repository.root, input.goalId, input.changeId);
+    const rejection = await deriveCurrentRejection(repository, input.goalId, input.changeId);
     if (rejection === undefined) {
       throw new Error(`current Candidate ${candidate.candidateRevision} has no exact reject review Report`);
     }
@@ -414,7 +419,7 @@ async function resolveChangeWithoutLanding(
   });
   const decision = { metadata, body: `${statement}\n` };
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     decisionDocumentPath,
     serializeDocument(metadata, decision.body),
     commitCrashHooks(input.crash, "change-decision-publication"),
@@ -431,11 +436,11 @@ export function abandonChange(input: ResolveChangeInput): Promise<ResolvedChange
 }
 
 export async function createChange(input: CreateChangeInput): Promise<CreatedChange> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
-  await loadGoal(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
+  await loadGoal(repository, input.goalId);
 
-  const activeChangeId = await unresolvedChangeId(repository.root, input.goalId);
+  const activeChangeId = await unresolvedChangeId(repository, input.goalId);
   if (activeChangeId !== undefined) {
     throw new Error(`Goal ${input.goalId} already has unresolved Change ${activeChangeId}`);
   }
@@ -447,7 +452,7 @@ export async function createChange(input: CreateChangeInput): Promise<CreatedCha
   if (acceptanceCriteria.length === 0) throw new Error("Change must have at least one acceptance criterion");
   const nonGoals = requireItems(input.nonGoals ?? [], "Non-goal");
   const dependencies = requireItems(input.dependencies ?? [], "Dependency");
-  const changeId = nextId(await allocatedChangeIds(repository.root, input.goalId), "Change");
+  const changeId = nextId(await allocatedChangeIds(repository, input.goalId), "Change");
   const baseRevision = await git(repository.root, ["rev-parse", "--verify", `${integratedRef(input.goalId)}^{commit}`]);
   const metadata = changeSchema.parse({
     kind: "change",
@@ -459,9 +464,9 @@ export async function createChange(input: CreateChangeInput): Promise<CreatedCha
   const body = changeBody(title, intent, rationale, acceptanceCriteria, nonGoals, dependencies);
 
   await installImmutable(
-    repository.root,
-    changePath(repository.root, input.goalId, changeId),
+    repository.controlRoot,
+    changePath(repository, input.goalId, changeId),
     serializeDocument(metadata, body),
   );
-  return { root: repository.root, change: { metadata, body } };
+  return { root: repository.root, project: repository, change: { metadata, body } };
 }

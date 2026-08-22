@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changeDecisionPath, changeStatus, createChange } from "../../src/change.ts";
@@ -7,17 +7,11 @@ import { createGoal, integratedRef } from "../../src/goal.ts";
 import { issueTicket, reportPath, ticketPath, ticketStatus } from "../../src/ticket.ts";
 import { fixtureGuidance, temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  await Promise.all(repositories.splice(0).map((repository) => repository.remove()));
-});
 
 async function fixture() {
   const repository = await temporaryRepository();
-  repositories.push(repository);
   const createdGoal = await createGoal({
-    cwd: repository.root,
-    title: "Sequential workflow",
+    cwd: repository.root, hostPaths: repository.hostPaths, title: "Sequential workflow",
     outcome: "Allocate durable Changes and Tickets.",
     approval: "Approved.",
     now: new Date("2026-03-19T10:00:00.000Z"),
@@ -27,8 +21,7 @@ async function fixture() {
 
 async function firstChange(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string) {
   return createChange({
-    cwd: repository.root,
-    goalId,
+    cwd: repository.root, hostPaths: repository.hostPaths, goalId,
     title: "Create allocation",
     intent: "Issue parent-relative IDs.",
     rationale: "Sequential work needs deterministic identity.",
@@ -61,22 +54,22 @@ describe("sequential Change and Ticket allocation", () => {
       baseRevision: repository.head,
     });
     expect(first.change.body).toContain("## Acceptance criteria\n\n- Allocate the next monotonic ID.");
-    expect(await changeStatus(repository.root, goalId, "001")).toBe("active");
+    expect(await changeStatus(repository.project, goalId, "001")).toBe("active");
     expect(first.change.metadata).not.toHaveProperty("status");
 
     await expect(firstChange(repository, goalId)).rejects.toThrow(`already has unresolved Change 001`);
 
-    const decisionPath = changeDecisionPath(repository.root, goalId, "001");
+    const decisionPath = changeDecisionPath(repository.project, goalId, "001");
     await installImmutable(
-      repository.root,
+      repository.project.controlRoot,
       decisionPath,
       serializeDocument({ kind: "change-decision", disposition: "abandon" }, "Invalid decision."),
     );
-    await expect(changeStatus(repository.root, goalId, "001")).rejects.toThrow();
+    await expect(changeStatus(repository.project, goalId, "001")).rejects.toThrow();
     await rm(decisionPath);
 
     await installImmutable(
-      repository.root,
+      repository.project.controlRoot,
       decisionPath,
       serializeDocument(
         {
@@ -89,11 +82,10 @@ describe("sequential Change and Ticket allocation", () => {
         "Superseded.",
       ),
     );
-    expect(await changeStatus(repository.root, goalId, "001")).toBe("resolved");
+    expect(await changeStatus(repository.project, goalId, "001")).toBe("resolved");
     await expect(
       issueTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         instruction: "Reopen resolved work.",
         executionPolicy,
@@ -104,8 +96,7 @@ describe("sequential Change and Ticket allocation", () => {
     // A directory left before immutable publication burns its sequence ID.
     await mkdir(join(repository.projectRoot, "goals", goalId, "changes", "002"), { recursive: true });
     const third = await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Continue allocation",
       intent: "Do not reuse interrupted allocation IDs.",
       rationale: "Nested identities remain stable.",
@@ -126,8 +117,7 @@ describe("sequential Change and Ticket allocation", () => {
     const hostRevision = await repository.git("rev-parse", "HEAD");
 
     const first = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Implement monotonic Ticket allocation.",
       curatedContext: "Preserve directories left by interrupted publication.",
@@ -157,9 +147,9 @@ describe("sequential Change and Ticket allocation", () => {
     expect(first.ticket.body).toContain("### Change\n\n# Create allocation");
     expect(first.ticket.body).toContain("### Current Plan\n\n# Plan: Sequential workflow");
     expect(first.ticket.body).toContain("### Planner-selected context\n\nPreserve directories");
-    expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("open");
+    expect(await ticketStatus(repository.project, goalId, "001", "001")).toBe("open");
 
-    const firstTicketPath = ticketPath(repository.root, goalId, "001", "001");
+    const firstTicketPath = ticketPath(repository.project, goalId, "001", "001");
     const firstTicketSource = await readFile(firstTicketPath, "utf8");
     await rm(firstTicketPath);
     await writeFile(
@@ -169,7 +159,7 @@ describe("sequential Change and Ticket allocation", () => {
         `\"revision\": \"${hostRevision}\"`,
       ),
     );
-    await expect(ticketStatus(repository.root, goalId, "001", "001")).rejects.toThrow(
+    await expect(ticketStatus(repository.project, goalId, "001", "001")).rejects.toThrow(
       "Ticket guidance must come from the Change base revision",
     );
     await rm(firstTicketPath);
@@ -177,8 +167,7 @@ describe("sequential Change and Ticket allocation", () => {
 
     await expect(
       issueTicket({
-        cwd: repository.root,
-        goalId,
+        cwd: repository.root, hostPaths: repository.hostPaths, goalId,
         changeId: "001",
         instruction: "Issue another Ticket too early.",
         executionPolicy,
@@ -204,27 +193,26 @@ describe("sequential Change and Ticket allocation", () => {
         finishedAt: "2026-03-19T10:21:00.000Z",
       },
     };
-    const interruptedReportPath = reportPath(repository.root, goalId, "001", "001");
+    const interruptedReportPath = reportPath(repository.project, goalId, "001", "001");
     await installImmutable(
-      repository.root,
+      repository.project.controlRoot,
       interruptedReportPath,
       serializeDocument({ ...interruptedReport, role: "review" }, "Worker interrupted."),
     );
-    await expect(ticketStatus(repository.root, goalId, "001", "001")).rejects.toThrow("role does not match");
+    await expect(ticketStatus(repository.project, goalId, "001", "001")).rejects.toThrow("role does not match");
     await rm(interruptedReportPath);
     await installImmutable(
-      repository.root,
+      repository.project.controlRoot,
       interruptedReportPath,
       serializeDocument(interruptedReport, "Worker interrupted."),
     );
-    expect(await ticketStatus(repository.root, goalId, "001", "001")).toBe("reported");
+    expect(await ticketStatus(repository.project, goalId, "001", "001")).toBe("reported");
 
     await mkdir(join(repository.projectRoot, "goals", goalId, "changes", "001", "tickets", "002"), {
       recursive: true,
     });
     const third = await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Retry from the Change base.",
       executionPolicy: { isolation: "container", networkAccess: "none", credentialGrants: [] },

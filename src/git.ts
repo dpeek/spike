@@ -1,8 +1,10 @@
 import { realpath } from "node:fs/promises";
+import type { HostPaths } from "./data-root.ts";
 import { resolveProject } from "./project.ts";
 
 export type Repository = {
   root: string;
+  controlRoot: string;
   identity: string;
   head: string;
 };
@@ -59,7 +61,7 @@ export async function readGitBlob(cwd: string, object: string, maximumBytes: num
   }
 }
 
-export async function discoverRepository(cwd: string): Promise<Repository> {
+export async function discoverRepository(cwd: string, hostPaths: HostPaths): Promise<Repository> {
   let root: string;
   try {
     root = await realpath(await git(cwd, ["rev-parse", "--show-toplevel"]));
@@ -74,9 +76,10 @@ export async function discoverRepository(cwd: string): Promise<Repository> {
     throw new Error("the repository must have at least one commit");
   }
 
-  const project = await resolveProject(root);
+  const project = await resolveProject(root, hostPaths);
   return {
     root,
+    controlRoot: project.controlRoot,
     head,
     identity: project.registration.identity,
   };

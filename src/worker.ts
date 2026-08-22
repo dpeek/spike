@@ -21,7 +21,8 @@ import {
   type ReadHerdrTerminalInput,
 } from "./herdr.ts";
 import { loadTicket, ticketStatus } from "./ticket.ts";
-import { projectRoot } from "./project.ts";
+import type { ProjectPaths } from "./project.ts";
+import type { HostPaths } from "./data-root.ts";
 
 export type TicketIdentity = {
   goalId: string;
@@ -49,11 +50,11 @@ export type WorkerAdapter = {
   /** Adapter-owned runtime resource validation and lifecycle operations. */
   validateRuntime: (resource: unknown) => void;
   runtimeOperations?: WorkerRuntimeOperations;
-  observe: (root: string, identity: TicketIdentity, options?: unknown) => Promise<WorkerObservation>;
-  loadFinished: (root: string, identity: TicketIdentity, operations?: WorkerRuntimeOperations) => Promise<WorkerExecution>;
-  readTerminal?: (root: string, identity: TicketIdentity, input?: unknown, options?: unknown) => Promise<string>;
-  attachTerminal?: (root: string, identity: TicketIdentity, options?: unknown) => Promise<number>;
-  finalize: (root: string, identity: TicketIdentity, finishedAt: Date, operations?: WorkerRuntimeOperations) => Promise<WorkerCleanup>;
+  observe: (root: ProjectPaths, identity: TicketIdentity, options?: unknown) => Promise<WorkerObservation>;
+  loadFinished: (root: ProjectPaths, identity: TicketIdentity, operations?: WorkerRuntimeOperations) => Promise<WorkerExecution>;
+  readTerminal?: (root: ProjectPaths, identity: TicketIdentity, input?: unknown, options?: unknown) => Promise<string>;
+  attachTerminal?: (root: ProjectPaths, identity: TicketIdentity, options?: unknown) => Promise<number>;
+  finalize: (root: ProjectPaths, identity: TicketIdentity, finishedAt: Date, operations?: WorkerRuntimeOperations) => Promise<WorkerCleanup>;
 };
 
 export type WorkerExecution = TicketIdentity & {
@@ -74,6 +75,7 @@ export type WorkerExecution = TicketIdentity & {
 
 export type DispatchWorkerTicketInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   command: string[];
   worker: string;
   environmentDigest?: string;
@@ -95,6 +97,7 @@ export type _DispatchLocalTicketInput = TicketIdentity & {
 
 export type DispatchPiTicketInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   worker: string;
   host?: "herdr" | "direct";
   piExecutable?: string;
@@ -290,9 +293,9 @@ export function selectWorkerAdapter(policy: { isolation: "workspace" | "containe
   throw new Error(`no Worker adapter supports ${policy.isolation} isolation`);
 }
 
-export function exchangePath(root: string, identity: TicketIdentity): string {
+export function exchangePath(project: ProjectPaths, identity: TicketIdentity): string {
   return join(
-    projectRoot(root),
+    project.controlRoot,
     "exchange",
     "goals",
     identity.goalId,
@@ -303,13 +306,13 @@ export function exchangePath(root: string, identity: TicketIdentity): string {
   );
 }
 
-export function ticketOutputPath(root: string, identity: TicketIdentity): string {
-  return join(exchangePath(root, identity), "output");
+export function ticketOutputPath(project: ProjectPaths, identity: TicketIdentity): string {
+  return join(exchangePath(project, identity), "output");
 }
 
-export function workerRecordPath(root: string, identity: TicketIdentity): string {
+export function workerRecordPath(project: ProjectPaths, identity: TicketIdentity): string {
   return join(
-    projectRoot(root),
+    project.controlRoot,
     "runtime",
     "workers",
     "goals",
@@ -377,12 +380,12 @@ function validateLocalCloneRuntime(resource: unknown): asserts resource is Local
 }
 
 export async function loadRecordedWorkerIfPresent(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
 ): Promise<RecordedWorker | undefined> {
   const path = workerRecordPath(root, identity);
-  if (!(await documentExists(root, path))) return undefined;
-  const document = await readDocument(root, path);
+  if (!(await documentExists(root.controlRoot, path))) return undefined;
+  const document = await readDocument(root.controlRoot, path);
   const metadata = workerRecordSchema.parse(document.metadata);
   if (
     metadata.goalId !== identity.goalId ||
@@ -418,7 +421,7 @@ export async function loadRecordedWorkerIfPresent(
 }
 
 export async function recordWorker(
-  root: string,
+  root: ProjectPaths,
   input: TicketIdentity & {
     role: "implement" | "review"; worker: string; startedAt: string;
     runtime: WorkerRuntimeResource; environmentDigest?: string;
@@ -437,13 +440,13 @@ export async function recordWorker(
     runtime: { adapter: selected.adapter, resource: input.runtime },
   });
   const body = "# Worker runtime\n";
-  await installImmutable(root, workerRecordPath(root, input), serializeDocument(metadata, body));
+  await installImmutable(root.controlRoot, workerRecordPath(root, input), serializeDocument(metadata, body));
   return { metadata, body };
 }
 
 /** Docker lifecycle tests may record opaque attended resources without a daemon. */
 export function recordDockerWorker(
-  root: string,
+  root: ProjectPaths,
   input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; containerId: string; imageDigest: string; workspace?: string; herdr?: HerdrHandles; environmentDigest?: string },
 ): Promise<RecordedWorker> {
   return recordWorker(root, {
@@ -456,7 +459,7 @@ export function recordDockerWorker(
 
 /** Local adapter's resource constructor; generic recording retains it opaquely. */
 export function recordLocalCloneWorker(
-  root: string,
+  root: ProjectPaths,
   input: TicketIdentity & { role: "implement" | "review"; worker: string; startedAt: string; workspace: string; pid?: number; herdr?: HerdrHandles; environmentDigest?: string },
 ): Promise<RecordedWorker> {
   return recordWorker(root, {
@@ -467,9 +470,9 @@ export function recordLocalCloneWorker(
   });
 }
 
-async function replaceWorkerRecord(root: string, record: RecordedWorker): Promise<void> {
+async function replaceWorkerRecord(root: ProjectPaths, record: RecordedWorker): Promise<void> {
   await replaceAtomic(
-    root,
+    root.controlRoot,
     workerRecordPath(root, record.metadata),
     serializeDocument(record.metadata, record.body),
   );
@@ -511,7 +514,7 @@ async function loadHerdrExecutionMarker(
   return herdrExecutionSchema.parse(JSON.parse(await readFile(path, "utf8")));
 }
 
-async function refreshHerdrExecution(root: string, record: RecordedWorker): Promise<RecordedWorker> {
+async function refreshHerdrExecution(root: ProjectPaths, record: RecordedWorker): Promise<RecordedWorker> {
   const resource = attendedRuntime(record.metadata.runtime?.resource);
   if (record.metadata.finishedAt !== undefined || resource === undefined) return record;
   const execution = await loadHerdrExecutionMarker(resource);
@@ -548,7 +551,7 @@ async function installDockerExecutionMarker(resource: DockerRuntime, exitCode: n
   }
 }
 
-async function refreshDockerExecution(root: string, record: RecordedWorker, operations: WorkerRuntimeOperations = dockerWorkerAdapter.runtimeOperations!): Promise<RecordedWorker> {
+async function refreshDockerExecution(root: ProjectPaths, record: RecordedWorker, operations: WorkerRuntimeOperations = dockerWorkerAdapter.runtimeOperations!): Promise<RecordedWorker> {
   if (record.metadata.finishedAt !== undefined) return record;
   const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
   if (runtime === undefined) return record;
@@ -597,7 +600,7 @@ const localCloneRuntimeOperations: WorkerRuntimeOperations = {
 localCloneWorkerAdapter.runtimeOperations = localCloneRuntimeOperations;
 
 export async function stopAndFinalizeRecordedWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   finishedAt: Date,
   operations?: WorkerRuntimeOperations,
@@ -673,7 +676,7 @@ export async function stopAndFinalizeRecordedWorker(
 
 /** Finalize through the adapter selected by immutable Ticket policy. */
 export async function finalizeWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   finishedAt: Date,
   operations?: WorkerRuntimeOperations,
@@ -682,7 +685,7 @@ export async function finalizeWorker(
   return selectWorkerAdapter(ticket.metadata.executionPolicy).finalize(root, identity, finishedAt, operations);
 }
 
-export async function forgetFinalizedWorker(root: string, identity: TicketIdentity): Promise<void> {
+export async function forgetFinalizedWorker(root: ProjectPaths, identity: TicketIdentity): Promise<void> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) return;
   if (record.metadata.runtime !== undefined) throw new Error("cannot forget Worker record before resources are finalized");
@@ -690,7 +693,7 @@ export async function forgetFinalizedWorker(root: string, identity: TicketIdenti
 }
 
 async function loadFinishedLocalCloneWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
 ): Promise<WorkerExecution> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
@@ -710,7 +713,7 @@ async function loadFinishedLocalCloneWorker(
 
 /** Load completion evidence through the adapter selected by immutable Ticket policy. */
 export async function loadFinishedWorkerExecution(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   operations?: WorkerRuntimeOperations,
 ): Promise<WorkerExecution> {
@@ -719,7 +722,7 @@ export async function loadFinishedWorkerExecution(
 }
 
 export async function observeLocalCloneWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   herdr: HerdrOperations = herdrOperations,
 ): Promise<WorkerObservation> {
@@ -742,7 +745,7 @@ export async function observeLocalCloneWorker(
 
 /** Observe through the adapter selected by immutable Ticket policy. */
 export async function observeWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   herdr?: HerdrOperations,
 ): Promise<WorkerObservation> {
@@ -755,7 +758,7 @@ function workerDoneKey(identity: TicketIdentity): string {
 }
 
 async function markerBackedHerdrDone(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
 ): Promise<WorkerDoneNotification | undefined> {
   if ((await ticketStatus(root, identity.goalId, identity.changeId, identity.ticketId)) !== "open") {
@@ -770,7 +773,7 @@ async function markerBackedHerdrDone(
 }
 
 /** Docker completion is owned by the adapter, never by the Herdr attach pane. */
-async function waitForDockerWorkerDone(root: string, identity: TicketIdentity, signal?: AbortSignal): Promise<WorkerDoneNotification> {
+async function waitForDockerWorkerDone(root: ProjectPaths, identity: TicketIdentity, signal?: AbortSignal): Promise<WorkerDoneNotification> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} has no Worker record`);
   const runtime = record.metadata.runtime?.resource as DockerRuntime | undefined;
@@ -794,7 +797,7 @@ async function waitForDockerWorkerDone(root: string, identity: TicketIdentity, s
  * publishes a Report or closes a Ticket.
  */
 export async function waitForWorkerDone(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   signal?: AbortSignal,
 ): Promise<WorkerDoneNotification> {
@@ -855,7 +858,7 @@ export async function waitForWorkerDone(
 }
 
 async function readLocalCloneWorkerTerminal(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   input: ReadHerdrTerminalInput = {},
   herdr: HerdrOperations = herdrOperations,
@@ -867,7 +870,7 @@ async function readLocalCloneWorkerTerminal(
 }
 
 async function attachLocalCloneWorkerTerminal(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   herdr: HerdrOperations = herdrOperations,
 ): Promise<number> {
@@ -878,7 +881,7 @@ async function attachLocalCloneWorkerTerminal(
 }
 
 export async function readWorkerTerminal(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   input: ReadHerdrTerminalInput = {},
   herdr: HerdrOperations = herdrOperations,
@@ -890,7 +893,7 @@ export async function readWorkerTerminal(
 }
 
 export async function attachWorkerTerminal(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   herdr: HerdrOperations = herdrOperations,
 ): Promise<number> {
@@ -931,7 +934,7 @@ For completed work, Spike snapshots the checkout and creates \`repository.bundle
 `;
 }
 
-export async function prepareTicketExchange(root: string, identity: TicketIdentity): Promise<TicketExchange> {
+export async function prepareTicketExchange(root: ProjectPaths, identity: TicketIdentity): Promise<TicketExchange> {
   const ticket = await loadTicket(root, identity.goalId, identity.changeId, identity.ticketId);
   if ((await ticketStatus(root, identity.goalId, identity.changeId, identity.ticketId)) === "reported") {
     throw new Error(`Ticket ${identity.goalId}/${identity.changeId}/${identity.ticketId} is already reported`);
@@ -941,15 +944,15 @@ export async function prepareTicketExchange(root: string, identity: TicketIdenti
   const inputDirectory = join(exchange, "input");
   const outputDirectory = join(exchange, "output");
   // Validate the complete central path before mkdir can follow an exchange symlink.
-  await ensureWorkflowDirectory(root, inputDirectory);
+  await ensureWorkflowDirectory(root.controlRoot, inputDirectory);
 
   await installImmutable(
-    root,
+    root.controlRoot,
     join(inputDirectory, "ticket.md"),
     serializeDocument(ticket.metadata, ticket.body),
   );
   await installImmutable(
-    root,
+    root.controlRoot,
     join(inputDirectory, "context.md"),
     serializeDocument(
       {
@@ -962,13 +965,13 @@ export async function prepareTicketExchange(root: string, identity: TicketIdenti
       contextBody(ticket.metadata.role, ticket.metadata.inputRevision),
     ),
   );
-  await createInputBundle(root, ticket.metadata.inputRevision, join(inputDirectory, "repository.bundle"), identity);
+  await createInputBundle(root.root, ticket.metadata.inputRevision, join(inputDirectory, "repository.bundle"), identity);
   await Promise.all([
     chmod(join(inputDirectory, "ticket.md"), 0o400),
     chmod(join(inputDirectory, "context.md"), 0o400),
     chmod(inputDirectory, 0o500),
   ]);
-  await ensureWorkflowDirectory(root, outputDirectory);
+  await ensureWorkflowDirectory(root.controlRoot, outputDirectory);
   return { ...identity, inputDirectory, outputDirectory };
 }
 
@@ -1164,7 +1167,7 @@ function dockerEnvironment(exchange: TicketExchange, revision: string, ticket: A
   return Object.entries(values).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
-async function observeDockerWorker(root: string, identity: TicketIdentity): Promise<WorkerObservation> {
+async function observeDockerWorker(root: ProjectPaths, identity: TicketIdentity): Promise<WorkerObservation> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record === undefined) return { hosting: null, status: "unavailable" };
   record = await refreshHerdrExecution(root, record);
@@ -1178,21 +1181,21 @@ async function observeDockerWorker(root: string, identity: TicketIdentity): Prom
   return { hosting, status: "working" };
 }
 
-async function readDockerWorkerTerminal(root: string, identity: TicketIdentity, input: ReadHerdrTerminalInput = {}, herdr: HerdrOperations = herdrOperations): Promise<string> {
+async function readDockerWorkerTerminal(root: ProjectPaths, identity: TicketIdentity, input: ReadHerdrTerminalInput = {}, herdr: HerdrOperations = herdrOperations): Promise<string> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
   const runtime = attendedRuntime(record?.metadata.runtime?.resource);
   if (runtime === undefined) throw new Error("Ticket has no Herdr-hosted terminal");
   return herdr.read(runtime.pane, input);
 }
 
-async function attachDockerWorkerTerminal(root: string, identity: TicketIdentity, herdr: HerdrOperations = herdrOperations): Promise<number> {
+async function attachDockerWorkerTerminal(root: ProjectPaths, identity: TicketIdentity, herdr: HerdrOperations = herdrOperations): Promise<number> {
   const record = await loadRecordedWorkerIfPresent(root, identity);
   const runtime = attendedRuntime(record?.metadata.runtime?.resource);
   if (runtime === undefined) throw new Error("Ticket has no Herdr-hosted terminal");
   return herdr.attach(runtime.pane);
 }
 
-async function loadFinishedDockerWorker(root: string, identity: TicketIdentity, operations?: WorkerRuntimeOperations): Promise<WorkerExecution> {
+async function loadFinishedDockerWorker(root: ProjectPaths, identity: TicketIdentity, operations?: WorkerRuntimeOperations): Promise<WorkerExecution> {
   let record = await loadRecordedWorkerIfPresent(root, identity);
   if (record !== undefined) {
     record = await refreshHerdrExecution(root, record);
@@ -1205,12 +1208,12 @@ async function loadFinishedDockerWorker(root: string, identity: TicketIdentity, 
 }
 
 export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
-  const frozenRepository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
+  const frozenRepository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(frozenRepository, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
   // Validate and resolve before preparing an exchange or invoking Docker create.
   validateDockerPolicy(ticket);
@@ -1220,7 +1223,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", image]);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${image}`);
   await input.afterDockerImageInspection?.(imageDigest);
-  const exchange = await prepareTicketExchange(repository.root, identity);
+  const exchange = await prepareTicketExchange(repository, identity);
   const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
   let containerId: string | undefined;
   let record: RecordedWorker | undefined;
@@ -1238,7 +1241,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
     if (createdImageDigest !== imageDigest) {
       throw new Error(`Docker container image does not match inspected provenance: ${createdImageDigest}`);
     }
-    record = await recordWorker(repository.root, {
+    record = await recordWorker(repository, {
       ...identity, role: ticket.metadata.role, worker, startedAt, runtime: { containerId, imageDigest }, environmentDigest: imageDigest,
     });
     const completion = new Promise<void>((resolve) => { completeDispatch = resolve; });
@@ -1249,7 +1252,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
     // Finalization may have stopped and removed the runtime while wait was
     // pending. Merge terminal evidence into the current durable record rather
     // than resurrecting this dispatch-time runtime snapshot.
-    const current = await loadRecordedWorkerIfPresent(repository.root, identity) ?? record;
+    const current = await loadRecordedWorkerIfPresent(repository, identity) ?? record;
     record = {
       metadata: workerRecordSchema.parse({
         ...current.metadata,
@@ -1258,7 +1261,7 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
       }),
       body: current.body,
     };
-    await replaceWorkerRecord(repository.root, record);
+    await replaceWorkerRecord(repository, record);
     const logs = await docker(["logs", containerId]);
     if (logs.code !== 0) throw new Error(`docker logs failed: ${(logs.stderr || logs.stdout).trim()}`);
     return { root: repository.root, exchange, execution: { ...identity, adapter: "docker", isolation: "container", worker, model: ticket.metadata.model, thinking: ticket.metadata.thinking, startedAt, finishedAt, exitCode, environmentDigest: imageDigest, stdout: logs.stdout, stderr: logs.stderr } };
@@ -1275,19 +1278,19 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
  * adapter-owned restartable exact-container observer waits after attachment;
  * attachment loss is never completion evidence. */
 export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
-  const frozenRepository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
+  const frozenRepository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(frozenRepository, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== dockerWorkerAdapter) throw new Error("selected Worker adapter cannot host a Docker Ticket");
   validateDockerPolicy(ticket);
   const credential = await resolveDockerCredential(ticket);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const imageDigest = await dockerRequired(["image", "inspect", "--format", "{{.Id}}", dockerImage()]);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${dockerImage()}`);
-  const exchange = await prepareTicketExchange(repository.root, identity);
+  const exchange = await prepareTicketExchange(repository, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const host = input.herdr ?? herdrOperations;
   const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
@@ -1304,7 +1307,7 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
     const createdImageDigest = await dockerRequired(["inspect", "--format", "{{.Image}}", containerId]);
     if (createdImageDigest !== imageDigest) throw new Error("Docker container image does not match inspected provenance");
     handles = await host.createTab({ cwd: workspace, label: `${input.goalId}-${input.changeId}-${input.ticketId}`, environment: {} });
-    await recordWorker(repository.root, { ...identity, role: ticket.metadata.role, worker, startedAt: (input.clock ?? (() => new Date()))().toISOString(), environmentDigest: imageDigest, runtime: { containerId, imageDigest, host: "herdr", workspace, tab: handles.tab, pane: handles.pane } });
+    await recordWorker(repository, { ...identity, role: ticket.metadata.role, worker, startedAt: (input.clock ?? (() => new Date()))().toISOString(), environmentDigest: imageDigest, runtime: { containerId, imageDigest, host: "herdr", workspace, tab: handles.tab, pane: handles.pane } });
     recorded = true;
     // Start is adapter-owned. Herdr owns only this interactive attachment;
     // losing its shell cannot prevent a later supervisor from observing exit.
@@ -1332,19 +1335,19 @@ export type DispatchHerdrTicketInput = DispatchLocalTicketInput & {
 export async function dispatchHerdrTicket(
   input: DispatchHerdrTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; hosting: "herdr"; status: "working" }> {
-  const frozenRepository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
+  const frozenRepository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(frozenRepository, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== localCloneWorkerAdapter) {
     throw new Error("selected Worker adapter cannot host a local-clone Ticket");
   }
   validateLocalPolicy(ticket);
 
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const exchange = await prepareTicketExchange(repository.root, identity);
+  const exchange = await prepareTicketExchange(repository, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const checkout = join(workspace, "repository");
   const inputBundle = join(exchange.inputDirectory, "repository.bundle");
@@ -1371,7 +1374,7 @@ export async function dispatchHerdrTicket(
       label: `${input.goalId}-${input.changeId}-${input.ticketId}`,
       environment: workerEnvironment(exchange, ticket.metadata.inputRevision, ticket),
     });
-    workerRecord = await recordLocalCloneWorker(repository.root, {
+    workerRecord = await recordLocalCloneWorker(repository, {
       ...identity,
       role: ticket.metadata.role,
       worker,
@@ -1395,19 +1398,19 @@ export async function dispatchHerdrTicket(
 export async function dispatchLocalTicket(
   input: DispatchLocalTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
-  const frozenRepository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(frozenRepository.root, input.goalId);
+  const frozenRepository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(frozenRepository, input.goalId);
   if (input.command.length === 0) throw new Error("Worker command must not be empty");
   const worker = requireText(input.worker, "Worker identity");
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (selectWorkerAdapter(ticket.metadata.executionPolicy) !== localCloneWorkerAdapter) {
     throw new Error("selected Worker adapter cannot host a local-clone Ticket");
   }
   validateLocalPolicy(ticket);
 
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const exchange = await prepareTicketExchange(repository.root, identity);
+  const exchange = await prepareTicketExchange(repository, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const checkout = join(workspace, "repository");
   const clock = input.clock ?? (() => new Date());
@@ -1431,7 +1434,7 @@ export async function dispatchLocalTicket(
 
   try {
     startedAt = clock().toISOString();
-    workerRecord = await recordLocalCloneWorker(repository.root, {
+    workerRecord = await recordLocalCloneWorker(repository, {
       ...identity,
       role: ticket.metadata.role,
       worker,
@@ -1464,7 +1467,7 @@ export async function dispatchLocalTicket(
         runtime: { adapter: "local-clone", resource: { host: "direct", workspace, pid: child.pid } },
       }),
     };
-    await replaceWorkerRecord(repository.root, workerRecord);
+    await replaceWorkerRecord(repository, workerRecord);
     [exitCode, stdout, stderr] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
@@ -1484,7 +1487,7 @@ export async function dispatchLocalTicket(
             exitCode,
           }),
         };
-        await replaceWorkerRecord(repository.root, workerRecord);
+        await replaceWorkerRecord(repository, workerRecord);
       }
     } finally {
       liveDirectWorkers.delete(liveWorkerKey);
@@ -1545,15 +1548,15 @@ export async function dispatchPiTicket(
       status: "working";
     }
 > {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
   const host = selectPiHost(ticket.metadata.executionPolicy, input.host);
   const container = selectWorkerAdapter(ticket.metadata.executionPolicy) === dockerWorkerAdapter;
   // Docker receives no host checkout paths. The pinned image contains both Pi
   // and this extension, while its entrypoint clones the immutable input bundle.
-  const inputDirectory = container ? "/exchange/input" : join(exchangePath(repository.root, identity), "input");
+  const inputDirectory = container ? "/exchange/input" : join(exchangePath(repository, identity), "input");
   const terminalTools = piTerminalTools(ticket.metadata.role);
   const extension = container ? "/opt/spike/src/pi-worker-extension.ts" : resolve(import.meta.dir, "pi-worker-extension.ts");
   const command = [
@@ -1585,6 +1588,7 @@ export async function dispatchPiTicket(
     const attended = await adapter.dispatchAttended({
       ...identity,
       cwd: repository.root,
+      hostPaths: input.hostPaths,
       worker: input.worker,
       command,
       ...(input.clock === undefined ? {} : { clock: input.clock }),
@@ -1596,6 +1600,7 @@ export async function dispatchPiTicket(
   const dispatched = await adapter.dispatch({
     ...identity,
     cwd: repository.root,
+    hostPaths: input.hostPaths,
     worker: input.worker,
     command,
     ...(input.clock === undefined ? {} : { clock: input.clock }),
@@ -1612,8 +1617,8 @@ export async function dispatchPiTicket(
 export async function dispatchWorkerTicket(
   input: DispatchLocalTicketInput,
 ): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   const adapter = selectWorkerAdapter(ticket.metadata.executionPolicy);
   return adapter.dispatch(input);
 }
@@ -1622,8 +1627,8 @@ async function dispatchLocalRole(
   input: DispatchLocalTicketInput,
   role: "implement" | "review",
 ): Promise<{ root: string; exchange: TicketExchange; execution: WorkerExecution }> {
-  const repository = await discoverRepository(input.cwd);
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (ticket.metadata.role !== role) throw new Error(`local ${role} dispatch requires a ${role} Ticket`);
   return dispatchLocalTicket(input);
 }

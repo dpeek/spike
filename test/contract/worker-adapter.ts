@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { publishFailedReport, publishImplementationReport } from "../../src/report.ts";
 import { loadRecordedWorkerIfPresent } from "../../src/worker.ts";
+import type { HostPaths } from "../../src/data-root.ts";
+import type { ProjectPaths } from "../../src/project.ts";
 import type { TicketIdentity, WorkerAdapter } from "../../src/worker.ts";
 
 /**
@@ -11,7 +13,7 @@ import type { TicketIdentity, WorkerAdapter } from "../../src/worker.ts";
 export function workerAdapterContract(input: {
   name: string;
   adapter: WorkerAdapter;
-  createTicket: () => Promise<{ root: string; identity: TicketIdentity; revision: string; remove: () => Promise<void> }>;
+  createTicket: () => Promise<{ root: string; hostPaths: HostPaths; project: ProjectPaths; identity: TicketIdentity; revision: string; remove: () => Promise<void> }>;
 }): void {
   describe(`Worker adapter contract: ${input.name}`, () => {
     test("dispatches exact immutable input, records observation, and finalizes idempotently", async () => {
@@ -33,37 +35,38 @@ if (code !== 0) throw new Error(err || out);
 `;
         const dispatching = input.adapter.dispatch({
           cwd: fixture.root,
+          hostPaths: fixture.hostPaths,
           ...fixture.identity,
           worker: "contract-worker",
           command: ["bun", "-e", script],
         });
         for (let attempt = 0; ; attempt++) {
-          const record = await loadRecordedWorkerIfPresent(fixture.root, fixture.identity);
-          const observation = await input.adapter.observe(fixture.root, fixture.identity);
+          const record = await loadRecordedWorkerIfPresent(fixture.project, fixture.identity);
+          const observation = await input.adapter.observe(fixture.project, fixture.identity);
           if (record !== undefined && observation.status === "working") break;
           if (attempt > 50) throw new Error("adapter did not durably expose an in-progress Worker");
           await Bun.sleep(10);
         }
-        expect(await input.adapter.observe(fixture.root, fixture.identity)).toEqual({ hosting: "direct", status: "working" });
+        expect(await input.adapter.observe(fixture.project, fixture.identity)).toEqual({ hosting: "direct", status: "working" });
         const dispatched = await dispatching;
         expect(dispatched.execution).toMatchObject({
           adapter: input.adapter.adapter,
           isolation: input.adapter.isolation,
           exitCode: 0,
         });
-        expect(await input.adapter.observe(fixture.root, fixture.identity)).toEqual({ hosting: "direct", status: "done" });
+        expect(await input.adapter.observe(fixture.project, fixture.identity)).toEqual({ hosting: "direct", status: "done" });
         expect(await Bun.file(`${dispatched.exchange.outputDirectory}/submission.md`).exists()).toBe(true);
         // Finalization is idempotent before Report publication.
-        expect((await input.adapter.finalize(fixture.root, fixture.identity, new Date())).status).toBe("finalized");
-        expect((await input.adapter.finalize(fixture.root, fixture.identity, new Date())).status).toBe("finalized");
+        expect((await input.adapter.finalize(fixture.project, fixture.identity, new Date())).status).toBe("finalized");
+        expect((await input.adapter.finalize(fixture.project, fixture.identity, new Date())).status).toBe("finalized");
         // Publication happens after process exit and removes the finalized record.
         const published = await publishImplementationReport({
-          cwd: fixture.root, ...fixture.identity, execution: dispatched.execution,
+          cwd: fixture.root, hostPaths: fixture.hostPaths, ...fixture.identity, execution: dispatched.execution,
           commitMessage: { summary: "Publish contract worker result" },
         });
         expect(published.report.metadata.outcome).toBe("completed");
         expect(published.cleanup.status).toBe("finalized");
-        expect(await loadRecordedWorkerIfPresent(fixture.root, fixture.identity)).toBeUndefined();
+        expect(await loadRecordedWorkerIfPresent(fixture.project, fixture.identity)).toBeUndefined();
       } finally {
         await Bun.spawn(["chmod", "-R", "u+w", fixture.root], { stdout: "ignore", stderr: "ignore" }).exited;
         await fixture.remove();
@@ -75,6 +78,7 @@ if (code !== 0) throw new Error(err || out);
       try {
         const dispatched = await input.adapter.dispatch({
           cwd: fixture.root,
+          hostPaths: fixture.hostPaths,
           ...fixture.identity,
           worker: "contract-worker",
           command: ["bun", "-e", "process.exit(23)"],
@@ -82,6 +86,7 @@ if (code !== 0) throw new Error(err || out);
         expect(dispatched.execution.exitCode).toBe(23);
         const published = await publishFailedReport({
           cwd: fixture.root,
+          hostPaths: fixture.hostPaths,
           ...fixture.identity,
           role: "implement",
           reason: "scripted contract failure",

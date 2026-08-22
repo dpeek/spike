@@ -1,17 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, onTestFinished, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadProjectConfig, resolveTicketAssignment } from "./config.ts";
 
-const roots: string[] = [];
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
-
 async function fixture(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "spike-config-test-"));
-  roots.push(root);
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
   await writeFile(
     join(root, "spike.json"),
     `${JSON.stringify({
@@ -54,7 +49,7 @@ describe("project agent configuration", () => {
 
   test("rejects missing, malformed, and incomplete configuration", async () => {
     const root = await mkdtemp(join(tmpdir(), "spike-config-test-"));
-    roots.push(root);
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
     await expect(loadProjectConfig(root)).rejects.toThrow("does not exist");
 
     await writeFile(join(root, "spike.json"), "not json\n");

@@ -5,6 +5,8 @@ import { z } from "zod";
 import { acceptanceCriteria } from "./acceptance.ts";
 import { changePath, loadChange } from "./change.ts";
 import { commitCrashHooks, type CrashInjector } from "./crash.ts";
+import type { HostPaths } from "./data-root.ts";
+import type { ProjectPaths } from "./project.ts";
 import { assertGoalBelongsToProject } from "./config.ts";
 import { assertGoalNotFrozen } from "./application.ts";
 import {
@@ -203,6 +205,7 @@ export type ReportExecution = TicketIdentity & {
 
 export type PublishImplementationReportInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   execution: WorkerExecution;
   commitMessage: {
     summary: string;
@@ -215,6 +218,7 @@ export type PublishImplementationReportInput = TicketIdentity & {
 
 export type PublishReviewReportInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   execution: WorkerExecution;
   now?: Date;
   crash?: CrashInjector;
@@ -223,6 +227,7 @@ export type PublishReviewReportInput = TicketIdentity & {
 
 export type PublishBlockedReportInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   execution: WorkerExecution;
   now?: Date;
   crash?: CrashInjector;
@@ -231,6 +236,7 @@ export type PublishBlockedReportInput = TicketIdentity & {
 
 export type PublishFailedReportInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   role: "implement" | "review";
   reason: string;
   execution: WorkerExecution;
@@ -241,6 +247,7 @@ export type PublishFailedReportInput = TicketIdentity & {
 
 export type PublishInterruptedReportInput = TicketIdentity & {
   cwd: string;
+  hostPaths: HostPaths;
   role: "implement" | "review";
   reason: string;
   execution: ReportExecution;
@@ -535,7 +542,7 @@ function matchingTicketModelSelection(
 
 /** Validate immutable Ticket provenance before an execution becomes a Report. */
 async function matchingTicketExecutionProvenance(
-  root: string,
+  root: ProjectPaths,
   ticket: Awaited<ReturnType<typeof loadTicket>>,
   execution: Pick<ReportExecution, "adapter" | "isolation" | "worker">,
   outcome: Report["metadata"]["outcome"],
@@ -573,7 +580,7 @@ function requireTerminalReason(reason: string, outcome: "Failure" | "Interruptio
 }
 
 async function finalizePublishedWorker(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
   finishedAt: Date,
   operations?: WorkerRuntimeOperations,
@@ -595,8 +602,8 @@ async function finalizePublishedWorker(
   }
 }
 
-async function loadReportDocument(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
-  const document = await readDocument(root, reportPath(root, goalId, changeId, ticketId));
+async function loadReportDocument(root: ProjectPaths, goalId: string, changeId: string, ticketId: string): Promise<Report> {
+  const document = await readDocument(root.controlRoot, reportPath(root, goalId, changeId, ticketId));
   const metadata = reportSchema.parse(document.metadata);
   if (metadata.goalId !== goalId || metadata.changeId !== changeId || metadata.ticketId !== ticketId) {
     throw new Error(`Report document belongs to a different Ticket: ${metadata.goalId}/${metadata.changeId}/${metadata.ticketId}`);
@@ -620,43 +627,43 @@ async function loadReportDocument(root: string, goalId: string, changeId: string
 }
 
 export async function loadSubmissionOutcome(
-  root: string,
+  root: ProjectPaths,
   identity: TicketIdentity,
 ): Promise<"completed" | "blocked"> {
-  const document = await readDocument(root, join(ticketOutputPath(root, identity), "submission.md"));
+  const document = await readDocument(root.controlRoot, join(ticketOutputPath(root, identity), "submission.md"));
   const metadata = submissionSchema.parse(document.metadata);
   assertSubmissionIdentity(metadata, identity);
   return metadata.outcome;
 }
 
-export async function loadReport(root: string, goalId: string, changeId: string, ticketId: string): Promise<Report> {
+export async function loadReport(root: ProjectPaths, goalId: string, changeId: string, ticketId: string): Promise<Report> {
   return loadReportDocument(root, goalId, changeId, ticketId);
 }
 
 export async function loadReportIfPresent(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   ticketId: string,
 ): Promise<Report | undefined> {
-  if (!(await documentExists(root, reportPath(root, goalId, changeId, ticketId)))) return undefined;
+  if (!(await documentExists(root.controlRoot, reportPath(root, goalId, changeId, ticketId)))) return undefined;
   return loadReportDocument(root, goalId, changeId, ticketId);
 }
 
 export async function loadChangeReportHistory(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<ChangeReportHistory> {
   const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
-  const ticketIds = (await listDirectoryNames(root, ticketsDirectory))
+  const ticketIds = (await listDirectoryNames(root.controlRoot, ticketsDirectory))
     .filter((name) => sequenceIdPattern.test(name))
     .sort();
   const reports: ChangeReportHistory["reports"] = [];
   let ticketCount = 0;
 
   for (const ticketId of ticketIds) {
-    if (!(await documentExists(root, ticketPath(root, goalId, changeId, ticketId)))) continue;
+    if (!(await documentExists(root.controlRoot, ticketPath(root, goalId, changeId, ticketId)))) continue;
     await loadTicket(root, goalId, changeId, ticketId);
     ticketCount++;
     const report = await loadReportIfPresent(root, goalId, changeId, ticketId);
@@ -674,7 +681,7 @@ export async function loadChangeReportHistory(
 }
 
 export async function loadImplementationReport(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   ticketId: string,
@@ -687,7 +694,7 @@ export async function loadImplementationReport(
 }
 
 export async function loadReviewReport(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   ticketId: string,
@@ -700,12 +707,12 @@ export async function loadReviewReport(
 }
 
 export async function deriveCurrentCandidate(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CurrentCandidate | undefined> {
   const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
-  const ticketIds = (await listDirectoryNames(root, ticketsDirectory))
+  const ticketIds = (await listDirectoryNames(root.controlRoot, ticketsDirectory))
     .filter((name) => sequenceIdPattern.test(name))
     .sort()
     .reverse();
@@ -722,7 +729,7 @@ export async function deriveCurrentCandidate(
 }
 
 export async function deriveCurrentReview(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CurrentReview | undefined> {
@@ -733,7 +740,7 @@ export async function deriveCurrentReview(
   if (candidate === undefined) return undefined;
 
   const ticketsDirectory = join(dirname(changePath(root, goalId, changeId)), "tickets");
-  const ticketIds = (await listDirectoryNames(root, ticketsDirectory))
+  const ticketIds = (await listDirectoryNames(root.controlRoot, ticketsDirectory))
     .filter((name) => sequenceIdPattern.test(name))
     .sort()
     .reverse();
@@ -785,7 +792,7 @@ export async function deriveCurrentReview(
 }
 
 async function deriveCurrentReviewWithVerdict(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
   verdict: ReviewReport["metadata"]["verdict"],
@@ -795,7 +802,7 @@ async function deriveCurrentReviewWithVerdict(
 }
 
 export function deriveCurrentRemediation(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CurrentRemediation | undefined> {
@@ -803,7 +810,7 @@ export function deriveCurrentRemediation(
 }
 
 export function deriveCurrentApproval(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CurrentApproval | undefined> {
@@ -811,7 +818,7 @@ export function deriveCurrentApproval(
 }
 
 export function deriveCurrentRejection(
-  root: string,
+  root: ProjectPaths,
   goalId: string,
   changeId: string,
 ): Promise<CurrentRejection | undefined> {
@@ -821,21 +828,21 @@ export function deriveCurrentRejection(
 export async function publishBlockedReport(
   input: PublishBlockedReportInput,
 ): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
-  if (await documentExists(repository.root, path)) {
+  const path = reportPath(repository, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.controlRoot, path)) {
     throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
   }
   matchingExecution(input.execution, identity);
 
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   matchingTicketModelSelection(ticket, input.execution);
-  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "blocked");
+  await matchingTicketExecutionProvenance(repository, ticket, input.execution, "blocked");
   const submission = await validateBlockedSubmission(
-    repository.root,
-    ticketOutputPath(repository.root, identity),
+    repository.controlRoot,
+    ticketOutputPath(repository, identity),
     identity,
   );
   const metadata = terminalReportSchema.parse({
@@ -851,33 +858,33 @@ export async function publishBlockedReport(
   });
   const report = { metadata, body: submission.body };
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     path,
     serializeDocument(metadata, submission.body),
     commitCrashHooks(input.crash, ticket.metadata.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
+  const cleanup = await finalizePublishedWorker(repository, identity, input.now ?? new Date(), input.runtimeOperations);
   return { root: repository.root, report, cleanup };
 }
 
 export async function publishFailedReport(
   input: PublishFailedReportInput,
 ): Promise<{ root: string; report: TerminalReport; cleanup: ReportPublicationCleanup }> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
-  if (await documentExists(repository.root, path)) {
+  const path = reportPath(repository, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.controlRoot, path)) {
     throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
   }
 
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (input.role !== ticket.metadata.role) {
     throw new Error(`failed Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
   matchingExecution(input.execution, identity, false);
   matchingTicketModelSelection(ticket, input.execution);
-  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "failed");
+  await matchingTicketExecutionProvenance(repository, ticket, input.execution, "failed");
   const execution = executionMetadata(input.execution);
   const reason = requireTerminalReason(input.reason, "Failure");
   const metadata = terminalReportSchema.parse({
@@ -895,12 +902,12 @@ export async function publishFailedReport(
   const report = { metadata, body };
 
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     path,
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
+  const cleanup = await finalizePublishedWorker(repository, identity, input.now ?? new Date(), input.runtimeOperations);
   return { root: repository.root, report, cleanup };
 }
 
@@ -908,21 +915,21 @@ async function publishHostTerminalReport(
   input: PublishInterruptedReportInput,
   outcome: "interrupted" | "stopped",
 ): Promise<{ root: string; report: TerminalReport }> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
-  if (await documentExists(repository.root, path)) {
+  const path = reportPath(repository, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.controlRoot, path)) {
     throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
   }
 
-  const ticket = await loadTicket(repository.root, input.goalId, input.changeId, input.ticketId);
+  const ticket = await loadTicket(repository, input.goalId, input.changeId, input.ticketId);
   if (input.role !== ticket.metadata.role) {
     throw new Error(`${outcome} Report role ${input.role} does not match its Ticket role ${ticket.metadata.role}`);
   }
   matchingReportExecution(input.execution, identity);
   matchingTicketModelSelection(ticket, input.execution);
-  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, outcome);
+  await matchingTicketExecutionProvenance(repository, ticket, input.execution, outcome);
   const execution = executionMetadata(input.execution);
   const label = outcome === "interrupted" ? "Interruption" : "Stop";
   const reason = requireTerminalReason(input.reason, label);
@@ -940,7 +947,7 @@ async function publishHostTerminalReport(
   const body = `# Ticket ${outcome}\n\n${reason}\n`;
   const report = { metadata, body };
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     path,
     serializeDocument(metadata, body),
     commitCrashHooks(input.crash, input.role === "implement" ? "implementation-report-publication" : "review-report-publication"),
@@ -963,31 +970,31 @@ export function publishStoppedReport(
 export async function publishImplementationReport(
   input: PublishImplementationReportInput,
 ): Promise<{ root: string; report: ImplementationReport; cleanup: ReportPublicationCleanup }> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   await assertGoalBelongsToProject(repository.root, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
-  if (await documentExists(repository.root, path)) {
+  const path = reportPath(repository, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.controlRoot, path)) {
     throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
   }
   matchingExecution(input.execution, identity);
 
   const [ticket, change] = await Promise.all([
-    loadTicket(repository.root, input.goalId, input.changeId, input.ticketId),
-    loadChange(repository.root, input.goalId, input.changeId),
+    loadTicket(repository, input.goalId, input.changeId, input.ticketId),
+    loadChange(repository, input.goalId, input.changeId),
   ]);
   if (ticket.metadata.role !== "implement") throw new Error("implementation Report requires an implement Ticket");
   matchingTicketModelSelection(ticket, input.execution);
-  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "completed");
+  await matchingTicketExecutionProvenance(repository, ticket, input.execution, "completed");
 
-  const currentCandidate = await deriveCurrentCandidate(repository.root, input.goalId, input.changeId);
+  const currentCandidate = await deriveCurrentCandidate(repository, input.goalId, input.changeId);
   if (ticket.metadata.responseToReviewTicketId === undefined) {
     if (currentCandidate !== undefined) {
       throw new Error("implementation Ticket omits the current Candidate's review Report");
     }
   } else {
-    const responseToReview = await deriveCurrentReview(repository.root, input.goalId, input.changeId);
+    const responseToReview = await deriveCurrentReview(repository, input.goalId, input.changeId);
     if (
       responseToReview === undefined ||
       responseToReview.reviewReport.metadata.verdict === "approve" ||
@@ -998,8 +1005,8 @@ export async function publishImplementationReport(
     }
   }
 
-  const outputDirectory = ticketOutputPath(repository.root, identity);
-  const submission = await validateImplementationSubmission(repository.root, outputDirectory, identity);
+  const outputDirectory = ticketOutputPath(repository, identity);
+  const submission = await validateImplementationSubmission(repository.controlRoot, outputDirectory, identity);
   const message = requireCommitMessage(input.commitMessage, identity);
 
   return withImportedWorkerRevision(
@@ -1033,12 +1040,12 @@ export async function publishImplementationReport(
 
       await retainCandidate(repository.root, input.goalId, input.changeId, input.ticketId, candidateRevision);
       await installImmutable(
-        repository.root,
+        repository.controlRoot,
         path,
         serializeDocument(metadata, submission.body),
         commitCrashHooks(input.crash, "implementation-report-publication"),
       );
-      const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
+      const cleanup = await finalizePublishedWorker(repository, identity, input.now ?? new Date(), input.runtimeOperations);
       return { root: repository.root, report, cleanup };
     },
   );
@@ -1047,23 +1054,23 @@ export async function publishImplementationReport(
 export async function publishReviewReport(
   input: PublishReviewReportInput,
 ): Promise<{ root: string; report: ReviewReport; cleanup: ReportPublicationCleanup }> {
-  const repository = await discoverRepository(input.cwd);
-  await assertGoalNotFrozen(repository.root, input.goalId);
+  const repository = await discoverRepository(input.cwd, input.hostPaths);
+  await assertGoalNotFrozen(repository, input.goalId);
   const identity = { goalId: input.goalId, changeId: input.changeId, ticketId: input.ticketId };
-  const path = reportPath(repository.root, input.goalId, input.changeId, input.ticketId);
-  if (await documentExists(repository.root, path)) {
+  const path = reportPath(repository, input.goalId, input.changeId, input.ticketId);
+  if (await documentExists(repository.controlRoot, path)) {
     throw new Error(`immutable Report already exists for Ticket ${input.goalId}/${input.changeId}/${input.ticketId}`);
   }
   matchingExecution(input.execution, identity);
 
   const [ticket, change, candidate] = await Promise.all([
-    loadTicket(repository.root, input.goalId, input.changeId, input.ticketId),
-    loadChange(repository.root, input.goalId, input.changeId),
-    deriveCurrentCandidate(repository.root, input.goalId, input.changeId),
+    loadTicket(repository, input.goalId, input.changeId, input.ticketId),
+    loadChange(repository, input.goalId, input.changeId),
+    deriveCurrentCandidate(repository, input.goalId, input.changeId),
   ]);
   if (ticket.metadata.role !== "review") throw new Error("review Report requires a review Ticket");
   matchingTicketModelSelection(ticket, input.execution);
-  await matchingTicketExecutionProvenance(repository.root, ticket, input.execution, "completed");
+  await matchingTicketExecutionProvenance(repository, ticket, input.execution, "completed");
   if (candidate === undefined) throw new Error(`Change ${input.goalId}/${input.changeId} has no completed implementation Candidate`);
   if (
     ticket.metadata.inputRevision !== candidate.candidateRevision ||
@@ -1073,7 +1080,7 @@ export async function publishReviewReport(
   }
 
   const producingReport = await loadImplementationReport(
-    repository.root,
+    repository,
     input.goalId,
     input.changeId,
     ticket.metadata.producingImplementationTicketId,
@@ -1083,8 +1090,8 @@ export async function publishReviewReport(
   }
 
   const submission = await validateReviewSubmission(
-    repository.root,
-    ticketOutputPath(repository.root, identity),
+    repository.controlRoot,
+    ticketOutputPath(repository, identity),
     identity,
     ticket.metadata.inputRevision,
     ticket.metadata.producingImplementationTicketId,
@@ -1110,11 +1117,11 @@ export async function publishReviewReport(
   });
   const report = { metadata, body: submission.body };
   await installImmutable(
-    repository.root,
+    repository.controlRoot,
     path,
     serializeDocument(metadata, submission.body),
     commitCrashHooks(input.crash, "review-report-publication"),
   );
-  const cleanup = await finalizePublishedWorker(repository.root, identity, input.now ?? new Date(), input.runtimeOperations);
+  const cleanup = await finalizePublishedWorker(repository, identity, input.now ?? new Date(), input.runtimeOperations);
   return { root: repository.root, report, cleanup };
 }

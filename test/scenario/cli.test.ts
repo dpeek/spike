@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,14 +11,7 @@ import { usage, version } from "../../src/cli.ts";
 import { fixtureGuidance, temporaryRepository } from "../support/repository.ts";
 
 const root = join(import.meta.dir, "..", "..");
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
 
-afterEach(async () => {
-  await Promise.all(repositories.splice(0).map(async (repository) => {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }));
-});
 
 async function spikeAt(cwd: string, args: string[], stdin?: string, env?: NodeJS.ProcessEnv) {
   const child = Bun.spawn([join(root, "bin", "spike"), ...args], {
@@ -37,6 +30,10 @@ async function spikeAt(cwd: string, args: string[], stdin?: string, env?: NodeJS
     stdout: await new Response(child.stdout).text(),
     stderr: await new Response(child.stderr).text(),
   };
+}
+
+function spikeIn(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[], stdin?: string, env?: NodeJS.ProcessEnv) {
+  return spikeAt(repository.root, args, stdin, env ?? { ...process.env, SPIKE_DATA_DIR: repository.dataRoot });
 }
 
 function spike(...args: string[]) {
@@ -63,9 +60,8 @@ describe("spike CLI", () => {
 
   test("emits one stable JSON object for success and failure", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const canonicalRoot = await realpath(repository.root);
-    const status = await spikeAt(repository.root, ["status", "--json"]);
+    const status = await spikeIn(repository, ["status", "--json"]);
     expect(status.exitCode).toBe(0);
     expect(status.stderr).toBe("");
     expect(status.stdout.trim().split("\n")).toHaveLength(1);
@@ -75,7 +71,7 @@ describe("spike CLI", () => {
       data: { root: canonicalRoot, project: { slug: "spike" }, goals: [], cleanup: { healthy: true, warnings: [] }, applicationQueue: [], queueHead: null },
     });
 
-    const failed = await spikeAt(repository.root, ["change", "reject", "--json"]);
+    const failed = await spikeIn(repository, ["change", "reject", "--json"]);
     expect(failed.exitCode).toBe(2);
     expect(failed.stderr).toBe("");
     expect(JSON.parse(failed.stdout)).toEqual({
@@ -84,7 +80,7 @@ describe("spike CLI", () => {
       error: { code: "usage", message: "--goal is required" },
     });
 
-    const duplicate = await spikeAt(repository.root, ["status", "--json", "--json"]);
+    const duplicate = await spikeIn(repository, ["status", "--json", "--json"]);
     expect(duplicate.exitCode).toBe(2);
     expect(duplicate.stderr).toBe("");
     expect(JSON.parse(duplicate.stdout)).toEqual({
@@ -161,9 +157,8 @@ describe("spike CLI", () => {
 
   test("shows exact committed guidance with its selected source revision", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
 
-    const shown = await spikeAt(repository.root, ["guidance", "show", "--step", "goal", "--json"]);
+    const shown = await spikeIn(repository, ["guidance", "show", "--step", "goal", "--json"]);
     expect(shown).toMatchObject({ exitCode: 0, stderr: "" });
     expect(JSON.parse(shown.stdout)).toEqual({
       ok: true,
@@ -176,7 +171,7 @@ describe("spike CLI", () => {
       },
     });
 
-    const rejected = await spikeAt(repository.root, ["guidance", "show", "--step", "review", "--json"]);
+    const rejected = await spikeIn(repository, ["guidance", "show", "--step", "review", "--json"]);
     expect(rejected.exitCode).toBe(2);
     expect(JSON.parse(rejected.stdout)).toMatchObject({
       ok: false,
@@ -187,10 +182,8 @@ describe("spike CLI", () => {
 
   test("revises the Plan from a user file or stdin without changing the source file", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Operate through the CLI",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Operate through the CLI",
       outcome: "Revise planner working memory.",
       approval: "Approved.",
     });
@@ -199,7 +192,7 @@ describe("spike CLI", () => {
     const fileBody = "# Revised Plan\n\nKeep immutable evidence.\n";
     await writeFile(sourcePath, fileBody);
 
-    const fromFile = await spikeAt(repository.root, ["plan", "revise", "--goal", goalId, "--file", "operator-plan.md", "--json"]);
+    const fromFile = await spikeIn(repository, ["plan", "revise", "--goal", goalId, "--file", "operator-plan.md", "--json"]);
     expect(fromFile.exitCode).toBe(0);
     expect(JSON.parse(fromFile.stdout)).toMatchObject({
       ok: true,
@@ -207,36 +200,32 @@ describe("spike CLI", () => {
       data: { body: fileBody },
     });
     expect(await readFile(sourcePath, "utf8")).toBe(fileBody);
-    expect((await loadPlan(repository.root, goalId)).body).toBe(fileBody);
+    expect((await loadPlan(repository.project, goalId)).body).toBe(fileBody);
 
     const stdinBody = "# Revised Again\n\nRead from stdin.\n";
-    const fromStdin = await spikeAt(repository.root, ["plan", "revise", "--goal", goalId, "--json"], stdinBody);
+    const fromStdin = await spikeIn(repository, ["plan", "revise", "--goal", goalId, "--json"], stdinBody);
     expect(fromStdin.exitCode).toBe(0);
     expect(JSON.parse(fromStdin.stdout)).toMatchObject({ ok: true, command: "plan revise", data: { body: stdinBody } });
-    expect((await loadPlan(repository.root, goalId)).body).toBe(stdinBody);
+    expect((await loadPlan(repository.project, goalId)).body).toBe(stdinBody);
   });
 
   test("dispatches with frozen Ticket execution policy and publishes failure evidence after exit", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Publish direct failure evidence",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Publish direct failure evidence",
       outcome: "Seal a failed controlled worker execution.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Exercise failed publication",
       intent: "Preserve execution evidence between CLI processes.",
       rationale: "Publication must not depend on a live worker.",
       acceptanceCriteria: ["The failed Report records the frozen model selection."],
     });
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Exit with a controlled failure.",
       executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
@@ -250,7 +239,7 @@ describe("spike CLI", () => {
       '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"}}}\n',
     );
 
-    const rejectedOverride = await spikeAt(repository.root, [
+    const rejectedOverride = await spikeIn(repository, [
       "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "scripted-failure", "--model", "dispatch-override", "--json", "--", "bun", "-e", "process.exit(19)",
     ]);
@@ -261,7 +250,7 @@ describe("spike CLI", () => {
       error: { code: "usage", message: "unknown option: --model" },
     });
 
-    const dispatched = await spikeAt(repository.root, [
+    const dispatched = await spikeIn(repository, [
       "ticket", "dispatch-test", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--worker", "scripted-failure", "--json", "--", "bun", "-e",
       'if (process.env.SPIKE_MODEL !== "frozen-model" || process.env.SPIKE_THINKING !== "low") process.exit(99); console.log("controlled failure"); process.exit(19)',
@@ -282,9 +271,9 @@ describe("spike CLI", () => {
       },
     });
     const identity = { goalId, changeId: "001", ticketId: "001" };
-    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(true);
+    expect(await Bun.file(workerRecordPath(repository.project, identity)).exists()).toBe(true);
 
-    const published = await spikeAt(repository.root, [
+    const published = await spikeIn(repository, [
       "report", "publish", "--goal", goalId, "--change", "001", "--ticket", "001",
       "--failure", "Controlled worker exited with code 19.", "--json",
     ]);
@@ -302,29 +291,26 @@ describe("spike CLI", () => {
         cleanup: { status: "finalized" },
       },
     });
-    expect(await Bun.file(workerRecordPath(repository.root, identity)).exists()).toBe(false);
+    expect(await Bun.file(workerRecordPath(repository.project, identity)).exists()).toBe(false);
   });
 
   test("delegates abandonment and repository recovery to workflow modules", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Resolve a Change",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Resolve a Change",
       outcome: "Preserve its terminal decision.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Abandon this direction",
       intent: "Exercise the terminal command.",
       rationale: "The planner changed direction.",
       acceptanceCriteria: ["The decision remains immutable."],
     });
 
-    const rejected = await spikeAt(repository.root, [
+    const rejected = await spikeIn(repository, [
       "change", "reject", "--goal", goalId, "--change", "001", "--statement", "Reject this direction.", "--json",
     ]);
     expect(rejected.exitCode).toBe(1);
@@ -334,7 +320,7 @@ describe("spike CLI", () => {
       error: { code: "workflow", message: `Change ${goalId}/001 has no completed implementation Candidate` },
     });
 
-    const abandoned = await spikeAt(repository.root, [
+    const abandoned = await spikeIn(repository, [
       "change", "abandon", "--goal", goalId, "--change", "001", "--statement", "Operator changed direction.", "--json",
     ]);
     expect(abandoned.exitCode).toBe(0);
@@ -343,9 +329,9 @@ describe("spike CLI", () => {
       command: "change abandon",
       data: { goalId, changeId: "001", disposition: "abandon", statement: "Operator changed direction." },
     });
-    expect((await loadChangeDecision(repository.root, goalId, "001")).metadata.disposition).toBe("abandon");
+    expect((await loadChangeDecision(repository.project, goalId, "001")).metadata.disposition).toBe("abandon");
 
-    const recovered = await spikeAt(repository.root, ["recover", "--json"]);
+    const recovered = await spikeIn(repository, ["recover", "--json"]);
     expect(recovered.exitCode).toBe(0);
     expect(JSON.parse(recovered.stdout)).toMatchObject({
       ok: true,
@@ -356,17 +342,16 @@ describe("spike CLI", () => {
 
   test("creates zero-source Goals in the isolated Project root without Request-store access", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const env = { ...process.env, SPIKE_DATA_DIR: repository.dataRoot, XDG_DATA_HOME: "/dev/null/spike-request-store", HOME: "/dev/null/spike-home" };
 
-    const created = await spikeAt(repository.root, ["goal", "create", "--title", "No requests", "--outcome", "Preserve central authority.", "--approval", "Approved.", "--json"], undefined, env);
+    const created = await spikeIn(repository, ["goal", "create", "--title", "No requests", "--outcome", "Preserve central authority.", "--approval", "Approved.", "--json"], undefined, env);
     expect(created.exitCode).toBe(0);
     expect(JSON.parse(created.stdout)).toMatchObject({ ok: true, command: "goal create", data: { goal: { goalId: "spike-001" } } });
     expect(await Bun.file(join(repository.projectRoot, "goals", "spike-001", "goal.md")).exists()).toBe(true);
     expect(await Bun.file(join(repository.projectRoot, "goals", "spike-001", "plan.md")).exists()).toBe(true);
     expect(await Bun.file(join(repository.root, ".spike")).exists()).toBe(false);
 
-    const refused = await spikeAt(repository.root, ["goal", "create", "--title", "With request", "--outcome", "Validate request root.", "--approval", "Approved.", "--request", "request-001", "--json"], undefined, env);
+    const refused = await spikeIn(repository, ["goal", "create", "--title", "With request", "--outcome", "Validate request root.", "--approval", "Approved.", "--request", "request-001", "--json"], undefined, env);
     expect(refused.exitCode).toBe(1);
     expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, command: "goal create", error: { code: "workflow", message: "Source Request does not exist: request-001" } });
     expect(await Bun.file(join(repository.projectRoot, "goals", "spike-002", "goal.md")).exists()).toBe(false);
@@ -375,17 +360,16 @@ describe("spike CLI", () => {
 
   test("creates cited Goals through CLI JSON and refuses duplicate source IDs without mutations", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const dataRoot = await realpath(await mkdtemp(join(tmpdir(), "spike-goal-cli-data-")));
     try {
       const env = { ...process.env, SPIKE_DATA_DIR: dataRoot };
-      const request = await spikeAt(repository.root, ["request", "create", "--title", "Source", "--statement", "Future work.", "--project", "spike", "--json"], undefined, env);
+      const request = await spikeIn(repository, ["request", "create", "--title", "Source", "--statement", "Future work.", "--project", "spike", "--json"], undefined, env);
       const requestId = JSON.parse(request.stdout).data.metadata.requestId;
       const requestFile = await readFile(join(dataRoot, "requests", requestId, "request.md"), "utf8");
-      const created = await spikeAt(repository.root, ["goal", "create", "--title", "Cite", "--outcome", "Keep provenance.", "--approval", "Approved.", "--request", requestId, "--json"], undefined, env);
+      const created = await spikeIn(repository, ["goal", "create", "--title", "Cite", "--outcome", "Keep provenance.", "--approval", "Approved.", "--request", requestId, "--json"], undefined, env);
       expect(JSON.parse(created.stdout)).toMatchObject({ ok: true, command: "goal create", data: { goal: { goalId: "spike-001" } } });
       expect(await readFile(join(dataRoot, "projects", "spike", "goals", "spike-001", "goal.md"), "utf8")).toContain(`## Source Requests\n\n- ${requestId}`);
-      const refused = await spikeAt(repository.root, ["goal", "create", "--title", "Duplicate", "--outcome", "Refuse.", "--approval", "Approved.", "--request", requestId, "--request", requestId, "--json"], undefined, env);
+      const refused = await spikeIn(repository, ["goal", "create", "--title", "Duplicate", "--outcome", "Refuse.", "--approval", "Approved.", "--request", requestId, "--request", requestId, "--json"], undefined, env);
       expect(refused.exitCode).toBe(1);
       expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, command: "goal create", error: { code: "workflow", message: `duplicate Source Request ID: ${requestId}` } });
       expect(await Bun.file(join(dataRoot, "projects", "spike", "goals", "spike-002", "goal.md")).exists()).toBe(false);

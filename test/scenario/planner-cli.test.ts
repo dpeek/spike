@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createChange, loadChangeDecision } from "../../src/change.ts";
@@ -9,13 +9,6 @@ import { issueTicket, reportPath } from "../../src/ticket.ts";
 import { dispatchLocalImplementation, dispatchLocalReview } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const repositories: Array<{ root: string; remove: () => Promise<void> }> = [];
-afterEach(async () => {
-  for (const repository of repositories.splice(0)) {
-    await Bun.spawn(["chmod", "-R", "u+w", repository.root], { stdout: "ignore", stderr: "ignore" }).exited;
-    await repository.remove();
-  }
-});
 
 const worker = String.raw`
 import { writeFile } from "node:fs/promises";
@@ -61,10 +54,10 @@ if (ticketId === "001") {
 
 const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
 
-async function spike(cwd: string, args: string[], stdin?: string) {
+async function spike(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[], stdin?: string) {
   const child = Bun.spawn([join(import.meta.dir, "..", "..", "bin", "spike"), ...args], {
-    cwd,
-    env: { ...process.env },
+    cwd: repository.root,
+    env: { ...process.env, SPIKE_DATA_DIR: repository.dataRoot },
     stdin: stdin === undefined ? "ignore" : "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -85,17 +78,14 @@ async function spike(cwd: string, args: string[], stdin?: string) {
 describe("planner CLI", () => {
   test("derives status, revises the Plan, and lands an approved Change", async () => {
     const repository = await temporaryRepository();
-    repositories.push(repository);
     const goal = await createGoal({
-      cwd: repository.root,
-      title: "Land through the planner CLI",
+      cwd: repository.root, hostPaths: repository.hostPaths, title: "Land through the planner CLI",
       outcome: "Advance only the dedicated integration ref.",
       approval: "Approved.",
     });
     const goalId = goal.goal.metadata.goalId;
     const change = await createChange({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       title: "Add approved behavior",
       intent: "Produce and independently review one Candidate.",
       rationale: "The CLI must derive readiness from Reports.",
@@ -104,13 +94,12 @@ describe("planner CLI", () => {
     const baseRevision = change.change.metadata.baseRevision;
 
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Produce the Candidate.",
       executionPolicy: policy,
     });
-    const issuedStatus = await spike(repository.root, ["status", "--goal", goalId, "--json"]);
+    const issuedStatus = await spike(repository, ["status", "--goal", goalId, "--json"]);
     expect(issuedStatus.output).toMatchObject({
       ok: true,
       data: {
@@ -124,6 +113,7 @@ describe("planner CLI", () => {
     });
     const implementation = await dispatchLocalImplementation({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "001",
@@ -131,8 +121,7 @@ describe("planner CLI", () => {
       worker: "scripted-implementer",
     });
     const implemented = await publishImplementationReport({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       ticketId: "001",
       execution: implementation.execution,
@@ -141,8 +130,7 @@ describe("planner CLI", () => {
     const candidateRevision = implemented.report.metadata.candidateRevision;
 
     await issueTicket({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       role: "review",
       instruction: "Review the exact Candidate.",
@@ -150,6 +138,7 @@ describe("planner CLI", () => {
     });
     const review = await dispatchLocalReview({
       cwd: repository.root,
+      hostPaths: repository.hostPaths,
       goalId,
       changeId: "001",
       ticketId: "002",
@@ -157,18 +146,17 @@ describe("planner CLI", () => {
       worker: "scripted-reviewer",
     });
     await publishReviewReport({
-      cwd: repository.root,
-      goalId,
+      cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       ticketId: "002",
       execution: review.execution,
     });
 
     await writeFile(join(repository.root, "operator-notes.txt"), "preserve this user file\n");
-    const implementationEvidence = await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8");
-    const reviewEvidence = await readFile(reportPath(repository.root, goalId, "001", "002"), "utf8");
+    const implementationEvidence = await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8");
+    const reviewEvidence = await readFile(reportPath(repository.project, goalId, "001", "002"), "utf8");
 
-    const before = await spike(repository.root, ["status", "--goal", goalId, "--json"]);
+    const before = await spike(repository, ["status", "--goal", goalId, "--json"]);
     expect(before.exitCode).toBe(0);
     expect(before.output).toMatchObject({
       ok: true,
@@ -190,20 +178,20 @@ describe("planner CLI", () => {
     });
 
     const revisedBody = "# Plan: approved landing\n\n## Current focus\n\nLand reviewed Change 001.\n";
-    const revised = await spike(repository.root, ["plan", "revise", "--goal", goalId, "--json"], revisedBody);
+    const revised = await spike(repository, ["plan", "revise", "--goal", goalId, "--json"], revisedBody);
     expect(revised.output).toMatchObject({ ok: true, command: "plan revise", data: { body: revisedBody } });
-    expect((await loadPlan(repository.root, goalId)).body).toBe(revisedBody);
+    expect((await loadPlan(repository.project, goalId)).body).toBe(revisedBody);
 
-    const landed = await spike(repository.root, ["change", "land", "--goal", goalId, "--change", "001", "--json"]);
+    const landed = await spike(repository, ["change", "land", "--goal", goalId, "--change", "001", "--json"]);
     expect(landed.output).toMatchObject({
       ok: true,
       command: "change land",
       data: { goalId, changeId: "001", disposition: "land", approvedRevision: candidateRevision },
     });
-    expect((await loadChangeDecision(repository.root, goalId, "001")).metadata.disposition).toBe("land");
+    expect((await loadChangeDecision(repository.project, goalId, "001")).metadata.disposition).toBe("land");
     expect(await repository.git("rev-parse", integratedRef(goalId))).toBe(candidateRevision);
 
-    const after = await spike(repository.root, ["status", "--goal", goalId, "--json"]);
+    const after = await spike(repository, ["status", "--goal", goalId, "--json"]);
     expect(after.output).toMatchObject({
       ok: true,
       data: {
@@ -212,8 +200,8 @@ describe("planner CLI", () => {
         decisions: [{ changeId: "001", disposition: "land", approvedRevision: candidateRevision }],
       },
     });
-    expect(await readFile(reportPath(repository.root, goalId, "001", "001"), "utf8")).toBe(implementationEvidence);
-    expect(await readFile(reportPath(repository.root, goalId, "001", "002"), "utf8")).toBe(reviewEvidence);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "001"), "utf8")).toBe(implementationEvidence);
+    expect(await readFile(reportPath(repository.project, goalId, "001", "002"), "utf8")).toBe(reviewEvidence);
     expect(await readFile(join(repository.root, "operator-notes.txt"), "utf8")).toBe("preserve this user file\n");
     expect(await repository.git("rev-parse", "HEAD")).toBe(repository.head);
   }, 15_000);

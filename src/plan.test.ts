@@ -12,7 +12,7 @@ import {
   revisePlan,
 } from "./plan.ts";
 import { reportPath, ticketPath } from "./ticket.ts";
-import { activateProject, projectRoot } from "./project.ts";
+import { activateProject, type ProjectPaths } from "./project.ts";
 
 const goalId = "spike-001";
 const baseRevision = "0".repeat(40);
@@ -42,18 +42,18 @@ async function installProjectConfig(root: string): Promise<void> {
   );
 }
 
-async function activateFixture(root: string): Promise<void> {
+async function activateFixture(root: string): Promise<ProjectPaths> {
   for (const args of [["init", "--quiet"], ["config", "user.name", "Spike Test"], ["config", "user.email", "spike@example.test"], ["add", "."], ["commit", "--quiet", "-m", "fixture"]]) {
     const process = Bun.spawn(["git", "-C", root, ...args], { stdout: "ignore", stderr: "ignore" });
     if (await process.exited !== 0) throw new Error("could not initialize fixture repository");
   }
-  process.env["SPIKE_DATA_DIR"] = join(await realpath(root), "central-data");
-  await activateProject(root);
+  const hostPaths = { dataRoot: join(await realpath(root), "central-data") };
+  return activateProject(root, hostPaths);
 }
 
-async function installChurnHistory(root: string): Promise<string[]> {
+async function installChurnHistory(root: ProjectPaths): Promise<string[]> {
   await installImmutable(
-    root,
+    root.controlRoot,
     changePath(root, goalId, "001"),
     serializeDocument(
       { kind: "change", goalId, changeId: "001", createdAt: "2026-03-25T09:30:00.000Z", baseRevision },
@@ -64,7 +64,7 @@ async function installChurnHistory(root: string): Promise<string[]> {
   for (const ticketId of ticketIds) {
     const implement = ticketId === "001";
     await installImmutable(
-      root,
+      root.controlRoot,
       ticketPath(root, goalId, "001", ticketId),
       serializeDocument(
         implement
@@ -100,7 +100,7 @@ async function installChurnHistory(root: string): Promise<string[]> {
     );
 
     await installImmutable(
-      root,
+      root.controlRoot,
       reportPath(root, goalId, "001", ticketId),
       serializeDocument(
         implement
@@ -189,14 +189,14 @@ describe("Plan", () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "spike-plan-")));
     try {
       await installProjectConfig(root);
-      await activateFixture(root);
-      await createInitialPlan(root, goalId, "Detect churn", "Warn after repeated feedback.", "2026-03-25T09:00:00.000Z");
-      const ticketIds = await installChurnHistory(root);
+      const project = await activateFixture(root);
+      await createInitialPlan(project, goalId, "Detect churn", "Warn after repeated feedback.", "2026-03-25T09:00:00.000Z");
+      const ticketIds = await installChurnHistory(project);
       const reportSources = await Promise.all(
-        ticketIds.map((ticketId) => readFile(reportPath(root, goalId, "001", ticketId), "utf8")),
+        ticketIds.map((ticketId) => readFile(reportPath(project, goalId, "001", ticketId), "utf8")),
       );
 
-      const refreshed = await refreshChangeChurn(root, goalId, "001", "2026-03-25T11:00:00.000Z");
+      const refreshed = await refreshChangeChurn(project, goalId, "001", "2026-03-25T11:00:00.000Z");
       expect(refreshed.indicators).toEqual([
         { kind: "remediation-rounds", count: 3 },
         { kind: "reopened-finding", findingId: "correctness-001", reportCount: 3 },
@@ -205,9 +205,9 @@ describe("Plan", () => {
       expect(refreshed.plan.body).toContain("Change 001 churn detected");
       expect(refreshed.plan.body).toContain("3 completed review Reports requested remediation");
       expect(refreshed.plan.body).toContain("`correctness-001` appeared in 3 review Reports");
-      expect((await loadPlan(root, goalId)).body).toBe(refreshed.plan.body);
+      expect((await loadPlan(project, goalId)).body).toBe(refreshed.plan.body);
       expect(
-        await Promise.all(ticketIds.map((ticketId) => readFile(reportPath(root, goalId, "001", ticketId), "utf8"))),
+        await Promise.all(ticketIds.map((ticketId) => readFile(reportPath(project, goalId, "001", ticketId), "utf8"))),
       ).toEqual(reportSources);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -218,10 +218,10 @@ describe("Plan", () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "spike-plan-")));
     try {
       await installProjectConfig(root);
-      await activateFixture(root);
-      const goalPath = join(projectRoot(root), "goals", goalId, "goal.md");
+      const project = await activateFixture(root);
+      const goalPath = join(project.controlRoot, "goals", goalId, "goal.md");
       await createInitialPlan(
-        root,
+        project,
         goalId,
         "Plan a Goal",
         "Keep working memory durable.",
@@ -230,14 +230,14 @@ describe("Plan", () => {
       await writeFile(goalPath, "authoritative Goal evidence\n");
 
       const revised = await revisePlan(
-        root,
+        project,
         goalId,
         "# Revised Plan\n\nFirst create Change 001.",
         "2026-03-19T11:00:00.000Z",
       );
 
       expect(revised.metadata.updatedAt).toBe("2026-03-19T11:00:00.000Z");
-      expect((await loadPlan(root, goalId)).body).toBe("# Revised Plan\n\nFirst create Change 001.\n");
+      expect((await loadPlan(project, goalId)).body).toBe("# Revised Plan\n\nFirst create Change 001.\n");
       expect(await readFile(goalPath, "utf8")).toBe("authoritative Goal evidence\n");
     } finally {
       await rm(root, { recursive: true, force: true });
