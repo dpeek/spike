@@ -86,6 +86,29 @@ async function spikeRepositoryFixture() {
 }
 
 describe("Docker worker isolation", () => {
+  test("provides Debian fdfind to Pi's managed fd resolver while offline", async () => {
+    const probe = `
+const statuses = [];
+const { ensureTool } = await import("file:///usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/utils/tools-manager.js");
+const resolved = await ensureTool("fd", (status) => statuses.push(status));
+if (resolved !== "fdfind") throw new Error("Pi resolved fd as " + JSON.stringify(resolved));
+if (statuses.length > 0) throw new Error("Pi emitted managed-tool startup status: " + JSON.stringify(statuses));
+process.stdout.write(resolved + "\\n");
+`;
+    const process = Bun.spawn([
+      "docker", "run", "--rm", "--entrypoint", "node", "--env", "PI_OFFLINE=1",
+      "spike-worker:local", "--input-type=module", "--eval", probe,
+    ], { stdout: "pipe", stderr: "pipe" });
+    const [code, stdout, stderr] = await Promise.all([
+      process.exited,
+      new Response(process.stdout).text(),
+      new Response(process.stderr).text(),
+    ]);
+    expect(code).toBe(0);
+    expect(stdout).toBe("fdfind\n");
+    expect(stderr).toBe("");
+  }, 30_000);
+
   test("mounts only the declared exchange, records immutable image provenance, and enforces policy before launch", async () => {
     const active = await fixture();
     try {

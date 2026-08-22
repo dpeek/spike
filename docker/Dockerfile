@@ -3,7 +3,7 @@ FROM node:22.19.0-bookworm-slim@sha256:4a4884e8a44826194dff92ba316264f392056cbe2
 
 ARG BUN_VERSION=1.4.0
 ARG PI_VERSION=0.84.2
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep curl jq \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep fd-find curl jq \
  && rm -rf /var/lib/apt/lists/* \
  && npm install --global "bun@${BUN_VERSION}" "@earendil-works/pi-coding-agent@${PI_VERSION}"
 
