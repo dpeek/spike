@@ -80,6 +80,15 @@ describe("spike CLI", () => {
       error: { code: "usage", message: "--goal is required" },
     });
 
+    const nestedFailure = await spikeIn(repository, ["application", "review", "publish", "--json"]);
+    expect(nestedFailure.exitCode).toBe(2);
+    expect(nestedFailure.stderr).toBe("");
+    expect(JSON.parse(nestedFailure.stdout)).toEqual({
+      ok: false,
+      command: "application review publish",
+      error: { code: "usage", message: "--goal is required" },
+    });
+
     const duplicate = await spikeIn(repository, ["status", "--json", "--json"]);
     expect(duplicate.exitCode).toBe(2);
     expect(duplicate.stderr).toBe("");

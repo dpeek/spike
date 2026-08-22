@@ -47,13 +47,13 @@ async function report(repository: Awaited<ReturnType<typeof temporaryRepository>
 }
 
 /** Establishes real durable integration evidence, then restores checked-out main to its Goal base. */
-async function readyGoal() {
+async function readyGoal(constraints: string[] = []) {
   const repository = await temporaryRepository();
   // A tracked common file gives the diverged Application scenarios both
   // non-overlapping same-file and true textual-conflict inputs.
   await writeFile(join(repository.root, "shared.txt"), "one\nbase-goal\nseparator\nbase-target\ntwo\n");
   await repository.git("add", "shared.txt"); await repository.git("commit", "--quiet", "-m", "Shared integration base");
-  const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Scenario Application", outcome: "Recover a squash Application.", approval: "Approved." });
+  const goal = await createGoal({ cwd: repository.root, hostPaths: repository.hostPaths, title: "Scenario Application", outcome: "Recover a squash Application.", constraints, approval: "Approved." });
   const goalId = goal.goal.metadata.goalId;
   const base = await repository.git("rev-parse", "HEAD");
   const change = await createChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, title: "Scenario change", intent: "Produce a reviewed tree.", rationale: "Application needs durable integration.", acceptanceCriteria: ["The scenario tree is approved."] });
@@ -303,6 +303,26 @@ test("scenario: Application review approves only the exact current Candidate and
 });
 
 
+test("scenario: Application review assesses the Goal Outcome and every Constraint", async () => {
+  const constraints = ["Preserve target intent.", "Preserve Goal intent.", "Require exact evidence."];
+  const { repository, goalId } = await readyGoal(constraints);
+  await writeFile(join(repository.root, "target-only.txt"), "M\n");
+  await repository.git("add", "target-only.txt");
+  await repository.git("commit", "--quiet", "-m", "Diverged target");
+  const queued = await queueGoalIntegration({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, approval: "Review every Goal item." });
+  const issued = await issueApplicationTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, instruction: "Produce candidate.", executionPolicy: policy });
+  const identity = { goalId, applicationId: queued.applicationId, ticketId: issued.ticket.metadata.ticketId };
+  const run = await dispatchApplicationWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...identity, worker: "constraint-source", command: ["bun", "-e", workerCommand] });
+  await publishApplicationImplementationReport({ cwd: repository.root, hostPaths: repository.hostPaths, ...identity, message: { summary: "Constraint source" }, execution: { adapter: run.execution.adapter, isolation: run.execution.isolation, worker: run.execution.worker, model: run.execution.model, thinking: run.execution.thinking, startedAt: run.execution.startedAt, finishedAt: run.execution.finishedAt } });
+  await recoverApplicationTicket(repository.root, repository.hostPaths, goalId, queued.applicationId, identity.ticketId);
+
+  const review = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: queued.applicationId, instruction: "Assess every Goal item.", executionPolicy: policy });
+  const reviewIdentity = { goalId, applicationId: queued.applicationId, ticketId: review.ticket.metadata.ticketId };
+  const acceptanceAssessment = ["Recover a squash Application.", ...constraints].map((criterion) => ({ criterion, assessment: "met" as const, evidence: `${criterion} verified.` }));
+  const reviewRun = await dispatchApplicationReviewWorker({ cwd: repository.root, hostPaths: repository.hostPaths, ...reviewIdentity, worker: "constraint-reviewer", command: reviewCompletionCommand({ reviewStatement: "Every canonical Goal item is met.", verdict: "approve", findings: [], acceptanceAssessment, artifacts: [] }) });
+  const published = await publishApplicationReviewReport({ cwd: repository.root, hostPaths: repository.hostPaths, ...reviewIdentity, execution: reviewExecution(reviewRun) });
+  expect(published.report.metadata.acceptanceAssessment.map(({ criterion }) => criterion)).toEqual(["Recover a squash Application.", ...constraints]);
+});
 
 
 test("scenario: Application review retains remediate and reject as durable non-approvals through the adapter seam", async () => {

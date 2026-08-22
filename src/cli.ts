@@ -227,6 +227,14 @@ function commandName(args: string[]): string {
   if (args.length === 0 || ["--help", "-h"].includes(args[0]!)) return "help";
   if (["--version", "-V"].includes(args[0]!)) return "version";
   if (args[0] === "status" || args[0] === "recover") return args[0];
+  if (args[0] === "application" && args[1] === "review") {
+    if (args[2] === "report" && args[3] === "publish") return "application review publish";
+    if (args[2] === "worker") return args.slice(0, 4).join(" ");
+    return args.slice(0, 3).join(" ");
+  }
+  if (args[0] === "application" && ["ticket", "report", "worker"].includes(args[1] ?? "")) {
+    return args.slice(0, 3).join(" ");
+  }
   return args.slice(0, 2).join(" ");
 }
 

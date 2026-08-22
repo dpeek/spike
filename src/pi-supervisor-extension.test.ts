@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -681,7 +681,7 @@ describe("Pi supervisor extension", () => {
 
     const calls = (await readFile(fake.calls, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     expect(calls).toEqual([{
-      cwd: fake.directory,
+      cwd: await realpath(fake.directory),
       args: ["request", "close", "--request", "request-001", "--disposition", "declined", "--statement", "No longer needed.", "--json"],
       stdin: "",
     }]);
