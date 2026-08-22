@@ -68,8 +68,8 @@ export async function temporaryRepository(): Promise<{
           project: { slug: "spike" },
           agents: {
             planner: { model: "planner-model", thinking: "high" },
-            implement: { model: "implementation-model", thinking: "medium", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
-            review: { model: "review-model", thinking: "high", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+            implement: { model: "implementation-model", thinking: "medium", isolation: "workspace", credentialGrants: [] },
+            review: { model: "review-model", thinking: "high", isolation: "workspace", credentialGrants: [] },
           },
         },
         null,

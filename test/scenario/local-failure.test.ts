@@ -26,7 +26,7 @@ await writeFile(join(output, "diagnostic.log"), "worker failed after staging out
 process.exit(23);
 `;
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 function clock(...timestamps: string[]): () => Date {
   const values = timestamps.map((value) => new Date(value));

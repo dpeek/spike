@@ -16,7 +16,7 @@ import { temporaryRepository } from "../support/repository.ts";
 
 setDefaultTimeout(30_000);
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 const timestamp = new Date(0).toISOString();
 const workerCompletionModule = join(import.meta.dir, "../../src/worker-completion.ts");
 type ScenarioRepository = Awaited<ReturnType<typeof temporaryRepository>>;

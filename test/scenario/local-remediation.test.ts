@@ -85,7 +85,7 @@ if (id === "002" || id === "004") {
 }
 `;
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 async function makeInputRemovable(inputDirectory: string): Promise<void> {
   await chmod(inputDirectory, 0o700);

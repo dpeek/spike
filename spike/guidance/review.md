@@ -4,6 +4,11 @@
 
 Independently assess the exact Candidate against the canonical Change criteria and workflow invariants.
 
+## Ticket assignment
+
+- Use the Project's configured execution-policy defaults. Do not override isolation or credential grants speculatively.
+- Override policy only when the approved Goal or Change explicitly requires a different supported isolation boundary. Before overriding, verify the complete frozen setup, selected-model, credential-resolution, dispatch, completion-observation, Report-publication, and cleanup lifecycle in that boundary.
+
 ## Required work
 
 - Review the exact Candidate and producing implementation Report named by the Ticket.

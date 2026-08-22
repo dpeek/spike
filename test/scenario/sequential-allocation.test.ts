@@ -33,7 +33,6 @@ async function firstChange(repository: Awaited<ReturnType<typeof temporaryReposi
 
 const executionPolicy = {
   isolation: "workspace" as const,
-  networkAccess: "restricted" as const,
   credentialGrants: ["source-repository"],
 };
 
@@ -216,7 +215,7 @@ describe("sequential Change and Ticket allocation", () => {
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Retry from the Change base.",
-      executionPolicy: { isolation: "container", networkAccess: "none", credentialGrants: [] },
+      executionPolicy: { isolation: "container", credentialGrants: [] },
     });
 
     expect(third.ticket.metadata.ticketId).toBe("003");

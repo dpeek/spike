@@ -11,7 +11,7 @@ import { prepareTicketExchange, recordLocalCloneWorker, workerRecordPath } from 
 import { temporaryRepository } from "../support/repository.ts";
 
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 describe("interrupted Ticket recovery", () => {
   test("finalizes recorded resources, publishes interruption evidence, and lets the planner issue 002", async () => {

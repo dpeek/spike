@@ -48,7 +48,7 @@ async function configuredTicket(setup: string[]) {
     goalId: goal.goal.metadata.goalId,
     changeId: "001",
     instruction: "Verify setup ordering.",
-    executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+    executionPolicy: { isolation: "workspace", credentialGrants: [] },
   });
   const identity = {
     goalId: goal.goal.metadata.goalId,

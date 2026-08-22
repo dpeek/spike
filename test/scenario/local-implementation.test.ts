@@ -87,7 +87,7 @@ async function fixture() {
         inputRevision: baseRevision,
         model: "implementation-model",
         thinking: "medium",
-        executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+        executionPolicy: { isolation: "workspace", credentialGrants: [] },
         guidance: { step: "implement", revision: baseRevision },
       },
       "# Implement Change\n\n## Instruction\n\nAdd the implementation marker.\n",
@@ -101,7 +101,7 @@ async function fixture() {
   await writeFile(join(repository.root, "README.md"), "dirty host edit\n");
   await writeFile(
     join(repository.root, "spike.json"),
-    '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n',
+    '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","credentialGrants":[]}}}\n',
   );
   const dirtyDiff = await repository.git("diff", "--", "README.md");
   const indexTree = await repository.git("write-tree");

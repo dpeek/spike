@@ -14,14 +14,12 @@
       "model": "openai-codex/gpt-5.6-terra",
       "thinking": "medium",
       "isolation": "container",
-      "networkAccess": "unrestricted",
       "credentialGrants": ["openai-codex"]
     },
     "review": {
       "model": "openai-codex/gpt-5.6-sol",
       "thinking": "high",
       "isolation": "container",
-      "networkAccess": "unrestricted",
       "credentialGrants": ["openai-codex"]
     }
   }

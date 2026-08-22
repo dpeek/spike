@@ -117,14 +117,13 @@ describe("direct CLI tracer bullet", () => {
     const issuedImplementation = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001",
       "--instruction", "Implement the direct CLI Candidate.",
-      "--network-access", "unrestricted",
     ]);
     expect(issuedImplementation.data.ticket).toMatchObject({
       ticketId: "001", role: "implement", model: "implementation-model", thinking: "medium",
     });
 
     const config = JSON.parse(await readFile(join(repository.root, "spike.json"), "utf8"));
-    config.agents.implement = { model: "changed-after-issuance", thinking: "minimal", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] };
+    config.agents.implement = { model: "changed-after-issuance", thinking: "minimal", isolation: "workspace", credentialGrants: [] };
     await writeFile(join(repository.root, "spike.json"), `${JSON.stringify(config, null, 2)}\n`);
 
     const implementationDispatch = await spike(repository, [
@@ -152,7 +151,6 @@ describe("direct CLI tracer bullet", () => {
     const issuedReview = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--role", "review",
       "--instruction", "Independently review the exact Candidate.",
-      "--network-access", "unrestricted",
     ]);
     expect(issuedReview.data.ticket).toMatchObject({
       ticketId: "002", role: "review", inputRevision: candidateRevision,

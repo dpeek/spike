@@ -17,7 +17,7 @@ import {
 } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 const timestamp = new Date(0);
 const completionUrl = pathToFileURL(join(import.meta.dir, "..", "..", "src", "worker-completion.ts")).href;
 

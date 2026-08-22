@@ -30,12 +30,10 @@ describe("Pi host selection", () => {
 });
 
 describe("Pi worker prompt", () => {
-  test("describes container tooling without implying network access", () => {
+  test("describes container tooling", () => {
     for (const role of ["implement", "review"] as const) {
       const prompt = piWorkerPrompt(role, "container");
       expect(prompt).toContain("Container tools available: Bun, Node.js, Git, ripgrep (`rg`), fd (`fdfind`), jq, and curl.");
-      expect(prompt).toContain("installation does not grant network access");
-      expect(prompt).toContain("immutable Ticket execution policy remains authoritative");
       expect(prompt).toContain(role === "implement" ? "spike_complete_implementation" : "spike_complete_review");
     }
   });
@@ -43,7 +41,6 @@ describe("Pi worker prompt", () => {
   test("keeps runtime-specific tooling out of workspace prompts", () => {
     const prompt = piWorkerPrompt("implement", "workspace");
     expect(prompt).not.toContain("Container tools available");
-    expect(prompt).not.toContain("network access");
   });
 });
 

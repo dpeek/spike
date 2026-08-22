@@ -180,8 +180,6 @@ describe("Goal planning", () => {
         "001",
         "--instruction",
         "Implement the selection.",
-        "--network-access",
-        "none",
         "--model",
         "one-ticket-model",
         "--thinking",

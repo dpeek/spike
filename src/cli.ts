@@ -157,7 +157,6 @@ Ticket issuance options:
   --response-to-review <id>      Prior review Ticket being addressed; derived for implementation
   --context <context>            Additional planner-curated context
   --isolation <level>            Override isolation: workspace or container
-  --network-access <access>      Override network access: none, restricted, or unrestricted
   --credential <grant-id>        Repeat to override credential grant identifiers
   --clear-credentials            Override configured credential grants with none
   --model <model>                Override the role's configured model for this Ticket
@@ -457,7 +456,6 @@ function parseTicketIssue(args: string[]): {
   let model: string | undefined;
   let thinking: ThinkingLevel | undefined;
   let isolation: ExecutionPolicy["isolation"] | undefined;
-  let networkAccess: ExecutionPolicy["networkAccess"] | undefined;
   let clearCredentials = false;
   const credentialGrants: string[] = [];
 
@@ -484,12 +482,6 @@ function parseTicketIssue(args: string[]): {
         if (value !== "workspace" && value !== "container") throw new UsageError(`invalid isolation level: ${value}`);
         isolation = value;
         break;
-      case "--network-access":
-        if (value !== "none" && value !== "restricted" && value !== "unrestricted") {
-          throw new UsageError(`invalid network access: ${value}`);
-        }
-        networkAccess = value;
-        break;
       case "--credential": credentialGrants.push(value); break;
       case "--model": model = value; break;
       case "--thinking":
@@ -509,7 +501,6 @@ function parseTicketIssue(args: string[]): {
   if (clearCredentials && credentialGrants.length > 0) throw new UsageError("--clear-credentials cannot be combined with --credential");
   const executionPolicy = {
     ...(isolation === undefined ? {} : { isolation }),
-    ...(networkAccess === undefined ? {} : { networkAccess }),
     ...(clearCredentials ? { credentialGrants: [] } : credentialGrants.length === 0 ? {} : { credentialGrants }),
   };
   return {

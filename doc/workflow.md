@@ -191,7 +191,7 @@ Local paths, process IDs, container IDs, Herdr agent/tab/pane IDs, and adapter-s
 
 The exchange importer treats all worker output as untrusted. It accepts only declared regular files, rejects symlinks, unexpected paths and path traversal, applies explicit size limits, verifies artifact digests, and validates Git bundles before importing them.
 
-Ticket execution policy describes required capabilities rather than selecting an adapter. Credential grants contain identifiers, never secret values; the selected adapter resolves them at launch. An adapter must refuse a Ticket whose isolation, network, or credential policy it cannot satisfy.
+Ticket execution policy describes required capabilities rather than selecting an adapter. Credential grants contain identifiers, never secret values; the selected adapter resolves them at launch. An adapter must refuse a Ticket whose isolation or credential policy it cannot satisfy. Workers always have network access for model execution and the frozen setup command.
 
 The local-clone adapter provides workspace separation only and may run controlled, attended workers. It is not security isolation. While the direct supervisor owns the live process handle, stopping waits for graceful exit and escalates to forced termination before finalization. After supervisor restart, the adapter never signals a persisted PID because PID identity is unsafe; it publishes interruption evidence and surfaces orphan cleanup as a health warning. Durable cross-restart session reclamation belongs to Herdr. Autonomous workers must use the Docker adapter before Spike is used against valuable repositories.
 
@@ -411,7 +411,7 @@ A Ticket owns:
 - intended outcome;
 - exact input Candidate or base revision;
 - curated context snapshot;
-- adapter-independent execution policy for isolation, network access, and credential grants;
+- adapter-independent execution policy for isolation and credential grants;
 - effective model and thinking selection, resolved from the Ticket role default plus any explicit one-Ticket override when the Ticket is issued;
 - project-level worker setup argv resolved when the Ticket is issued, with an absent command frozen as a no-op.
 
@@ -702,25 +702,23 @@ Project configuration records the stable Project slug and distinguishes the plan
       "model": "openai-codex/gpt-5.6-terra",
       "thinking": "medium",
       "isolation": "container",
-      "networkAccess": "unrestricted",
       "credentialGrants": ["openai-codex"]
     },
     "review": {
       "model": "openai-codex/gpt-5.6-sol",
       "thinking": "high",
       "isolation": "container",
-      "networkAccess": "unrestricted",
       "credentialGrants": ["openai-codex"]
     }
   }
 }
 ```
 
-`agents` is strict: the former `models` shape is rejected, planner has only model and thinking, and implement/review also configure isolation, network access, and credential-grant identifiers (never secrets). Omitted worker isolation resolves to `container`. Remediation uses the implement agent; there is no remediation category. Optional `worker.setup` is an argv array; absence resolves to an empty no-op command rather than a shell string.
+`agents` is strict: the former `models` shape is rejected, planner has only model and thinking, and implement/review also configure isolation and credential-grant identifiers (never secrets). Omitted worker isolation resolves to `container`. Remediation uses the implement agent; there is no remediation category. Optional `worker.setup` is an argv array; absence resolves to an empty no-op command rather than a shell string.
 
-When Spike issues a Ticket, it resolves the effective model, thinking, isolation, network access, credential grants, and worker setup command from project configuration and any permitted one-Ticket override, then freezes model/thinking and `setupCommand` at top level and policy under `executionPolicy` in immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective assignment, including setup argv. Each adapter runs setup in the exact fresh checkout before starting Pi. A nonzero setup exit prevents Pi startup and is ordinary failed Worker execution evidence, sealable through a failed Report.
+When Spike issues a Ticket, it resolves the effective model, thinking, isolation, credential grants, and worker setup command from project configuration and any permitted one-Ticket override, then freezes model/thinking and `setupCommand` at top level and policy under `executionPolicy` in immutable Ticket provenance. Dispatch uses the frozen Ticket selection and does not reread mutable project defaults. A replacement Ticket preserves the interrupted Ticket's effective assignment, including setup argv. Each adapter runs setup in the exact fresh checkout before starting Pi. A nonzero setup exit prevents Pi startup and is ordinary failed Worker execution evidence, sealable through a failed Report.
 
-Ticket workers never inherit the planner model implicitly. Model, thinking, isolation, network access, and credential command-line flags on Ticket issuance are explicit optional one-Ticket overrides. `--clear-credentials` explicitly selects an empty grant list, enabling a workspace override when container defaults configured grants. Dispatch-time overrides are rejected because they would change an already committed assignment. Change-level model policy, fallback lists, automatic routing, reviewer ensembles, cost budgets, and escalation policy are deferred until observed workflows justify them.
+Ticket workers never inherit the planner model implicitly. Model, thinking, isolation, and credential command-line flags on Ticket issuance are explicit optional one-Ticket overrides. `--clear-credentials` explicitly selects an empty grant list, enabling a workspace override when container defaults configured grants. Dispatch-time overrides are rejected because they would change an already committed assignment. Change-level model policy, fallback lists, automatic routing, reviewer ensembles, cost budgets, and escalation policy are deferred until observed workflows justify them.
 
 ## Runtime policy
 
@@ -901,7 +899,7 @@ Implement the phase as a small sequence of vertical additions:
 
 Herdr integration in this phase is deliberately ephemeral and observational. Do not implement session reuse, remediation in the original implementation session, arbitrary free-form agents, planner-to-worker follow-up, concurrent Changes, semantic churn analysis, persistent worker panes after Report publication, or a general runtime plugin system. Direct process launch remains available for controlled tests and as an explicit fallback.
 
-The local-clone adapter provides workspace separation, not security isolation. Use it only for controlled tests and trusted, attended dogfooding with explicit unrestricted-network acknowledgement. Do not use it to run unattended autonomous workers against valuable repositories or provide valuable credentials. Docker isolation remains required for production use.
+The local-clone adapter provides workspace separation, not security isolation. Use it only for controlled tests and trusted, attended dogfooding. Do not use it to run unattended autonomous workers against valuable repositories or provide valuable credentials. Docker isolation remains required for production use.
 
 ## Phase 3: Docker isolation
 
@@ -912,7 +910,7 @@ Implement one Docker adapter behind the existing Worker module seam before produ
 - create the private repository inside the container;
 - write only the declared output exchange;
 - do not mount the host checkout, host control-plane authority, Docker socket, unrelated credentials, or the operator's home directory;
-- make network access and credentials explicit Ticket execution policy;
+- provide network access for model execution and setup while keeping credentials explicit Ticket execution policy;
 - retain the same Submission, bundle import, Report publication, stop, and cleanup behavior;
 - pass the same Worker module contract tests as the local-clone adapter.
 
@@ -967,7 +965,7 @@ Prioritize scenario tests:
 17. direct and Herdr-hosted local workers produce identical exchange and Report semantics;
 18. Herdr worker status and terminal output cannot complete a Ticket, and Herdr cleanup is idempotent;
 19. a real-Pi attended smoke loop completes one Goal in a temporary test repository through the supervisor and worker extensions;
-20. Docker exposes only declared inputs, outputs, network, and credentials;
+20. Docker exposes only declared inputs, outputs, and credentials while providing bridge networking;
 21. Docker launches Pi under Node and completes one Ticket through the standard exchange contract.
 
 Run the same Worker module contract suite against the local-clone adapter in Phase 2 and the Docker adapter in Phase 3. Avoid tests for unsupported arbitrary concurrent planner mutation. Retain focused tests for the genuine runtime stop/exit race.

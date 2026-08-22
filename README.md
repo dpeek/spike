@@ -31,8 +31,8 @@ Spike reads the stable Project slug and strict agent defaults from tracked `spik
   "worker": { "setup": ["bun", "install", "--frozen-lockfile"] },
   "agents": {
     "planner": { "model": "...", "thinking": "high" },
-    "implement": { "model": "...", "thinking": "medium", "isolation": "container", "networkAccess": "unrestricted", "credentialGrants": ["openai-codex"] },
-    "review": { "model": "...", "thinking": "high", "isolation": "container", "networkAccess": "unrestricted", "credentialGrants": ["openai-codex"] }
+    "implement": { "model": "...", "thinking": "medium", "isolation": "container", "credentialGrants": ["openai-codex"] },
+    "review": { "model": "...", "thinking": "high", "isolation": "container", "credentialGrants": ["openai-codex"] }
   }
 }
 ```
@@ -75,7 +75,7 @@ spike ticket issue \
 
 ## Attended container workers
 
-When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in a pane split immediately to the right of that planner. The worker pane can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, network policy, pinned image, and credential injection boundary. Their bounded `/tmp` and `/work` tmpfs locations are writable and executable for generated coding tools while remaining `nosuid`.
+When a planner is running under Herdr (`HERDR_ENV=1`), container Tickets launch a fresh interactive Docker TTY in a pane split immediately to the right of that planner. The worker pane can be read or attached through the existing worker status/read/attach operations. Outside Herdr, and with `--host direct`, Docker remains the explicit headless path. Terminal output and attachment are operational only: the adapter's restartable Docker observer records the actual-exit marker only after `docker wait` observes container exit; the Herdr wrapper owns attachment only. Normal validated exchange output and Report publication remain authoritative. Containers retain the declared read-only filesystem, exchange-only mounts, pinned image, and credential injection boundary, and use Docker bridge networking for model execution and setup. Their bounded `/tmp` and `/work` tmpfs locations are writable and executable for generated coding tools while remaining `nosuid`.
 
 ## Request inbox
 
@@ -107,8 +107,8 @@ open-Request view. During explicitly approved Goal creation,
 Goal's outcome and constraints only: an approved Goal may remain queued without
 an active Change.
 
-`--model`, `--thinking`, `--isolation`, `--network-access`, and repeated
-`--credential` are optional one-Ticket overrides. Without them, a Ticket uses its
+`--model`, `--thinking`, `--isolation`, and repeated `--credential` are optional
+one-Ticket overrides. Without them, a Ticket uses its
 role's `implement` or `review` agent defaults from `spike.json`. Use
 `--clear-credentials` to explicitly replace configured grants with an empty list,
 for example when overriding a Ticket to workspace isolation. Omitted worker

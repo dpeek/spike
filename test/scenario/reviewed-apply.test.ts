@@ -19,7 +19,7 @@ import { temporaryRepository } from "../support/repository.ts";
 
 setDefaultTimeout(30_000);
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 const completionModule = join(import.meta.dir, "../../src/worker-completion.ts");
 
 function implementationCommand(file: string, value: string) {

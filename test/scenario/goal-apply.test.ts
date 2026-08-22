@@ -17,7 +17,7 @@ import { temporaryRepository } from "../support/repository.ts";
 setDefaultTimeout(15_000);
 
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 const timestamp = new Date(0).toISOString();
 
 // Legacy scenarios exercise the new two-step production operations as one test helper.

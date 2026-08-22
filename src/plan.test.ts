@@ -35,8 +35,8 @@ async function installProjectConfig(root: string): Promise<void> {
       project: { slug: "spike" },
       agents: {
         planner: { model: "planner", thinking: "high" },
-        implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
-        review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+        implement: { model: "implementer", thinking: "medium", isolation: "container", credentialGrants: [] },
+        review: { model: "reviewer", thinking: "high", isolation: "container", credentialGrants: [] },
       },
     }),
   );
@@ -77,7 +77,7 @@ async function installChurnHistory(root: ProjectPaths): Promise<string[]> {
               inputRevision: baseRevision,
               model: "fixture-model",
               thinking: "low",
-              executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+              executionPolicy: { isolation: "workspace", credentialGrants: [] },
               guidance: { step: "implement", revision: baseRevision },
               role: "implement",
             }
@@ -90,7 +90,7 @@ async function installChurnHistory(root: ProjectPaths): Promise<string[]> {
               inputRevision: candidateRevision,
               model: "fixture-model",
               thinking: "low",
-              executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+              executionPolicy: { isolation: "workspace", credentialGrants: [] },
               guidance: { step: "review", revision: baseRevision },
               role: "review",
               producingImplementationTicketId: "001",

@@ -21,7 +21,7 @@ const execution = { adapter: "fixture", isolation: "workspace" as const, worker:
 
 async function recordImplementation(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string, applicationId: string, target: string, goalRevision: string, completed: boolean, reported = true) {
   const tree = await repository.git("rev-parse", `${target}^{tree}`);
-  const ticket = { kind: "application-ticket", goalId, applicationId, ticketId: "001", issuedAt: stamp, role: "implement", targetRevision: target, goalRevision, mergeBase: goalRevision, inputRevision: target, integration: { classification: "clean", cleanTree: tree }, model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, guidance: { step: "implement", revision: target } };
+  const ticket = { kind: "application-ticket", goalId, applicationId, ticketId: "001", issuedAt: stamp, role: "implement", targetRevision: target, goalRevision, mergeBase: goalRevision, inputRevision: target, integration: { classification: "clean", cleanTree: tree }, model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", credentialGrants: [] }, guidance: { step: "implement", revision: target } };
   await mkdir(join(applicationTicketPath(repository.project, goalId, applicationId, "001"), ".."), { recursive: true });
   await writeFile(applicationTicketPath(repository.project, goalId, applicationId, "001"), serializeDocument(ticket, "# Ticket\n"));
   const report = { kind: "application-report", goalId, applicationId, ticketId: "001", role: "implement", outcome: completed ? "completed" : "partial", publishedAt: stamp, targetRevision: target, goalRevision, mergeBase: goalRevision, integrationClassification: "clean", inputRevision: target, ...(completed ? { workerRevision: target, candidateRevision: target } : {}), artifacts: [], execution };
@@ -32,7 +32,7 @@ async function recordImplementation(repository: Awaited<ReturnType<typeof tempor
 }
 
 async function recordReview(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string, applicationId: string, target: string, goalRevision: string) {
-  const reviewTicket = { kind: "application-review-ticket", goalId, applicationId, ticketId: "001", role: "review", issuedAt: stamp, targetRevision: target, goalRevision, mergeBase: goalRevision, candidateRevision: target, producingImplementationTicketId: "001", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, guidance: { step: "review", revision: target } };
+  const reviewTicket = { kind: "application-review-ticket", goalId, applicationId, ticketId: "001", role: "review", issuedAt: stamp, targetRevision: target, goalRevision, mergeBase: goalRevision, candidateRevision: target, producingImplementationTicketId: "001", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", credentialGrants: [] }, guidance: { step: "review", revision: target } };
   await mkdir(join(applicationReviewTicketPath(repository.project, goalId, applicationId, "001"), ".."), { recursive: true });
   await writeFile(applicationReviewTicketPath(repository.project, goalId, applicationId, "001"), serializeDocument(reviewTicket, "# Review\n"));
   const reviewReport = { kind: "application-review-report", goalId, applicationId, ticketId: "001", role: "review", outcome: "completed", publishedAt: stamp, targetRevision: target, goalRevision, mergeBase: goalRevision, candidateRevision: target, producingImplementationTicketId: "001", verdict: "approve", findings: [], acceptanceAssessment: [], reviewStatement: "Reviewed.", artifacts: [], execution };
@@ -63,10 +63,10 @@ async function writeCompletedChangeReport(repository: Awaited<ReturnType<typeof 
 async function landChangeAfterReturn(repository: Awaited<ReturnType<typeof temporaryRepository>>, goalId: string) {
   const base = await repository.git("rev-parse", `refs/spike/goals/${goalId}/integrated`);
   const change = await createChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, title: "Post-return product work", intent: "Advance G before requeue.", rationale: "Returned Applications require later landed work.", acceptanceCriteria: ["G advances."] });
-  const implementation = await issueTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: change.change.metadata.changeId, instruction: "Create fixture Candidate.", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, model: "fixture", thinking: "medium" });
+  const implementation = await issueTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: change.change.metadata.changeId, instruction: "Create fixture Candidate.", executionPolicy: { isolation: "workspace", credentialGrants: [] }, model: "fixture", thinking: "medium" });
   const candidate = await repository.git("commit-tree", `${base}^{tree}`, "-p", base, "-m", "Advance Goal after return");
   await writeCompletedChangeReport(repository, goalId, "001", implementation.ticket.metadata.ticketId, { role: "implement", baseRevision: base, inputRevision: base, workerRevision: candidate, candidateRevision: candidate });
-  const review = await issueTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001", role: "review", instruction: "Approve fixture Candidate.", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, model: "fixture", thinking: "medium" });
+  const review = await issueTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001", role: "review", instruction: "Approve fixture Candidate.", executionPolicy: { isolation: "workspace", credentialGrants: [] }, model: "fixture", thinking: "medium" });
   await writeCompletedChangeReport(repository, goalId, "001", review.ticket.metadata.ticketId, { role: "review", reviewedRevision: candidate, producingImplementationTicketId: implementation.ticket.metadata.ticketId, findings: [], acceptanceAssessment: [{ criterion: "G advances.", assessment: "met", evidence: "Fixture approval." }], reviewStatement: "Approved.", reviewer: "fixture", verdict: "approve" });
   await landChange({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, changeId: "001" });
   return candidate;
@@ -197,7 +197,7 @@ describe("Application terminal resolution", () => {
 
   test("refuses stale while review is open, recovers it, then requeues same G and returns", async () => {
     const { repository, goalId, base } = await fixture(true);
-    const review = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: "001", instruction: "Review exact Candidate.", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] } });
+    const review = await issueApplicationReviewTicket({ cwd: repository.root, hostPaths: repository.hostPaths, goalId, applicationId: "001", instruction: "Review exact Candidate.", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", credentialGrants: [] } });
     await writeFile(join(repository.root, "moved.txt"), "moved\n"); await repository.git("add", "moved.txt"); await repository.git("commit", "--quiet", "-m", "move main during review");
     const moved = await repository.git("rev-parse", "main");
     const beforeOpenReviewRefusal = await gitSnapshot(repository);
@@ -273,7 +273,7 @@ describe("Application terminal resolution", () => {
     expect(await gitSnapshot(returned.repository)).toEqual(beforePlanner);
 
     const change = await createChange({ cwd: returned.repository.root, hostPaths: returned.repository.hostPaths, goalId: returned.goalId, title: "Recover open work", intent: "Prove ordinary work resumes.", rationale: "Return released the Goal.", acceptanceCriteria: ["The open Ticket is recovered."] });
-    await issueTicket({ cwd: returned.repository.root, hostPaths: returned.repository.hostPaths, goalId: returned.goalId, changeId: change.change.metadata.changeId, instruction: "Remain open for recovery.", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, model: "fixture", thinking: "medium" });
+    await issueTicket({ cwd: returned.repository.root, hostPaths: returned.repository.hostPaths, goalId: returned.goalId, changeId: change.change.metadata.changeId, instruction: "Remain open for recovery.", executionPolicy: { isolation: "workspace", credentialGrants: [] }, model: "fixture", thinking: "medium" });
     const beforeRecovery = await gitSnapshot(returned.repository);
     const recovered = await reconcileGoal({ cwd: returned.repository.root, hostPaths: returned.repository.hostPaths, goalId: returned.goalId, recoverApplications: false });
     expect(recovered.interruptedTickets.map((entry) => entry.report.metadata.ticketId)).toEqual(["001"]);
@@ -320,7 +320,7 @@ describe("Application terminal resolution", () => {
 
   test("returns only reviewed exact Candidate, unfreezes planning, and leaves main and Goal ref unchanged", async () => {
     const { repository, goalId, base } = await fixture(true);
-    const reviewTicket = { kind: "application-review-ticket", goalId, applicationId: "001", ticketId: "001", role: "review", issuedAt: stamp, targetRevision: base, goalRevision: base, mergeBase: base, candidateRevision: base, producingImplementationTicketId: "001", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", networkAccess: "none", credentialGrants: [] }, guidance: { step: "review", revision: base } };
+    const reviewTicket = { kind: "application-review-ticket", goalId, applicationId: "001", ticketId: "001", role: "review", issuedAt: stamp, targetRevision: base, goalRevision: base, mergeBase: base, candidateRevision: base, producingImplementationTicketId: "001", model: "fixture", thinking: "medium", executionPolicy: { isolation: "workspace", credentialGrants: [] }, guidance: { step: "review", revision: base } };
     await mkdir(join(applicationReviewTicketPath(repository.project, goalId, "001", "001"), ".."), { recursive: true });
     await writeFile(applicationReviewTicketPath(repository.project, goalId, "001", "001"), serializeDocument(reviewTicket, "# Review\n"));
     const reviewReport = { kind: "application-review-report", goalId, applicationId: "001", ticketId: "001", role: "review", outcome: "completed", publishedAt: stamp, targetRevision: base, goalRevision: base, mergeBase: base, candidateRevision: base, producingImplementationTicketId: "001", verdict: "approve", findings: [], acceptanceAssessment: [], reviewStatement: "Reviewed.", artifacts: [], execution };

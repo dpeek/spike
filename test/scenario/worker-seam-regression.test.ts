@@ -8,7 +8,7 @@ import { recordWorker } from "../../src/worker.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 async function fixture() {
   const repository = await temporaryRepository();

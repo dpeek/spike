@@ -14,8 +14,8 @@ async function fixture(): Promise<string> {
       worker: { setup: ["bun", "install", "--frozen-lockfile"] },
       agents: {
         planner: { model: "planner", thinking: "high" },
-        implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
-        review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+        implement: { model: "implementer", thinking: "medium", isolation: "container", credentialGrants: [] },
+        review: { model: "reviewer", thinking: "high", isolation: "container", credentialGrants: [] },
       },
     })}\n`,
   );
@@ -29,11 +29,11 @@ describe("project agent configuration", () => {
     expect((await loadProjectConfig(root)).project).toEqual({ slug: "example-project" });
     expect((await loadProjectConfig(root)).agents.planner).toEqual({ model: "planner", thinking: "high" });
     expect(await resolveTicketAssignment(root, "implement")).toEqual({
-      model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [],
+      model: "implementer", thinking: "medium", isolation: "container", credentialGrants: [],
       setupCommand: ["bun", "install", "--frozen-lockfile"],
     });
     expect(await resolveTicketAssignment(root, "review", { model: "special-reviewer", thinking: "low", isolation: "workspace", credentialGrants: [] })).toEqual({
-      model: "special-reviewer", thinking: "low", isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [],
+      model: "special-reviewer", thinking: "low", isolation: "workspace", credentialGrants: [],
       setupCommand: ["bun", "install", "--frozen-lockfile"],
     });
   });
@@ -84,8 +84,8 @@ describe("project agent configuration", () => {
         project: { slug: "Invalid Slug" },
         agents: {
           planner: { model: "planner", thinking: "high" },
-          implement: { model: "implementer", thinking: "medium", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
-          review: { model: "reviewer", thinking: "high", isolation: "container", networkAccess: "unrestricted", credentialGrants: [] },
+          implement: { model: "implementer", thinking: "medium", isolation: "container", credentialGrants: [] },
+          review: { model: "reviewer", thinking: "high", isolation: "container", credentialGrants: [] },
         },
       })}\n`,
     );

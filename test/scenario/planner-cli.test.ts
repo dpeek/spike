@@ -52,7 +52,7 @@ if (ticketId === "001") {
 } else throw new Error("unexpected Ticket " + ticketId);
 `;
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 async function spike(repository: Awaited<ReturnType<typeof temporaryRepository>>, args: string[], stdin?: string) {
   const child = Bun.spawn([join(import.meta.dir, "..", "..", "bin", "spike"), ...args], {

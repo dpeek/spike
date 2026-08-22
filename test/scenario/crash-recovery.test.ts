@@ -68,7 +68,7 @@ const body = "# Review evidence\n\n## Review statement\n\nThe exact candidate sa
 await writeFile(join(process.env.SPIKE_OUTPUT_DIR, "submission.md"), "---\n" + JSON.stringify(metadata, null, 2) + "\n---\n\n" + body);
 `;
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 describe("crash-point recovery", () => {
   test("reconciles crashes immediately before and after every immutable commit point", async () => {

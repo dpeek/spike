@@ -1033,9 +1033,6 @@ function validateLocalPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): vo
   if (ticket.metadata.executionPolicy.isolation !== "workspace") {
     throw new Error("local-clone adapter supports only workspace isolation");
   }
-  if (ticket.metadata.executionPolicy.networkAccess !== "unrestricted") {
-    throw new Error("local-clone adapter cannot enforce restricted network access");
-  }
   if (ticket.metadata.executionPolicy.credentialGrants.length > 0) {
     throw new Error("local-clone adapter does not resolve credential grants");
   }
@@ -1121,7 +1118,6 @@ export async function resolveDockerCredential(
 
 function validateDockerPolicy(ticket: Awaited<ReturnType<typeof loadTicket>>): void {
   if (ticket.metadata.executionPolicy.isolation !== "container") throw new Error("docker adapter supports only container isolation");
-  if (ticket.metadata.executionPolicy.networkAccess === "restricted") throw new Error("docker adapter does not support restricted network access");
 }
 
 async function docker(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -1261,14 +1257,13 @@ export async function dispatchDockerTicket(input: DispatchWorkerTicketInput): Pr
   if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) throw new Error(`Docker image has no immutable digest: ${image}`);
   await input.afterDockerImageInspection?.(imageDigest);
   const exchange = await prepareTicketExchange(repository, identity);
-  const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
   let containerId: string | undefined;
   let record: RecordedWorker | undefined;
   let completeDispatch: (() => void) | undefined;
   const startedAt = (input.clock ?? (() => new Date()))().toISOString();
   try {
     containerId = await dockerRequired([
-      "create", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
+      "create", "--read-only", "--network", "bridge", "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
@@ -1331,13 +1326,12 @@ export async function dispatchHerdrDockerTicket(input: DispatchHerdrTicketInput)
   const exchange = await prepareTicketExchange(repository, identity);
   const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-"));
   const host = input.herdr ?? herdrOperations;
-  const network = ticket.metadata.executionPolicy.networkAccess === "none" ? "none" : "bridge";
   let containerId: string | undefined;
   let handles: HerdrPaneHandle | undefined;
   let recorded = false;
   try {
     containerId = await dockerRequired([
-      "create", "--tty", "--interactive", "--read-only", "--network", network, "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
+      "create", "--tty", "--interactive", "--read-only", "--network", "bridge", "--tmpfs", "/tmp:rw,exec,nosuid,size=64m", "--tmpfs", "/work:rw,exec,nosuid,size=256m",
       "--mount", `type=bind,src=${exchange.inputDirectory},dst=/exchange/input,readonly`,
       "--mount", `type=bind,src=${exchange.outputDirectory},dst=/exchange/output`,
       "--workdir", "/work/repository", ...dockerEnvironment(exchange, ticket.metadata.inputRevision, ticket, credential), imageDigest, ...input.command,
@@ -1588,7 +1582,7 @@ export function piWorkerPrompt(role: "implement" | "review", isolation: "workspa
   const terminalTools = piTerminalTools(role);
   const instruction = `Execute the attached immutable ${role} Ticket in this exact checkout. Finish with ${terminalTools.complete}, or use ${terminalTools.blocked} only when a condition outside the worker's control prevents completion.`;
   if (isolation === "workspace") return instruction;
-  return `${instruction}\n\nContainer tools available: Bun, Node.js, Git, ripgrep (\`rg\`), fd (\`fdfind\`), jq, and curl. Their installation does not grant network access; the immutable Ticket execution policy remains authoritative.`;
+  return `${instruction}\n\nContainer tools available: Bun, Node.js, Git, ripgrep (\`rg\`), fd (\`fdfind\`), jq, and curl.`;
 }
 
 async function acceptedSubmission(outputDirectory: string): Promise<boolean> {

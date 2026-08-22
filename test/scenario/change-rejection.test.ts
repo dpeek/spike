@@ -75,7 +75,7 @@ if (ticketId === "002") {
 }
 `;
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 async function implementedChange() {
   const repository = await temporaryRepository();

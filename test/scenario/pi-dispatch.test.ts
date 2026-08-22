@@ -107,7 +107,7 @@ describe("controlled Pi dispatch", () => {
     const identity = { goalId, changeId: "001", ticketId: "001" };
     const issued = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Implement through headed Pi.",
-      "--network-access", "unrestricted", "--model", "frozen-headed-model", "--thinking", "high",
+      "--model", "frozen-headed-model", "--thinking", "high",
     ]);
     expect(issued.exitCode).toBe(0);
     // Pi dispatch shares frozen Ticket loading with controlled worker dispatch.
@@ -216,10 +216,10 @@ describe("controlled Pi dispatch", () => {
 
     const issued = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Implement through Pi.",
-      "--network-access", "unrestricted", "--model", "frozen-implementation-model", "--thinking", "medium",
+      "--model", "frozen-implementation-model", "--thinking", "medium",
     ]);
     expect(issued.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"changed","thinking":"minimal"},"implement":{"model":"changed","thinking":"minimal","isolation":"workspace","credentialGrants":[]},"review":{"model":"changed","thinking":"minimal","isolation":"workspace","credentialGrants":[]}}}\n');
 
     for (const override of ["--model", "--thinking", "--role", "--prompt", "--extension"]) {
       const rejected = await spike(repository, [
@@ -259,10 +259,10 @@ describe("controlled Pi dispatch", () => {
 
     const reviewIssue = await spike(repository, [
       "ticket", "issue", "--goal", goalId, "--change", "001", "--role", "review", "--instruction", "Review through Pi.",
-      "--network-access", "unrestricted", "--model", "frozen-review-model", "--thinking", "high",
+      "--model", "frozen-review-model", "--thinking", "high",
     ]);
     expect(reviewIssue.exitCode).toBe(0);
-    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]},"review":{"model":"later","thinking":"off","isolation":"workspace","networkAccess":"unrestricted","credentialGrants":[]}}}\n');
+    await writeFile(join(repository.root, "spike.json"), '{"project":{"slug":"spike"},"agents":{"planner":{"model":"later","thinking":"off"},"implement":{"model":"later","thinking":"off","isolation":"workspace","credentialGrants":[]},"review":{"model":"later","thinking":"off","isolation":"workspace","credentialGrants":[]}}}\n');
 
     const reviewed = await spike(repository, [
       "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "002", "--worker", "pi-reviewer", "--host", "direct",
@@ -289,7 +289,7 @@ describe("controlled Pi dispatch", () => {
       const { repository, goalId } = await issuedRepository();
       const pi = await fakePi();
       await spike(repository, [
-        "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Do not complete.", "--network-access", "unrestricted",
+        "ticket", "issue", "--goal", goalId, "--change", "001", "--instruction", "Do not complete.",
       ]);
       const dispatched = await spike(repository, [
         "ticket", "dispatch-pi", "--goal", goalId, "--change", "001", "--ticket", "001", "--worker", `pi-${mode}`, "--host", "direct",

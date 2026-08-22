@@ -26,7 +26,7 @@ workerAdapterContract({
       cwd: repository.root, hostPaths: repository.hostPaths, goalId: goal.goal.metadata.goalId,
       changeId: "001",
       instruction: "Execute the scripted adapter contract.",
-      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      executionPolicy: { isolation: "workspace", credentialGrants: [] },
       model: "contract-model",
       thinking: "off",
     });

@@ -7,10 +7,8 @@ const nonBlankString = z.string().trim().min(1);
 const thinkingSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]);
 const modelSelectionSchema = z.object({ model: nonBlankString, thinking: thinkingSchema }).strict();
 const isolationSchema = z.enum(["workspace", "container"]);
-const networkAccessSchema = z.enum(["none", "restricted", "unrestricted"]);
 const workerAgentSchema = modelSelectionSchema.extend({
   isolation: isolationSchema.optional().default("container"),
-  networkAccess: networkAccessSchema,
   credentialGrants: z.array(nonBlankString),
 }).strict();
 const setupCommandSchema = z.array(z.string()).superRefine((command, context) => {
@@ -33,7 +31,7 @@ const projectConfigSchema = z.object({
 
 export type ThinkingLevel = z.infer<typeof thinkingSchema>;
 export type ModelSelection = z.infer<typeof modelSelectionSchema>;
-export type ExecutionPolicyDefaults = Pick<z.infer<typeof workerAgentSchema>, "isolation" | "networkAccess" | "credentialGrants">;
+export type ExecutionPolicyDefaults = Pick<z.infer<typeof workerAgentSchema>, "isolation" | "credentialGrants">;
 export type WorkerAgent = z.infer<typeof workerAgentSchema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type ExecutableTicketRole = "implement" | "review";

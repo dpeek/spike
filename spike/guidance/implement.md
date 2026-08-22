@@ -4,6 +4,11 @@
 
 Implement the complete Change in the private checkout without expanding its scope.
 
+## Ticket assignment
+
+- Use the Project's configured execution-policy defaults. Do not override isolation or credential grants speculatively.
+- Override policy only when the approved Goal or Change explicitly requires a different supported isolation boundary. Before overriding, verify the complete frozen setup, selected-model, credential-resolution, dispatch, completion-observation, Report-publication, and cleanup lifecycle in that boundary.
+
 ## Required work
 
 - Treat the Ticket instruction as operational direction for implementing the whole Change, not as permission to defer acceptance criteria to later implementation Tickets.

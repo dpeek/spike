@@ -27,7 +27,7 @@ import { temporaryRepository } from "../support/repository.ts";
 const workspaces: string[] = [];
 
 
-async function issuedTicket(policy: import("../../src/ticket.ts").ExecutionPolicy = { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] }) {
+async function issuedTicket(policy: import("../../src/ticket.ts").ExecutionPolicy = { isolation: "workspace", credentialGrants: [] }) {
   const repository = await temporaryRepository();
   const goal = await createGoal({
     cwd: repository.root, hostPaths: repository.hostPaths, title: "Host a worker in Herdr",
@@ -124,7 +124,7 @@ describe("ephemeral Herdr worker hosting", () => {
   });
 
   test("loads an attended Docker marker directly after wait, without status observation", async () => {
-    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const { repository, identity } = await issuedTicket({ isolation: "container", credentialGrants: [] });
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-attended-"));
     workspaces.push(workspace);
     await recordDockerWorker(repository.project, {
@@ -139,7 +139,7 @@ describe("ephemeral Herdr worker hosting", () => {
   });
 
   test("Docker-free attended attachment loss, stop/report race, and repeated retirement retain actual-exit evidence", async () => {
-    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const { repository, identity } = await issuedTicket({ isolation: "container", credentialGrants: [] });
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-race-"));
     workspaces.push(workspace);
     await recordDockerWorker(repository.project, {
@@ -183,7 +183,7 @@ describe("ephemeral Herdr worker hosting", () => {
   });
 
   test("refuses a removed Docker runtime without durable terminal evidence before cleanup", async () => {
-    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const { repository, identity } = await issuedTicket({ isolation: "container", credentialGrants: [] });
     await recordDockerWorker(repository.project, {
       ...identity, role: "implement", worker: "unknown-container", startedAt: "2026-04-01T10:00:00.000Z",
       containerId: "1".repeat(64), imageDigest: `sha256:${"2".repeat(64)}`,
@@ -200,7 +200,7 @@ describe("ephemeral Herdr worker hosting", () => {
   });
 
   test("Docker-free observer loss cancels and restarts the exact-container waiter", async () => {
-    const { repository, identity } = await issuedTicket({ isolation: "container", networkAccess: "none", credentialGrants: [] });
+    const { repository, identity } = await issuedTicket({ isolation: "container", credentialGrants: [] });
     const workspace = await mkdtemp(join(tmpdir(), "spike-local-clone-docker-observer-loss-"));
     workspaces.push(workspace);
     await recordDockerWorker(repository.project, {

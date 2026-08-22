@@ -237,7 +237,7 @@ describe("spike CLI", () => {
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Exit with a controlled failure.",
-      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      executionPolicy: { isolation: "workspace", credentialGrants: [] },
       model: "frozen-model",
       thinking: "low",
     });

@@ -7,7 +7,7 @@ import { issueTicket, ticketPath } from "../../src/ticket.ts";
 import { temporaryRepository } from "../support/repository.ts";
 
 
-const policy = { isolation: "workspace" as const, networkAccess: "unrestricted" as const, credentialGrants: [] };
+const policy = { isolation: "workspace" as const, credentialGrants: [] };
 
 describe("Change abandonment", () => {
   test("requires a terminal Ticket Report and never replaces interrupted work automatically", async () => {

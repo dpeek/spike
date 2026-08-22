@@ -1209,7 +1209,6 @@ export function registerSupervisorExtension(
           instruction: nonBlankString,
           context: { type: "string" },
           isolation: { type: "string", enum: ["workspace", "container"] },
-          networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
           credentialGrants: { type: "array", items: nonBlankString },
           clearCredentialGrants: { type: "boolean" },
           model: nonBlankString,
@@ -1224,7 +1223,6 @@ export function registerSupervisorExtension(
         ];
         optional(args, "--context", params.context);
         optional(args, "--isolation", params.isolation);
-        optional(args, "--network-access", params.networkAccess);
         repeated(args, "--credential", params.credentialGrants);
         if (params.clearCredentialGrants === true) args.push("--clear-credentials");
         optional(args, "--model", params.model);
@@ -1249,7 +1247,6 @@ export function registerSupervisorExtension(
           producingImplementationTicketId: nonBlankString,
           context: { type: "string" },
           isolation: { type: "string", enum: ["workspace", "container"] },
-          networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
           credentialGrants: { type: "array", items: nonBlankString },
           clearCredentialGrants: { type: "boolean" },
           model: nonBlankString,
@@ -1265,7 +1262,6 @@ export function registerSupervisorExtension(
         ];
         optional(args, "--context", params.context);
         optional(args, "--isolation", params.isolation);
-        optional(args, "--network-access", params.networkAccess);
         repeated(args, "--credential", params.credentialGrants);
         if (params.clearCredentialGrants === true) args.push("--clear-credentials");
         optional(args, "--model", params.model);
@@ -1290,7 +1286,6 @@ export function registerSupervisorExtension(
           responseToReviewTicketId: nonBlankString,
           context: { type: "string" },
           isolation: { type: "string", enum: ["workspace", "container"] },
-          networkAccess: { type: "string", enum: ["none", "restricted", "unrestricted"] },
           credentialGrants: { type: "array", items: nonBlankString },
           clearCredentialGrants: { type: "boolean" },
           model: nonBlankString,
@@ -1306,7 +1301,6 @@ export function registerSupervisorExtension(
         ];
         optional(args, "--context", params.context);
         optional(args, "--isolation", params.isolation);
-        optional(args, "--network-access", params.networkAccess);
         repeated(args, "--credential", params.credentialGrants);
         if (params.clearCredentialGrants === true) args.push("--clear-credentials");
         optional(args, "--model", params.model);

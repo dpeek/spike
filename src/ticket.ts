@@ -29,7 +29,6 @@ const timestamp = z.string().refine((value) => !Number.isNaN(Date.parse(value)),
 const executionPolicySchema = z
   .object({
     isolation: z.enum(["workspace", "container"]),
-    networkAccess: z.enum(["none", "restricted", "unrestricted"]),
     credentialGrants: z.array(z.string().min(1)),
   })
   .strict();
@@ -400,14 +399,12 @@ export async function issueTicket(input: IssueTicketInput): Promise<IssuedTicket
     ...(input.model === undefined ? {} : { model: input.model }),
     ...(input.thinking === undefined ? {} : { thinking: input.thinking }),
     ...(input.executionPolicy?.isolation === undefined ? {} : { isolation: input.executionPolicy.isolation }),
-    ...(input.executionPolicy?.networkAccess === undefined ? {} : { networkAccess: input.executionPolicy.networkAccess }),
     ...(input.executionPolicy?.credentialGrants === undefined
       ? {}
       : { credentialGrants: input.executionPolicy.credentialGrants.map((grant) => requireText(grant, "Credential grant")) }),
   });
   const policy = executionPolicySchema.parse({
     isolation: assignment.isolation,
-    networkAccess: assignment.networkAccess,
     credentialGrants: assignment.credentialGrants,
   });
   let derivedRevision: string;

@@ -80,7 +80,7 @@ describe("Pi worker completion boundary", () => {
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Attempt completion with mismatched observed provenance.",
-      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      executionPolicy: { isolation: "workspace", credentialGrants: [] },
       model: "openai-codex/gpt-5.6-terra",
       thinking: "medium",
     });
@@ -121,7 +121,7 @@ describe("Pi worker completion boundary", () => {
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Report the external Docker blocker.",
-      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      executionPolicy: { isolation: "workspace", credentialGrants: [] },
       model: "openai-codex/gpt-5.6-terra",
       thinking: "medium",
     });
@@ -179,7 +179,7 @@ describe("Pi worker completion boundary", () => {
       cwd: repository.root, hostPaths: repository.hostPaths, goalId,
       changeId: "001",
       instruction: "Implement and complete through the role-specific Pi tool.",
-      executionPolicy: { isolation: "workspace", networkAccess: "unrestricted", credentialGrants: [] },
+      executionPolicy: { isolation: "workspace", credentialGrants: [] },
       model: "openai-codex/gpt-5.6-terra",
       thinking: "medium",
     });

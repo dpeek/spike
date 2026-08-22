@@ -380,15 +380,15 @@ describe("Pi supervisor extension", () => {
       ["spike_decide_change", { ...identity, disposition: "abandon", statement: "Stop." }],
       ["spike_begin_step", { step: "implement", ...identity }],
       ["spike_issue_implement", {
-        ...identity, instruction: "Implement it.", networkAccess: "unrestricted", model: "worker-model", thinking: "medium",
+        ...identity, instruction: "Implement it.", model: "worker-model", thinking: "medium",
       }],
       ["spike_begin_step", { step: "review", ...identity }],
       ["spike_issue_review", {
-        ...identity, instruction: "Review it.", producingImplementationTicketId: "001", networkAccess: "unrestricted",
+        ...identity, instruction: "Review it.", producingImplementationTicketId: "001",
       }],
       ["spike_begin_step", { step: "remediate", ...identity }],
       ["spike_issue_remediate", {
-        ...identity, instruction: "Close F-1.", responseToReviewTicketId: "002", networkAccess: "unrestricted",
+        ...identity, instruction: "Close F-1.", responseToReviewTicketId: "002",
       }],
       ["spike_dispatch_pi", { ...identity, ticketId: "003", worker: "pi-worker" }],
       ["spike_worker_status", { ...identity, ticketId: "003" }],
@@ -492,7 +492,7 @@ describe("Pi supervisor extension", () => {
     });
     const registered = new Map(tools.map((tool) => [tool.name, tool]));
     const context = { cwd: "/project" };
-    const ticket = { goalId: "goal-1", changeId: "001", instruction: "Bounded work.", networkAccess: "unrestricted" };
+    const ticket = { goalId: "goal-1", changeId: "001", instruction: "Bounded work." };
 
     await expect(registered.get("spike_issue_implement")!.execute("call", ticket, undefined, undefined, context))
       .rejects.toThrow("Call spike_begin_step for implement on goal-1/001");
